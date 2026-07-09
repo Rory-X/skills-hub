@@ -192,3 +192,93 @@ export type SkillFileEntry = {
   path: string
   size: number
 }
+
+export type ProjectSummaryDto = {
+  id: string
+  name: string
+  root_path: string
+  enabled_tool_keys: string[]
+  local_git_exclude_enabled: boolean
+  created_at: number
+  updated_at: number
+  last_scanned_at?: number | null
+  skill_count: number
+  attention_count: number
+}
+
+export type ProjectToolDto = {
+  key: string
+  label: string
+  project_skills_dir: string
+  enabled: boolean
+}
+
+export type ProjectSkillPathDto = {
+  discovered_skill_id: string
+  relative_path: string
+  absolute_path: string
+  tool_keys: string[]
+  content_hash?: string | null
+  status: 'valid' | 'matched' | 'invalid_missing_skill_md'
+}
+
+export type ProjectSkillDto = {
+  name: string
+  description?: string | null
+  source: 'project' | 'library' | 'matched_library'
+  status:
+    | 'healthy'
+    | 'needs_attention'
+    | 'ok'
+    | 'pending'
+    | 'partial'
+    | 'error'
+    | 'conflict'
+  linked_skill_id?: string | null
+  matched_skill_id?: string | null
+  tool_keys: string[]
+  paths: ProjectSkillPathDto[]
+}
+
+export type ProjectLibrarySkillDto = {
+  skill_id: string
+  name: string
+  description?: string | null
+  availability:
+    | 'addable'
+    | 'enabled'
+    | 'project_same'
+    | 'conflict'
+    | 'needs_repair'
+    | 'disabled'
+}
+
+export type ProjectIssueKind =
+  | 'invalid_skill'
+  | 'same_project_name_content_mismatch'
+  | 'same_name_content_conflict'
+  | 'tool_added_pending_sync'
+  | 'injection_failed'
+  | 'target_missing'
+  | 'tool_removed_pending_unsync'
+  | 'git_exclude_drift'
+  | 'git_exclude_unavailable'
+  | 'library_skill_unavailable'
+
+export type ProjectIssueDto = {
+  id: string
+  kind: ProjectIssueKind
+  skill_id?: string | null
+  skill_name?: string | null
+  tool_key?: string | null
+  path?: string | null
+  fixable: boolean
+}
+
+export type ProjectDetailDto = {
+  project: ProjectSummaryDto
+  tools: ProjectToolDto[]
+  current_skills: ProjectSkillDto[]
+  library_skills: ProjectLibrarySkillDto[]
+  issues: ProjectIssueDto[]
+}

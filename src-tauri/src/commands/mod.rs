@@ -34,7 +34,13 @@ use crate::core::network_proxy::{
     set_github_proxy_url as set_github_proxy_url_core, GithubProxyConfig,
 };
 use crate::core::onboarding::{build_onboarding_plan, OnboardingPlan};
-use crate::core::skill_store::{SkillStore, SkillTargetRecord};
+use crate::core::projects::{
+    build_project_detail_data, build_project_summary_data, collect_project_skill_and_scan,
+    import_project_and_scan, inject_project_skill_and_scan, refresh_project,
+    remove_project_skill_and_scan, repair_project_issue_and_scan, update_project_and_scan,
+    ProjectIssue, ProjectToolSpec,
+};
+use crate::core::skill_store::{ProjectRecord, SkillStore, SkillTargetRecord};
 use crate::core::skills_search::{
     search_skills_online as search_skills_online_core, OnlineSkillResult,
 };
@@ -60,6 +66,7 @@ fn format_anyhow_error(err: anyhow::Error) -> String {
     if first.starts_with("MULTI_SKILLS|")
         || first.starts_with("TARGET_EXISTS|")
         || first.starts_with("TOOL_NOT_INSTALLED|")
+        || first.starts_with("PROJECT_LIBRARY_NAME_REQUIRED|")
     {
         return first;
     }
@@ -650,6 +657,360 @@ fn normalize_scope(scope: Option<&str>) -> Result<&'static str, anyhow::Error> {
         "global" => Ok("global"),
         "project" => Ok("project"),
         other => anyhow::bail!("invalid scope: {}", other),
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProjectSummaryDto {
+    pub id: String,
+    pub name: String,
+    pub root_path: String,
+    pub enabled_tool_keys: Vec<String>,
+    pub local_git_exclude_enabled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_scanned_at: Option<i64>,
+    pub skill_count: usize,
+    pub attention_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProjectToolDto {
+    pub key: String,
+    pub label: String,
+    pub project_skills_dir: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProjectSkillPathDto {
+    pub discovered_skill_id: String,
+    pub relative_path: String,
+    pub absolute_path: String,
+    pub tool_keys: Vec<String>,
+    pub content_hash: Option<String>,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProjectSkillDto {
+    pub name: String,
+    pub description: Option<String>,
+    pub source: String,
+    pub status: String,
+    pub linked_skill_id: Option<String>,
+    pub matched_skill_id: Option<String>,
+    pub tool_keys: Vec<String>,
+    pub paths: Vec<ProjectSkillPathDto>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProjectLibrarySkillDto {
+    pub skill_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub availability: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProjectIssueDto {
+    pub id: String,
+    pub kind: String,
+    pub skill_id: Option<String>,
+    pub skill_name: Option<String>,
+    pub tool_key: Option<String>,
+    pub path: Option<String>,
+    pub fixable: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProjectDetailDto {
+    pub project: ProjectSummaryDto,
+    pub tools: Vec<ProjectToolDto>,
+    pub current_skills: Vec<ProjectSkillDto>,
+    pub library_skills: Vec<ProjectLibrarySkillDto>,
+    pub issues: Vec<ProjectIssueDto>,
+}
+
+#[tauri::command]
+pub async fn list_projects(store: State<'_, SkillStore>) -> Result<Vec<ProjectSummaryDto>, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let specs = runtime_project_tool_specs(&store)?;
+        store
+            .list_projects()?
+            .into_iter()
+            .map(|project| build_project_summary(&store, &project, &specs))
+            .collect::<anyhow::Result<Vec<_>>>()
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn import_project(
+    store: State<'_, SkillStore>,
+    projectPath: String,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = expand_home_path(&projectPath)?;
+        let runtime_tools = runtime_project_tools(&store)?;
+        let default_tools = runtime_tools
+            .iter()
+            .map(|tool| tool.key.clone())
+            .collect::<Vec<_>>();
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project = import_project_and_scan(&store, &root, &default_tools, &specs)?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn scan_project(
+    store: State<'_, SkillStore>,
+    projectId: String,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime_tools = runtime_project_tools(&store)?;
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project = refresh_project(&store, &projectId, &specs)?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn update_project_settings(
+    store: State<'_, SkillStore>,
+    projectId: String,
+    enabledToolKeys: Vec<String>,
+    localGitExcludeEnabled: bool,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime_tools = runtime_project_tools(&store)?;
+        let available = runtime_tools
+            .iter()
+            .map(|tool| tool.key.clone())
+            .collect::<Vec<_>>();
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project = update_project_and_scan(
+            &store,
+            &projectId,
+            &enabledToolKeys,
+            localGitExcludeEnabled,
+            &available,
+            &specs,
+        )?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn inject_project_skill(
+    store: State<'_, SkillStore>,
+    projectId: String,
+    skillId: String,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime_tools = runtime_project_tools(&store)?;
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project = inject_project_skill_and_scan(&store, &projectId, &skillId, &specs)?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn remove_project_skill(
+    store: State<'_, SkillStore>,
+    projectId: String,
+    skillId: String,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime_tools = runtime_project_tools(&store)?;
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project = remove_project_skill_and_scan(&store, &projectId, &skillId, &specs)?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn repair_project_issue(
+    store: State<'_, SkillStore>,
+    projectId: String,
+    issueId: String,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime_tools = runtime_project_tools(&store)?;
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project = repair_project_issue_and_scan(&store, &projectId, &issueId, &specs)?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn collect_project_skill(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    projectId: String,
+    discoveredSkillId: String,
+    libraryName: Option<String>,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime_tools = runtime_project_tools(&store)?;
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project = collect_project_skill_and_scan(
+            &app,
+            &store,
+            &projectId,
+            &discoveredSkillId,
+            libraryName.as_deref(),
+            &specs,
+        )?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+fn runtime_project_tools(store: &SkillStore) -> anyhow::Result<Vec<RuntimeTool>> {
+    Ok(runtime_tools(store, false)?
+        .into_iter()
+        .filter(|tool| tool.supports_project_scope && !tool.project_skills_dir.is_empty())
+        .collect())
+}
+
+fn runtime_project_tool_specs(store: &SkillStore) -> anyhow::Result<Vec<ProjectToolSpec>> {
+    runtime_project_tools(store).map(|tools| project_specs_from_runtime(&tools))
+}
+
+fn project_specs_from_runtime(tools: &[RuntimeTool]) -> Vec<ProjectToolSpec> {
+    tools
+        .iter()
+        .map(|tool| ProjectToolSpec::new(&tool.key, &tool.project_skills_dir))
+        .collect()
+}
+
+fn build_project_summary(
+    store: &SkillStore,
+    project: &ProjectRecord,
+    specs: &[ProjectToolSpec],
+) -> anyhow::Result<ProjectSummaryDto> {
+    let data = build_project_summary_data(store, project, specs)?;
+    Ok(ProjectSummaryDto {
+        id: project.id.clone(),
+        name: project.name.clone(),
+        root_path: project.root_path.clone(),
+        enabled_tool_keys: project.enabled_tool_keys.clone(),
+        local_git_exclude_enabled: project.local_git_exclude_enabled,
+        created_at: project.created_at,
+        updated_at: project.updated_at,
+        last_scanned_at: project.last_scanned_at,
+        skill_count: data.skill_count,
+        attention_count: data.issues.len(),
+    })
+}
+
+fn build_project_detail(
+    store: &SkillStore,
+    project: &ProjectRecord,
+    runtime_tools: &[RuntimeTool],
+) -> anyhow::Result<ProjectDetailDto> {
+    let specs = project_specs_from_runtime(runtime_tools);
+    let data = build_project_detail_data(store, project, &specs)?;
+    let summary = build_project_summary(store, project, &specs)?;
+    let tools = runtime_tools
+        .iter()
+        .map(|tool| ProjectToolDto {
+            key: tool.key.clone(),
+            label: tool.label.clone(),
+            project_skills_dir: tool.project_skills_dir.clone(),
+            enabled: project.enabled_tool_keys.contains(&tool.key),
+        })
+        .collect::<Vec<_>>();
+    Ok(ProjectDetailDto {
+        project: summary,
+        tools,
+        current_skills: data
+            .current_skills
+            .into_iter()
+            .map(|skill| ProjectSkillDto {
+                name: skill.name,
+                description: skill.description,
+                source: skill.source,
+                status: skill.status,
+                linked_skill_id: skill.linked_skill_id,
+                matched_skill_id: skill.matched_skill_id,
+                tool_keys: skill.tool_keys,
+                paths: skill
+                    .paths
+                    .into_iter()
+                    .map(|path| ProjectSkillPathDto {
+                        discovered_skill_id: path.discovered_skill_id,
+                        relative_path: path.relative_path,
+                        absolute_path: path.absolute_path,
+                        tool_keys: path.tool_keys,
+                        content_hash: path.content_hash,
+                        status: path.status,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        library_skills: data
+            .library_skills
+            .into_iter()
+            .map(|skill| ProjectLibrarySkillDto {
+                skill_id: skill.skill_id,
+                name: skill.name,
+                description: skill.description,
+                availability: skill.availability,
+            })
+            .collect(),
+        issues: data.issues.into_iter().map(project_issue_dto).collect(),
+    })
+}
+
+fn project_issue_dto(issue: ProjectIssue) -> ProjectIssueDto {
+    ProjectIssueDto {
+        id: issue.id,
+        kind: issue.kind,
+        skill_id: issue.skill_id,
+        skill_name: issue.skill_name,
+        tool_key: issue.tool_key,
+        path: issue.path,
+        fixable: issue.fixable,
     }
 }
 

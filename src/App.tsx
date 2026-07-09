@@ -35,6 +35,8 @@ import SharedDirModal from './components/skills/modals/SharedDirModal'
 import SettingsPage from './components/skills/SettingsPage'
 import ToolsPage from './components/skills/ToolsPage'
 import UpdatesPage from './components/skills/UpdatesPage'
+import ProjectDetailPage from './components/projects/ProjectDetailPage'
+import ProjectsPage from './components/projects/ProjectsPage'
 import {
   getAutoUpdateToastKey,
   shouldKeepWaitingForTriggeredAutoUpdate,
@@ -60,6 +62,8 @@ import type {
   ManagedSkill,
   OnboardingPlan,
   OnlineSkillDto,
+  ProjectDetailDto,
+  ProjectSummaryDto,
   TagWithCountDto,
   ToolConfigDto,
   ToolOption,
@@ -75,7 +79,14 @@ type SkillScopeState = Record<
   }
 >
 
-type ActiveView = 'myskills' | 'explore' | 'detail' | 'settings' | 'manage'
+type ActiveView =
+  | 'projects'
+  | 'projectDetail'
+  | 'myskills'
+  | 'explore'
+  | 'detail'
+  | 'settings'
+  | 'manage'
 type ManagementTab = 'tags' | 'tools' | 'updates'
 
 function App() {
@@ -138,7 +149,7 @@ function App() {
   const [searchQuery, setSearchQuery] = useState('')
   const [sortBy, setSortBy] = useState<'updated' | 'name'>('updated')
   const [scopeFilter, setScopeFilter] = useState<'all' | 'global' | 'project'>('all')
-  const [activeView, setActiveView] = useState<ActiveView>('myskills')
+  const [activeView, setActiveView] = useState<ActiveView>('projects')
   const [managementTab, setManagementTab] = useState<ManagementTab>('tags')
   const [detailSkill, setDetailSkill] = useState<ManagedSkill | null>(null)
   const [tags, setTags] = useState<TagWithCountDto[]>([])
@@ -157,6 +168,10 @@ function App() {
   const [autoSelectSkillName, setAutoSelectSkillName] = useState<string | null>(null)
   const [scopeModalSkill, setScopeModalSkill] = useState<ManagedSkill | null>(null)
   const [recentProjects, setRecentProjects] = useState<string[]>([])
+  const [projects, setProjects] = useState<ProjectSummaryDto[]>([])
+  const [projectImportPath, setProjectImportPath] = useState('')
+  const [selectedProjectDetail, setSelectedProjectDetail] =
+    useState<ProjectDetailDto | null>(null)
   const [installScope, setInstallScope] = useState<InstallScope>('global')
   const [installProjects, setInstallProjects] = useState<string[]>([])
   const installProjectsRef = useRef<string[]>([])
@@ -215,6 +230,9 @@ function App() {
       if (raw.startsWith('PROJECT_SCOPE_UNSUPPORTED|')) {
         const tool = raw.split('|')[1] ?? ''
         return t('projectSync.unsupportedTool', { tool })
+      }
+      if (raw.startsWith('PROJECT_LIBRARY_NAME_REQUIRED|')) {
+        return t('projects.libraryNameRequired')
       }
       if (raw.includes('未在该仓库中发现可导入的 Skills')) {
         return t('errors.noSkillsFoundInRepo')
@@ -341,12 +359,22 @@ function App() {
     }
   }, [invokeTauri])
 
+  const loadProjects = useCallback(async () => {
+    try {
+      const result = await invokeTauri<ProjectSummaryDto[]>('list_projects')
+      setProjects(result)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }, [invokeTauri])
+
   useEffect(() => {
     if (isTauri) {
       loadManagedSkills()
       loadTags()
+      loadProjects()
     }
-  }, [isTauri, loadManagedSkills, loadTags])
+  }, [isTauri, loadManagedSkills, loadProjects, loadTags])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -1209,6 +1237,188 @@ function App() {
       .join('、')
   }, [toolStatus, tools])
 
+  const runProjectDetailCommand = useCallback(
+    async (
+      command: string,
+      args: Record<string, unknown>,
+      successMessage?: string,
+    ) => {
+      setLoading(true)
+      setLoadingStartAt(Date.now())
+      try {
+        const detail = await invokeTauri<ProjectDetailDto>(command, args)
+        setSelectedProjectDetail(detail)
+        setActiveView('projectDetail')
+        await loadProjects()
+        if (successMessage) toast.success(successMessage)
+        return detail
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+        return null
+      } finally {
+        setLoading(false)
+        setLoadingStartAt(null)
+      }
+    },
+    [invokeTauri, loadProjects],
+  )
+
+  const handlePickProjectRoot = useCallback(async () => {
+    try {
+      if (!isTauri) throw new Error(t('errors.notTauri'))
+      const { open } = await import('@tauri-apps/plugin-dialog')
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: t('projects.chooseFolder'),
+      })
+      if (!selected || Array.isArray(selected)) return
+      setProjectImportPath(selected)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }, [isTauri, t])
+
+  const handleImportProject = useCallback(() => {
+    const projectPath = projectImportPath.trim()
+    if (!projectPath) return
+    void runProjectDetailCommand(
+      'import_project',
+      { projectPath },
+      t('projects.imported'),
+    ).then((detail) => {
+      if (detail) setProjectImportPath('')
+    })
+  }, [projectImportPath, runProjectDetailCommand, t])
+
+  const handleOpenProject = useCallback(
+    (project: ProjectSummaryDto) => {
+      void runProjectDetailCommand('scan_project', { projectId: project.id })
+    },
+    [runProjectDetailCommand],
+  )
+
+  const handleRefreshProject = useCallback(() => {
+    if (!selectedProjectDetail) return
+    void runProjectDetailCommand('scan_project', {
+      projectId: selectedProjectDetail.project.id,
+    }, t('projects.refreshed'))
+  }, [runProjectDetailCommand, selectedProjectDetail, t])
+
+  const handleProjectToolsChange = useCallback(
+    (enabledToolKeys: string[]) => {
+      if (!selectedProjectDetail) return
+      void runProjectDetailCommand(
+        'update_project_settings',
+        {
+          projectId: selectedProjectDetail.project.id,
+          enabledToolKeys,
+          localGitExcludeEnabled:
+            selectedProjectDetail.project.local_git_exclude_enabled,
+        },
+        t('projects.settingsUpdated'),
+      )
+    },
+    [runProjectDetailCommand, selectedProjectDetail, t],
+  )
+
+  const handleProjectGitExcludeChange = useCallback(
+    (localGitExcludeEnabled: boolean) => {
+      if (!selectedProjectDetail) return
+      void runProjectDetailCommand(
+        'update_project_settings',
+        {
+          projectId: selectedProjectDetail.project.id,
+          enabledToolKeys: selectedProjectDetail.project.enabled_tool_keys,
+          localGitExcludeEnabled,
+        },
+        t('projects.settingsUpdated'),
+      )
+    },
+    [runProjectDetailCommand, selectedProjectDetail, t],
+  )
+
+  const handleInjectProjectSkill = useCallback(
+    (skillId: string) => {
+      if (!selectedProjectDetail) return
+      void runProjectDetailCommand(
+        'inject_project_skill',
+        { projectId: selectedProjectDetail.project.id, skillId },
+        t('projects.skillAdded'),
+      )
+    },
+    [runProjectDetailCommand, selectedProjectDetail, t],
+  )
+
+  const handleRemoveProjectSkill = useCallback(
+    (skillId: string) => {
+      if (!selectedProjectDetail) return
+      void runProjectDetailCommand(
+        'remove_project_skill',
+        { projectId: selectedProjectDetail.project.id, skillId },
+        t('projects.skillRemoved'),
+      )
+    },
+    [runProjectDetailCommand, selectedProjectDetail, t],
+  )
+
+  const handleRepairProjectIssue = useCallback(
+    (issueId: string) => {
+      if (!selectedProjectDetail) return
+      void runProjectDetailCommand(
+        'repair_project_issue',
+        { projectId: selectedProjectDetail.project.id, issueId },
+        t('projects.issueRepaired'),
+      )
+    },
+    [runProjectDetailCommand, selectedProjectDetail, t],
+  )
+
+  const handleCollectProjectSkill = useCallback(
+    async (discoveredSkillId: string, name: string) => {
+      if (!selectedProjectDetail) return
+      setLoading(true)
+      setLoadingStartAt(Date.now())
+      const projectId = selectedProjectDetail.project.id
+      const collect = (libraryName?: string) =>
+        invokeTauri<ProjectDetailDto>('collect_project_skill', {
+          projectId,
+          discoveredSkillId,
+          libraryName,
+        })
+      try {
+        let detail: ProjectDetailDto
+        try {
+          detail = await collect()
+        } catch (err) {
+          const raw = err instanceof Error ? err.message : String(err)
+          if (!raw.startsWith('PROJECT_LIBRARY_NAME_REQUIRED|')) throw err
+          const libraryName = window.prompt(
+            t('projects.libraryNamePrompt', { name }),
+            `${name}-project`,
+          )
+          if (!libraryName?.trim()) return
+          detail = await collect(libraryName.trim())
+        }
+        setSelectedProjectDetail(detail)
+        await Promise.all([loadProjects(), loadManagedSkills()])
+        toast.success(t('projects.collected'))
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setLoading(false)
+        setLoadingStartAt(null)
+      }
+    },
+    [invokeTauri, loadManagedSkills, loadProjects, selectedProjectDetail, t],
+  )
+
+  const handleBackToProjects = useCallback(() => {
+    setSelectedProjectDetail(null)
+    setActiveView('projects')
+    void loadProjects()
+  }, [loadProjects])
+
   const handleOpenSettings = useCallback(() => {
     setActiveView('settings')
   }, [])
@@ -1227,7 +1437,7 @@ function App() {
   }, [featuredSkills.length, invokeTauri])
 
   const handleViewChange = useCallback(
-    (view: 'myskills' | 'explore' | 'manage') => {
+    (view: 'projects' | 'myskills' | 'explore' | 'manage') => {
       setActiveView(view)
       if (view !== 'myskills') {
         setBulkMode(false)
@@ -1245,8 +1455,12 @@ function App() {
       if (view === 'myskills') {
         setDetailSkill(null)
       }
+      if (view === 'projects') {
+        setSelectedProjectDetail(null)
+        void loadProjects()
+      }
     },
-    [loadFeaturedSkills],
+    [loadFeaturedSkills, loadProjects],
   )
 
   const handleOpenDetail = useCallback((skill: ManagedSkill) => {
@@ -1334,7 +1548,7 @@ function App() {
   }, [loading])
 
   const handleCloseSettings = useCallback(() => {
-    setActiveView('myskills')
+    setActiveView('projects')
   }, [])
 
   const handleThemeChange = useCallback(
@@ -3285,7 +3499,35 @@ function App() {
       />
 
       <main className="skills-main">
-        {activeView === 'detail' && detailSkill ? (
+        {activeView === 'projectDetail' && selectedProjectDetail ? (
+          <ProjectDetailPage
+            detail={selectedProjectDetail}
+            loading={loading}
+            onBack={handleBackToProjects}
+            onRefresh={handleRefreshProject}
+            onToolsChange={handleProjectToolsChange}
+            onGitExcludeChange={handleProjectGitExcludeChange}
+            onInjectSkill={handleInjectProjectSkill}
+            onRemoveSkill={handleRemoveProjectSkill}
+            onCollectSkill={(discoveredSkillId, name) =>
+              void handleCollectProjectSkill(discoveredSkillId, name)
+            }
+            onRepairIssue={handleRepairProjectIssue}
+            t={t}
+          />
+        ) : activeView === 'projects' ? (
+          <ProjectsPage
+            projects={projects}
+            importPath={projectImportPath}
+            loading={loading}
+            onImportPathChange={setProjectImportPath}
+            onPickProject={() => void handlePickProjectRoot()}
+            onImportProject={handleImportProject}
+            onOpenProject={handleOpenProject}
+            formatRelative={formatRelative}
+            t={t}
+          />
+        ) : activeView === 'detail' && detailSkill ? (
           <SkillDetailView
             skill={detailSkill}
             onBack={handleBackToList}

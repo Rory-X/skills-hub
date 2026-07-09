@@ -1,14 +1,14 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use tauri::Manager;
 
 const DB_FILE_NAME: &str = "skills_hub.db";
 const LEGACY_APP_IDENTIFIERS: &[&str] = &["com.tauri.dev", "com.tauri.dev.skillshub"];
 
 // Schema versioning: bump when making changes and add a migration step.
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 
 // Minimal schema for MVP: skills, skill_targets, settings, discovered_skills(optional).
 const SCHEMA_V1: &str = r#"
@@ -79,6 +79,50 @@ CREATE TABLE IF NOT EXISTS skill_tag_links (
   FOREIGN KEY(skill_id) REFERENCES skills(id) ON DELETE CASCADE,
   FOREIGN KEY(tag_id) REFERENCES skill_tags(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS projects (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  root_path TEXT NOT NULL UNIQUE,
+  enabled_tool_keys TEXT NOT NULL,
+  local_git_exclude_enabled INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  last_scanned_at INTEGER NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_skill_links (
+  project_id TEXT NOT NULL,
+  skill_id TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  desired_tools TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (project_id, skill_id),
+  FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+  FOREIGN KEY(skill_id) REFERENCES skills(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS project_discovered_skills (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  relative_path TEXT NOT NULL,
+  absolute_path TEXT NOT NULL,
+  content_hash TEXT NULL,
+  tool_keys TEXT NOT NULL,
+  status TEXT NOT NULL,
+  matched_skill_id TEXT NULL,
+  first_seen_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+  FOREIGN KEY(matched_skill_id) REFERENCES skills(id) ON DELETE SET NULL,
+  UNIQUE(project_id, absolute_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_discovered_project_name
+ON project_discovered_skills(project_id, name);
 "#;
 
 #[derive(Clone, Debug)]
@@ -117,6 +161,44 @@ pub struct SkillTargetRecord {
     pub status: String,
     pub last_error: Option<String>,
     pub synced_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectRecord {
+    pub id: String,
+    pub name: String,
+    pub root_path: String,
+    pub enabled_tool_keys: Vec<String>,
+    pub local_git_exclude_enabled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_scanned_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectSkillLinkRecord {
+    pub project_id: String,
+    pub skill_id: String,
+    pub enabled: bool,
+    pub desired_tools: Vec<String>,
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectDiscoveredSkillRecord {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub relative_path: String,
+    pub absolute_path: String,
+    pub content_hash: Option<String>,
+    pub tool_keys: Vec<String>,
+    pub status: String,
+    pub matched_skill_id: Option<String>,
+    pub first_seen_at: i64,
+    pub last_seen_at: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,6 +254,9 @@ impl SkillStore {
                 }
                 if user_version < 6 {
                     migrate_skill_enabled_to_v6(conn)?;
+                }
+                if user_version < 7 {
+                    migrate_projects_to_v7(conn)?;
                 }
                 conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             } else if user_version > SCHEMA_VERSION {
@@ -668,6 +753,260 @@ impl SkillStore {
         })
     }
 
+    pub fn get_project(&self, project_id: &str) -> Result<Option<ProjectRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, name, root_path, enabled_tool_keys, local_git_exclude_enabled,
+                        created_at, updated_at, last_scanned_at
+                 FROM projects WHERE id = ?1",
+                params![project_id],
+                project_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn get_project_by_root(&self, root_path: &str) -> Result<Option<ProjectRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, name, root_path, enabled_tool_keys, local_git_exclude_enabled,
+                        created_at, updated_at, last_scanned_at
+                 FROM projects WHERE root_path = ?1",
+                params![root_path],
+                project_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn list_projects(&self) -> Result<Vec<ProjectRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, root_path, enabled_tool_keys, local_git_exclude_enabled,
+                        created_at, updated_at, last_scanned_at
+                 FROM projects
+                 ORDER BY updated_at DESC, name COLLATE NOCASE ASC",
+            )?;
+            let rows = stmt.query_map([], project_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn insert_project(&self, project: &ProjectRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO projects (
+                   id, name, root_path, enabled_tool_keys, local_git_exclude_enabled,
+                   created_at, updated_at, last_scanned_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    project.id,
+                    project.name,
+                    project.root_path,
+                    string_vec_to_json(&project.enabled_tool_keys)?,
+                    project.local_git_exclude_enabled as i32,
+                    project.created_at,
+                    project.updated_at,
+                    project.last_scanned_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn update_project(&self, project: &ProjectRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE projects
+                 SET name = ?2, root_path = ?3, enabled_tool_keys = ?4,
+                     local_git_exclude_enabled = ?5, updated_at = ?6, last_scanned_at = ?7
+                 WHERE id = ?1",
+                params![
+                    project.id,
+                    project.name,
+                    project.root_path,
+                    string_vec_to_json(&project.enabled_tool_keys)?,
+                    project.local_git_exclude_enabled as i32,
+                    project.updated_at,
+                    project.last_scanned_at
+                ],
+            )?;
+            if changed == 0 {
+                anyhow::bail!("project not found: {}", project.id);
+            }
+            Ok(())
+        })
+    }
+
+    pub fn upsert_project_skill_link(&self, link: &ProjectSkillLinkRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO project_skill_links (
+                   project_id, skill_id, enabled, desired_tools, status, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(project_id, skill_id) DO UPDATE SET
+                   enabled = excluded.enabled,
+                   desired_tools = excluded.desired_tools,
+                   status = excluded.status,
+                   updated_at = excluded.updated_at",
+                params![
+                    link.project_id,
+                    link.skill_id,
+                    link.enabled as i32,
+                    string_vec_to_json(&link.desired_tools)?,
+                    link.status,
+                    link.created_at,
+                    link.updated_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_project_skill_link(
+        &self,
+        project_id: &str,
+        skill_id: &str,
+    ) -> Result<Option<ProjectSkillLinkRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT project_id, skill_id, enabled, desired_tools, status, created_at, updated_at
+                 FROM project_skill_links WHERE project_id = ?1 AND skill_id = ?2",
+                params![project_id, skill_id],
+                project_link_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn list_project_skill_links(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<ProjectSkillLinkRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT project_id, skill_id, enabled, desired_tools, status, created_at, updated_at
+                 FROM project_skill_links WHERE project_id = ?1
+                 ORDER BY updated_at DESC",
+            )?;
+            let rows = stmt.query_map(params![project_id], project_link_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn list_project_discovered_skills(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<ProjectDiscoveredSkillRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, project_id, name, relative_path, absolute_path, content_hash,
+                        tool_keys, status, matched_skill_id, first_seen_at, last_seen_at
+                 FROM project_discovered_skills
+                 WHERE project_id = ?1
+                 ORDER BY name COLLATE NOCASE ASC, relative_path ASC",
+            )?;
+            let rows = stmt.query_map(params![project_id], project_discovered_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn replace_project_discovered_skills(
+        &self,
+        project_id: &str,
+        scanned_at: i64,
+        records: &[ProjectDiscoveredSkillRecord],
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let result = (|| -> Result<()> {
+                for record in records {
+                    conn.execute(
+                        "INSERT INTO project_discovered_skills (
+                           id, project_id, name, relative_path, absolute_path, content_hash,
+                           tool_keys, status, matched_skill_id, first_seen_at, last_seen_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                         ON CONFLICT(project_id, absolute_path) DO UPDATE SET
+                           name = excluded.name,
+                           relative_path = excluded.relative_path,
+                           content_hash = excluded.content_hash,
+                           tool_keys = excluded.tool_keys,
+                           status = excluded.status,
+                           matched_skill_id = excluded.matched_skill_id,
+                           last_seen_at = excluded.last_seen_at",
+                        params![
+                            record.id,
+                            record.project_id,
+                            record.name,
+                            record.relative_path,
+                            record.absolute_path,
+                            record.content_hash,
+                            string_vec_to_json(&record.tool_keys)?,
+                            record.status,
+                            record.matched_skill_id,
+                            record.first_seen_at,
+                            record.last_seen_at
+                        ],
+                    )?;
+                }
+                conn.execute(
+                    "DELETE FROM project_discovered_skills
+                     WHERE project_id = ?1 AND last_seen_at <> ?2",
+                    params![project_id, scanned_at],
+                )?;
+                conn.execute(
+                    "UPDATE projects SET last_scanned_at = ?2, updated_at = ?2 WHERE id = ?1",
+                    params![project_id, scanned_at],
+                )?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT;")?;
+                    Ok(())
+                }
+                Err(err) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(err)
+                }
+            }
+        })
+    }
+
+    pub fn list_project_skill_targets(&self, project_root: &str) -> Result<Vec<SkillTargetRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, skill_id, tool, scope, project_path, target_path, mode, status,
+                        last_error, synced_at
+                 FROM skill_targets
+                 WHERE scope = 'project' AND project_path = ?1
+                 ORDER BY target_path ASC, tool ASC",
+            )?;
+            let rows = stmt.query_map(params![project_root], |row| {
+                Ok(SkillTargetRecord {
+                    id: row.get(0)?,
+                    skill_id: row.get(1)?,
+                    tool: row.get(2)?,
+                    scope: row.get(3)?,
+                    project_path: row.get(4)?,
+                    target_path: row.get(5)?,
+                    mode: row.get(6)?,
+                    status: row.get(7)?,
+                    last_error: row.get(8)?,
+                    synced_at: row.get(9)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
     fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = Connection::open(&self.db_path)
             .with_context(|| format!("failed to open db at {:?}", self.db_path))?;
@@ -675,6 +1014,57 @@ impl SkillStore {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         f(&conn)
     }
+}
+
+fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRecord> {
+    Ok(ProjectRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        root_path: row.get(2)?,
+        enabled_tool_keys: string_vec_from_json(row.get::<_, String>(3)?),
+        local_git_exclude_enabled: row.get::<_, i32>(4)? != 0,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        last_scanned_at: row.get(7)?,
+    })
+}
+
+fn project_link_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectSkillLinkRecord> {
+    Ok(ProjectSkillLinkRecord {
+        project_id: row.get(0)?,
+        skill_id: row.get(1)?,
+        enabled: row.get::<_, i32>(2)? != 0,
+        desired_tools: string_vec_from_json(row.get::<_, String>(3)?),
+        status: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+fn project_discovered_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ProjectDiscoveredSkillRecord> {
+    Ok(ProjectDiscoveredSkillRecord {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        name: row.get(2)?,
+        relative_path: row.get(3)?,
+        absolute_path: row.get(4)?,
+        content_hash: row.get(5)?,
+        tool_keys: string_vec_from_json(row.get::<_, String>(6)?),
+        status: row.get(7)?,
+        matched_skill_id: row.get(8)?,
+        first_seen_at: row.get(9)?,
+        last_seen_at: row.get(10)?,
+    })
+}
+
+fn string_vec_from_json(raw: String) -> Vec<String> {
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+fn string_vec_to_json(values: &[String]) -> Result<String> {
+    serde_json::to_string(values).map_err(Into::into)
 }
 
 fn migrate_skill_targets_to_v4(conn: &Connection) -> Result<()> {
@@ -731,6 +1121,55 @@ fn migrate_tags_to_v5(conn: &Connection) -> Result<()> {
 
 fn migrate_skill_enabled_to_v6(conn: &Connection) -> Result<()> {
     conn.execute_batch("ALTER TABLE skills ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;")?;
+    Ok(())
+}
+
+fn migrate_projects_to_v7(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS projects (
+           id TEXT PRIMARY KEY,
+           name TEXT NOT NULL,
+           root_path TEXT NOT NULL UNIQUE,
+           enabled_tool_keys TEXT NOT NULL,
+           local_git_exclude_enabled INTEGER NOT NULL DEFAULT 0,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL,
+           last_scanned_at INTEGER NULL
+         );
+
+         CREATE TABLE IF NOT EXISTS project_skill_links (
+           project_id TEXT NOT NULL,
+           skill_id TEXT NOT NULL,
+           enabled INTEGER NOT NULL DEFAULT 1,
+           desired_tools TEXT NOT NULL,
+           status TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL,
+           PRIMARY KEY (project_id, skill_id),
+           FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+           FOREIGN KEY(skill_id) REFERENCES skills(id) ON DELETE CASCADE
+         );
+
+         CREATE TABLE IF NOT EXISTS project_discovered_skills (
+           id TEXT PRIMARY KEY,
+           project_id TEXT NOT NULL,
+           name TEXT NOT NULL,
+           relative_path TEXT NOT NULL,
+           absolute_path TEXT NOT NULL,
+           content_hash TEXT NULL,
+           tool_keys TEXT NOT NULL,
+           status TEXT NOT NULL,
+           matched_skill_id TEXT NULL,
+           first_seen_at INTEGER NOT NULL,
+           last_seen_at INTEGER NOT NULL,
+           FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+           FOREIGN KEY(matched_skill_id) REFERENCES skills(id) ON DELETE SET NULL,
+           UNIQUE(project_id, absolute_path)
+         );
+
+         CREATE INDEX IF NOT EXISTS idx_project_discovered_project_name
+         ON project_discovered_skills(project_id, name);",
+    )?;
     Ok(())
 }
 
