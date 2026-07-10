@@ -4,14 +4,10 @@ import {
   useMemo,
   useRef,
   useState,
-  type MutableRefObject,
 } from 'react'
-import type { Update } from '@tauri-apps/plugin-updater'
 import './App.css'
 import { useTranslation } from 'react-i18next'
 import { Toaster, toast } from 'sonner'
-import Markdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import ExplorePage from './components/skills/ExplorePage'
 import FilterBar from './components/skills/FilterBar'
 import SkillDetailView from './components/skills/SkillDetailView'
@@ -135,11 +131,6 @@ function App() {
   const [showAddModal, setShowAddModal] = useState(false)
   const [reimportSkill, setReimportSkill] = useState<ManagedSkill | null>(null)
   const [showImportModal, setShowImportModal] = useState(false)
-  const [updateAvailableVersion, setUpdateAvailableVersion] = useState<string | null>(null)
-  const [updateBody, setUpdateBody] = useState<string | null>(null)
-  const [updateInstalling, setUpdateInstalling] = useState(false)
-  const [updateDone, setUpdateDone] = useState(false)
-  const updateObjRef = useRef<Update | null>(null) as MutableRefObject<Update | null>
   const [searchQuery, setSearchQuery] = useState('')
   const [sortBy, setSortBy] = useState<'updated' | 'name'>('updated')
   const [scopeFilter, setScopeFilter] = useState<'all' | 'global' | 'project'>('all')
@@ -520,61 +511,6 @@ function App() {
       void loadPlan()
     }
   }, [isTauri, loadPlan])
-
-  useEffect(() => {
-    if (!isTauri) return
-    const ignoredVersion = localStorage.getItem('skills-ignored-update-version')
-    import('@tauri-apps/plugin-updater')
-      .then(({ check }) => check())
-      .then(async (update) => {
-        if (update && update.version !== ignoredVersion) {
-          updateObjRef.current = update
-          setUpdateAvailableVersion(update.version)
-          // Fetch full release notes from GitHub API
-          try {
-            const res = await fetch(
-              `https://api.github.com/repos/qufei1993/skills-hub/releases/tags/v${update.version}`,
-            )
-            if (res.ok) {
-              const data = await res.json()
-              setUpdateBody(data.body ?? update.body ?? null)
-            } else {
-              setUpdateBody(update.body ?? null)
-            }
-          } catch {
-            setUpdateBody(update.body ?? null)
-          }
-        }
-      })
-      .catch(() => {})
-  }, [isTauri])
-
-  const handleDismissUpdate = useCallback(() => {
-    setUpdateAvailableVersion(null)
-    setUpdateBody(null)
-  }, [])
-
-  const handleDismissUpdateForever = useCallback(() => {
-    if (updateAvailableVersion) {
-      localStorage.setItem('skills-ignored-update-version', updateAvailableVersion)
-    }
-    setUpdateAvailableVersion(null)
-    setUpdateBody(null)
-  }, [updateAvailableVersion])
-
-  const handleUpdateNow = useCallback(async () => {
-    const update = updateObjRef.current
-    if (!update) return
-    setUpdateInstalling(true)
-    try {
-      await update.downloadAndInstall()
-      setUpdateInstalling(false)
-      setUpdateDone(true)
-    } catch (err) {
-      setUpdateInstalling(false)
-      toast.error(err instanceof Error ? err.message : String(err), { duration: 3200 })
-    }
-  }, [])
 
   useEffect(() => {
     if (!successToastMessage) return
@@ -3431,73 +3367,6 @@ function App() {
         />
       ) : null}
 
-      {updateAvailableVersion && (
-        <div className="modal-backdrop" onClick={updateInstalling ? undefined : handleDismissUpdate}>
-          <div
-            className="modal update-modal"
-            role="dialog"
-            aria-modal="true"
-            onClick={(e) => e.stopPropagation()}
-          >
-            {!updateInstalling && !updateDone && (
-              <button
-                className="modal-close update-modal-close"
-                type="button"
-                onClick={handleDismissUpdate}
-                aria-label={t('close')}
-              >
-                ✕
-              </button>
-            )}
-            <div className="update-modal-body">
-              <div className="update-modal-title">
-                {updateDone ? t('updateInstalledRestart') : t('updateAvailable')}
-              </div>
-              {!updateDone && (
-                <div className="update-modal-text">
-                  {t('updateBannerText', { version: updateAvailableVersion })}
-                </div>
-              )}
-              {!updateDone && updateBody && (
-                <div className="update-modal-notes">
-                  <Markdown remarkPlugins={[remarkGfm]}>{updateBody}</Markdown>
-                </div>
-              )}
-            </div>
-            <div className="update-modal-actions">
-              {updateDone ? (
-                <button
-                  className="btn btn-primary"
-                  type="button"
-                  onClick={handleDismissUpdate}
-                >
-                  {t('done')}
-                </button>
-              ) : (
-                <>
-                  <button
-                    className="btn btn-primary"
-                    type="button"
-                    disabled={updateInstalling}
-                    onClick={handleUpdateNow}
-                  >
-                    {updateInstalling ? t('installingUpdate') : t('updateNow')}
-                  </button>
-                  {!updateInstalling && (
-                    <button
-                      className="btn btn-secondary"
-                      type="button"
-                      onClick={handleDismissUpdateForever}
-                    >
-                      {t('updateBannerDismiss')}
-                    </button>
-                  )}
-                </>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
       </div>
   )
 }
