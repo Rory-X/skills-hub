@@ -8,7 +8,7 @@ const DB_FILE_NAME: &str = "skills_hub.db";
 const LEGACY_APP_IDENTIFIERS: &[&str] = &["com.tauri.dev", "com.tauri.dev.skillshub"];
 
 // Schema versioning: bump when making changes and add a migration step.
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 // Minimal schema for MVP: skills, skill_targets, settings, discovered_skills(optional).
 const SCHEMA_V1: &str = r#"
@@ -123,6 +123,36 @@ CREATE TABLE IF NOT EXISTS project_discovered_skills (
 
 CREATE INDEX IF NOT EXISTS idx_project_discovered_project_name
 ON project_discovered_skills(project_id, name);
+
+CREATE TABLE IF NOT EXISTS skill_assignments (
+  id TEXT PRIMARY KEY,
+  skill_id TEXT NOT NULL,
+  tool TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  project_id TEXT NULL,
+  ownership TEXT NOT NULL,
+  state TEXT NOT NULL,
+  last_error TEXT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(skill_id) REFERENCES skills(id) ON DELETE CASCADE,
+  FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_skill_assignments_unique_scope
+ON skill_assignments(skill_id, tool, scope, COALESCE(project_id, ''));
+
+CREATE TABLE IF NOT EXISTS ignored_issues (
+  id TEXT PRIMARY KEY,
+  scope TEXT NOT NULL,
+  scope_id TEXT NULL,
+  issue_key TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  ignored_at INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ignored_issues_instance
+ON ignored_issues(scope, COALESCE(scope_id, ''), issue_key, fingerprint);
 "#;
 
 #[derive(Clone, Debug)]
@@ -161,6 +191,30 @@ pub struct SkillTargetRecord {
     pub status: String,
     pub last_error: Option<String>,
     pub synced_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillAssignmentRecord {
+    pub id: String,
+    pub skill_id: String,
+    pub tool: String,
+    pub scope: String,
+    pub project_id: Option<String>,
+    pub ownership: String,
+    pub state: String,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IgnoredIssueRecord {
+    pub id: String,
+    pub scope: String,
+    pub scope_id: Option<String>,
+    pub issue_key: String,
+    pub fingerprint: String,
+    pub ignored_at: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -237,6 +291,7 @@ impl SkillStore {
                 // V3: add source_subpath column
                 conn.execute_batch("ALTER TABLE skills ADD COLUMN source_subpath TEXT NULL;")?;
                 migrate_skill_targets_to_v4(conn)?;
+                migrate_assignments_to_v8(conn)?;
                 conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             } else if user_version < SCHEMA_VERSION {
                 // Incremental migrations
@@ -257,6 +312,9 @@ impl SkillStore {
                 }
                 if user_version < 7 {
                     migrate_projects_to_v7(conn)?;
+                }
+                if user_version < 8 {
+                    migrate_assignments_to_v8(conn)?;
                 }
                 conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             } else if user_version > SCHEMA_VERSION {
@@ -460,6 +518,28 @@ impl SkillStore {
                 params![description, skill_id],
             )?;
             Ok(())
+        })
+    }
+
+    pub fn update_skill_content_hash(&self, skill_id: &str, content_hash: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE skills SET content_hash = ?1
+                 WHERE id = ?2 AND (content_hash IS NULL OR content_hash <> ?1)",
+                params![content_hash, skill_id],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    pub fn clear_skill_content_hash(&self, skill_id: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE skills SET content_hash = NULL
+                 WHERE id = ?1 AND content_hash IS NOT NULL",
+                params![skill_id],
+            )?;
+            Ok(changed > 0)
         })
     }
 
@@ -750,6 +830,154 @@ impl SkillStore {
                 params![skill_id, tool, scope, project_path, status],
             )?;
             Ok(())
+        })
+    }
+
+    pub fn upsert_skill_assignment(&self, record: &SkillAssignmentRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO skill_assignments (
+                   id, skill_id, tool, scope, project_id, ownership, state,
+                   last_error, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT DO UPDATE SET
+                   ownership = excluded.ownership,
+                   state = excluded.state,
+                   last_error = excluded.last_error,
+                   updated_at = excluded.updated_at",
+                params![
+                    record.id,
+                    record.skill_id,
+                    record.tool,
+                    record.scope,
+                    record.project_id,
+                    record.ownership,
+                    record.state,
+                    record.last_error,
+                    record.created_at,
+                    record.updated_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_skill_assignment(
+        &self,
+        skill_id: &str,
+        tool: &str,
+        scope: &str,
+        project_id: Option<&str>,
+    ) -> Result<Option<SkillAssignmentRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, skill_id, tool, scope, project_id, ownership, state,
+                        last_error, created_at, updated_at
+                 FROM skill_assignments
+                 WHERE skill_id = ?1 AND tool = ?2 AND scope = ?3
+                   AND ((?4 IS NULL AND project_id IS NULL) OR project_id = ?4)",
+                params![skill_id, tool, scope, project_id],
+                skill_assignment_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn list_skill_assignments(&self, skill_id: &str) -> Result<Vec<SkillAssignmentRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, skill_id, tool, scope, project_id, ownership, state,
+                        last_error, created_at, updated_at
+                 FROM skill_assignments
+                 WHERE skill_id = ?1
+                 ORDER BY scope ASC, project_id ASC, tool ASC",
+            )?;
+            let rows = stmt.query_map(params![skill_id], skill_assignment_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn delete_skill_assignment(
+        &self,
+        skill_id: &str,
+        tool: &str,
+        scope: &str,
+        project_id: Option<&str>,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM skill_assignments
+                 WHERE skill_id = ?1 AND tool = ?2 AND scope = ?3
+                   AND ((?4 IS NULL AND project_id IS NULL) OR project_id = ?4)",
+                params![skill_id, tool, scope, project_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn set_skill_assignments_state(&self, skill_id: &str, state: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE skill_assignments SET state = ?2, updated_at = ?3
+                 WHERE skill_id = ?1 AND state = 'active'",
+                params![skill_id, state, now_ms()],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn upsert_ignored_issue(&self, record: &IgnoredIssueRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM ignored_issues
+                 WHERE scope = ?1
+                   AND ((?2 IS NULL AND scope_id IS NULL) OR scope_id = ?2)
+                   AND issue_key = ?3
+                   AND fingerprint <> ?4",
+                params![
+                    record.scope,
+                    record.scope_id,
+                    record.issue_key,
+                    record.fingerprint
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO ignored_issues (
+                   id, scope, scope_id, issue_key, fingerprint, ignored_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT DO UPDATE SET ignored_at = excluded.ignored_at",
+                params![
+                    record.id,
+                    record.scope,
+                    record.scope_id,
+                    record.issue_key,
+                    record.fingerprint,
+                    record.ignored_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn is_issue_ignored(
+        &self,
+        scope: &str,
+        scope_id: Option<&str>,
+        issue_key: &str,
+        fingerprint: &str,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ignored_issues
+                 WHERE scope = ?1
+                   AND ((?2 IS NULL AND scope_id IS NULL) OR scope_id = ?2)
+                   AND issue_key = ?3 AND fingerprint = ?4",
+                params![scope, scope_id, issue_key, fingerprint],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
         })
     }
 
@@ -1059,6 +1287,21 @@ fn project_discovered_from_row(
     })
 }
 
+fn skill_assignment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SkillAssignmentRecord> {
+    Ok(SkillAssignmentRecord {
+        id: row.get(0)?,
+        skill_id: row.get(1)?,
+        tool: row.get(2)?,
+        scope: row.get(3)?,
+        project_id: row.get(4)?,
+        ownership: row.get(5)?,
+        state: row.get(6)?,
+        last_error: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
 fn string_vec_from_json(raw: String) -> Vec<String> {
     serde_json::from_str(&raw).unwrap_or_default()
 }
@@ -1171,6 +1414,150 @@ fn migrate_projects_to_v7(conn: &Connection) -> Result<()> {
          ON project_discovered_skills(project_id, name);",
     )?;
     Ok(())
+}
+
+fn migrate_assignments_to_v8(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN;
+         CREATE TABLE IF NOT EXISTS skill_assignments (
+           id TEXT PRIMARY KEY,
+           skill_id TEXT NOT NULL,
+           tool TEXT NOT NULL,
+           scope TEXT NOT NULL,
+           project_id TEXT NULL,
+           ownership TEXT NOT NULL,
+           state TEXT NOT NULL,
+           last_error TEXT NULL,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL,
+           FOREIGN KEY(skill_id) REFERENCES skills(id) ON DELETE CASCADE,
+           FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_skill_assignments_unique_scope
+         ON skill_assignments(skill_id, tool, scope, COALESCE(project_id, ''));
+
+         CREATE TABLE IF NOT EXISTS ignored_issues (
+           id TEXT PRIMARY KEY,
+           scope TEXT NOT NULL,
+           scope_id TEXT NULL,
+           issue_key TEXT NOT NULL,
+           fingerprint TEXT NOT NULL,
+           ignored_at INTEGER NOT NULL
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_ignored_issues_instance
+         ON ignored_issues(scope, COALESCE(scope_id, ''), issue_key, fingerprint);
+
+         INSERT OR IGNORE INTO skill_assignments (
+           id, skill_id, tool, scope, project_id, ownership, state,
+           last_error, created_at, updated_at
+         )
+         SELECT
+           'assignment:target:' || target.id,
+           target.skill_id,
+           target.tool,
+           target.scope,
+           CASE WHEN target.scope = 'project' THEN project.id ELSE NULL END,
+           'hub',
+           CASE
+             WHEN target.status = 'disabled' THEN 'suspended'
+             WHEN target.status = 'error' THEN 'error'
+             ELSE 'active'
+           END,
+           target.last_error,
+           COALESCE(target.synced_at, skill.created_at),
+           COALESCE(target.synced_at, skill.updated_at)
+         FROM skill_targets target
+         JOIN skills skill ON skill.id = target.skill_id
+         LEFT JOIN projects project ON project.root_path = target.project_path
+         WHERE target.scope = 'global' OR project.id IS NOT NULL;",
+    )?;
+
+    let migration_result = (|| -> Result<()> {
+        let links = {
+            let mut stmt = conn.prepare(
+                "SELECT link.project_id, link.skill_id, link.desired_tools, link.status,
+                        link.created_at, link.updated_at, project.root_path, skill.enabled
+                 FROM project_skill_links link
+                 JOIN projects project ON project.id = link.project_id
+                 JOIN skills skill ON skill.id = link.skill_id
+                 WHERE link.enabled = 1",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i32>(7)? != 0,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        for (
+            project_id,
+            skill_id,
+            desired_tools,
+            link_status,
+            created_at,
+            updated_at,
+            root,
+            enabled,
+        ) in links
+        {
+            for tool in string_vec_from_json(desired_tools) {
+                let has_hub_target: bool = conn.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM skill_targets
+                       WHERE skill_id = ?1 AND tool = ?2
+                         AND scope = 'project' AND project_path = ?3
+                     )",
+                    params![skill_id, tool, root],
+                    |row| row.get(0),
+                )?;
+                let state = if !enabled {
+                    "suspended"
+                } else if matches!(link_status.as_str(), "error" | "conflict" | "partial") {
+                    "error"
+                } else {
+                    "active"
+                };
+                let last_error = (state == "error").then_some(link_status.as_str());
+                conn.execute(
+                    "INSERT OR IGNORE INTO skill_assignments (
+                       id, skill_id, tool, scope, project_id, ownership, state,
+                       last_error, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, 'project', ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        format!("assignment:project:{project_id}:{skill_id}:{tool}"),
+                        skill_id,
+                        tool,
+                        project_id,
+                        if has_hub_target { "hub" } else { "native" },
+                        state,
+                        last_error,
+                        created_at,
+                        updated_at
+                    ],
+                )?;
+            }
+        }
+        Ok(())
+    })();
+
+    match migration_result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(err)
+        }
+    }
 }
 
 fn normalize_tag_name(name: &str) -> Result<String> {

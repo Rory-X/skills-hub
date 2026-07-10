@@ -4,6 +4,9 @@ import type { TFunction } from 'i18next'
 import type { TagWithCountDto } from './types'
 
 type FilterBarProps = {
+  listMode: 'all' | 'pending'
+  allCount: number
+  pendingCount: number
   sortBy: 'updated' | 'name'
   searchQuery: string
   scopeFilter: 'all' | 'global' | 'project'
@@ -11,10 +14,10 @@ type FilterBarProps = {
   selectedTagIds: number[]
   includeUntagged: boolean
   untaggedCount: number
-  totalCount: number
   bulkMode: boolean
   bulkSelectedCount: number
   onSortChange: (value: 'updated' | 'name') => void
+  onListModeChange: (value: 'all' | 'pending') => void
   onSearchChange: (value: string) => void
   onScopeFilterChange: (value: 'all' | 'global' | 'project') => void
   onToggleTag: (tagId: number) => void
@@ -26,6 +29,9 @@ type FilterBarProps = {
 }
 
 const FilterBar = ({
+  listMode,
+  allCount,
+  pendingCount,
   sortBy,
   searchQuery,
   scopeFilter,
@@ -33,10 +39,10 @@ const FilterBar = ({
   selectedTagIds,
   includeUntagged,
   untaggedCount,
-  totalCount,
   bulkMode,
   bulkSelectedCount,
   onSortChange,
+  onListModeChange,
   onSearchChange,
   onScopeFilterChange,
   onToggleTag,
@@ -75,8 +81,27 @@ const FilterBar = ({
 
   return (
     <div className="filter-bar">
-      <div className="filter-title">
-        {t('allSkills')}（{totalCount}）
+      <div className="skill-list-tabs" role="tablist" aria-label={t('allSkills')}>
+        <button
+          className={listMode === 'all' ? 'active' : ''}
+          type="button"
+          role="tab"
+          aria-selected={listMode === 'all'}
+          onClick={() => onListModeChange('all')}
+        >
+          {t('allSkills')}
+          <span>{allCount}</span>
+        </button>
+        <button
+          className={listMode === 'pending' ? 'active' : ''}
+          type="button"
+          role="tab"
+          aria-selected={listMode === 'pending'}
+          onClick={() => onListModeChange('pending')}
+        >
+          {t('assignment.pendingTab')}
+          <span>{pendingCount}</span>
+        </button>
       </div>
       <div className="filter-actions">
         <button className="btn btn-secondary sort-btn" type="button">

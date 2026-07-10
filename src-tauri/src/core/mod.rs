@@ -1,3 +1,4 @@
+pub mod assignments;
 pub mod auto_update;
 pub mod cache_cleanup;
 pub mod cancel_token;
@@ -8,6 +9,7 @@ pub mod git_fetcher;
 pub mod github_download;
 pub mod github_search;
 pub mod installer;
+pub mod managed_targets;
 pub mod network_proxy;
 pub mod onboarding;
 pub mod projects;

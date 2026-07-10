@@ -1,6 +1,11 @@
 import { memo, useMemo, useState } from 'react'
-import { Download, Search } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, Download, Search, Wrench } from 'lucide-react'
 import type { TFunction } from 'i18next'
+import {
+  getDiscoveredHubResolutionKey,
+  getDiscoveredImportDecision,
+  type DiscoveredHubResolution,
+} from '../discoveredImportResolution'
 import type { OnboardingPlan } from '../types'
 
 type ImportModalProps = {
@@ -9,9 +14,15 @@ type ImportModalProps = {
   plan: OnboardingPlan
   selected: Record<string, boolean>
   variantChoice: Record<string, string>
+  hubResolutions: Record<string, DiscoveredHubResolution | undefined>
+  reservedSkillNames: string[]
   onRequestClose: () => void
   onToggleGroup: (groupName: string, checked: boolean) => void
   onSelectVariant: (groupName: string, path: string) => void
+  onResolveHubConflict: (
+    groupName: string,
+    resolution: DiscoveredHubResolution,
+  ) => void
   onImport: () => void
   t: TFunction
 }
@@ -22,13 +33,23 @@ const ImportModal = ({
   plan,
   selected,
   variantChoice,
+  hubResolutions,
+  reservedSkillNames,
   onRequestClose,
   onToggleGroup,
   onSelectVariant,
+  onResolveHubConflict,
   onImport,
   t,
 }: ImportModalProps) => {
   const [query, setQuery] = useState('')
+  const [resolutionGroupName, setResolutionGroupName] = useState<string | null>(
+    null,
+  )
+  const [draftResolution, setDraftResolution] = useState<
+    DiscoveredHubResolution['kind']
+  >('use_hub')
+  const [draftRename, setDraftRename] = useState('')
   const normalizedQuery = query.trim().toLowerCase()
   const filteredGroups = useMemo(() => {
     if (!normalizedQuery) return plan.groups
@@ -49,6 +70,48 @@ const ImportModal = ({
   const allVisibleSelected =
     filteredGroups.length > 0 &&
     filteredGroups.every((group) => selected[group.name])
+  const unresolvedHubConflictCount = plan.groups.filter((group) => {
+    if (!selected[group.name]) return false
+    return getDiscoveredImportDecision(
+      group,
+      variantChoice[group.name],
+      hubResolutions[group.name],
+    ).unresolvedHubConflict
+  }).length
+
+  const openResolution = (groupName: string) => {
+    const existing = hubResolutions[groupName]
+    setDraftResolution(existing?.kind ?? 'use_hub')
+    setDraftRename(
+      existing?.kind === 'rename' ? existing.name : `${groupName}-local`,
+    )
+    setResolutionGroupName(groupName)
+  }
+
+  const normalizedDraftRename = draftRename.trim()
+  const renameIsTaken =
+    draftResolution === 'rename' &&
+    (reservedSkillNames.some(
+      (name) => name.toLowerCase() === normalizedDraftRename.toLowerCase(),
+    ) ||
+      plan.groups.some(
+        (group) =>
+          group.name !== resolutionGroupName &&
+          group.name.toLowerCase() === normalizedDraftRename.toLowerCase(),
+      ))
+  const renameIsInvalid =
+    draftResolution === 'rename' &&
+    (normalizedDraftRename.length === 0 || renameIsTaken)
+
+  const confirmResolution = () => {
+    if (!resolutionGroupName || renameIsInvalid) return
+    const resolution: DiscoveredHubResolution =
+      draftResolution === 'rename'
+        ? { kind: 'rename', name: normalizedDraftRename }
+        : { kind: draftResolution }
+    onResolveHubConflict(resolutionGroupName, resolution)
+    setResolutionGroupName(null)
+  }
 
   const toggleVisibleGroups = (checked: boolean) => {
     filteredGroups.forEach((group) => onToggleGroup(group.name, checked))
@@ -111,7 +174,22 @@ const ImportModal = ({
             {filteredGroups.length === 0 ? (
               <div className="empty">{t('importSearchEmpty')}</div>
             ) : null}
-            {filteredGroups.map((group) => (
+            {filteredGroups.map((group) => {
+              const decision = getDiscoveredImportDecision(
+                group,
+                variantChoice[group.name],
+                hubResolutions[group.name],
+              )
+              const hubRelation = decision.variant?.hub_relation
+              const hubResolutionKey = getDiscoveredHubResolutionKey(
+                hubResolutions[group.name],
+              )
+              const hubResolution = hubResolutions[group.name]
+              const hasHubConflict =
+                Boolean(group.hub_skill) && hubRelation !== 'same'
+              const isResolving = resolutionGroupName === group.name
+
+              return (
               <div className="group-card" key={group.name}>
                 <div className="group-title">
                   <label className="group-select">
@@ -124,11 +202,32 @@ const ImportModal = ({
                     />
                     <span>{group.name}</span>
                   </label>
-                  {group.has_conflict ? (
-                    <span className="badge danger">{t('conflict')}</span>
-                  ) : (
-                    <span className="badge">{t('consistent')}</span>
-                  )}
+                  <div className="discovered-group-status">
+                    {group.hub_skill ? (
+                      hubRelation === 'same' ? (
+                        <span className="badge success">
+                          <CheckCircle2 size={12} />
+                          {t('discoveredHub.same')}
+                        </span>
+                      ) : (
+                        <span className="badge danger">
+                          <AlertTriangle size={12} />
+                          {t(
+                            hubRelation === 'unknown'
+                              ? 'discoveredHub.unknown'
+                              : 'discoveredHub.conflict',
+                          )}
+                        </span>
+                      )
+                    ) : group.has_conflict ? (
+                      <span className="badge danger">{t('sourcesConflict')}</span>
+                    ) : (
+                      <span className="badge">{t('sourcesConsistent')}</span>
+                    )}
+                    {group.hub_skill && group.has_conflict ? (
+                      <span className="badge danger">{t('sourcesConflict')}</span>
+                    ) : null}
+                  </div>
                 </div>
                 <div className="group-variants">
                   {group.variants.map((variant) => {
@@ -177,15 +276,120 @@ const ImportModal = ({
                     )
                   })}
                 </div>
+                {group.hub_skill ? (
+                  <div className={`discovered-hub-action${hasHubConflict ? ' conflict' : ''}`}>
+                    <div>
+                      <strong>
+                        {hasHubConflict
+                          ? t('discoveredHub.conflictTitle')
+                          : t('discoveredHub.reuseTitle')}
+                      </strong>
+                      <span>
+                        {hasHubConflict
+                          ? hubResolutionKey
+                            ? t(`discoveredHub.resolutions.${hubResolutionKey}.selected`, {
+                                name:
+                                  hubResolution?.kind === 'rename'
+                                    ? hubResolution.name
+                                    : group.name,
+                              })
+                            : t('discoveredHub.conflictImpact')
+                          : t('discoveredHub.reuseImpact')}
+                      </span>
+                    </div>
+                    {hasHubConflict ? (
+                      <button
+                        className="btn btn-secondary discovered-resolve-btn"
+                        type="button"
+                        onClick={() => openResolution(group.name)}
+                        disabled={loading}
+                      >
+                        <Wrench size={14} />
+                        {hubResolutionKey
+                          ? t('discoveredHub.changeResolution')
+                          : t('discoveredHub.handleConflict')}
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
+                {isResolving ? (
+                  <div className="discovered-resolution-editor">
+                    <fieldset>
+                      <legend>{t('discoveredHub.chooseResolution')}</legend>
+                      {(['use_hub', 'replace_hub', 'rename'] as const).map((kind) => {
+                        const key =
+                          kind === 'use_hub'
+                            ? 'useHub'
+                            : kind === 'replace_hub'
+                              ? 'replaceHub'
+                              : 'rename'
+                        return (
+                          <label key={kind}>
+                            <input
+                              type="radio"
+                              name={`hub-resolution-${group.name}`}
+                              checked={draftResolution === kind}
+                              onChange={() => setDraftResolution(kind)}
+                              disabled={loading}
+                            />
+                            <span>
+                              <strong>{t(`discoveredHub.resolutions.${key}.title`)}</strong>
+                              <small>{t(`discoveredHub.resolutions.${key}.description`)}</small>
+                            </span>
+                          </label>
+                        )
+                      })}
+                    </fieldset>
+                    {draftResolution === 'rename' ? (
+                      <div className="discovered-rename-field">
+                        <input
+                          value={draftRename}
+                          onChange={(event) => setDraftRename(event.target.value)}
+                          placeholder={t('discoveredHub.renamePlaceholder')}
+                          aria-label={t('discoveredHub.renameLabel')}
+                          disabled={loading}
+                        />
+                        {renameIsInvalid ? (
+                          <span>
+                            {renameIsTaken
+                              ? t('discoveredHub.renameTaken')
+                              : t('discoveredHub.renameRequired')}
+                          </span>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    <div className="discovered-resolution-actions">
+                      <button
+                        className="btn btn-secondary"
+                        type="button"
+                        onClick={() => setResolutionGroupName(null)}
+                        disabled={loading}
+                      >
+                        {t('cancel')}
+                      </button>
+                      <button
+                        className="btn btn-primary"
+                        type="button"
+                        onClick={confirmResolution}
+                        disabled={loading || renameIsInvalid}
+                      >
+                        {t('confirm')}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
               </div>
-            ))}
+              )
+            })}
           </div>
         </div>
         <div className="modal-footer">
           <button
             className="btn btn-primary"
             onClick={onImport}
-            disabled={loading || selectedCount === 0}
+            disabled={
+              loading || selectedCount === 0 || unresolvedHubConflictCount > 0
+            }
           >
             <Download size={14} />
             {t('importAndSync')}

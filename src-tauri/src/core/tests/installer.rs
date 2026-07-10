@@ -220,6 +220,89 @@ description: >-
 }
 
 #[test]
+fn backfill_skill_content_hashes_populates_legacy_records() {
+    let (_dir, store) = make_store();
+    let central = tempfile::tempdir().unwrap();
+    fs::write(central.path().join("SKILL.md"), "same content").unwrap();
+    let expected_hash = crate::core::content_hash::hash_dir(central.path()).unwrap();
+    store
+        .upsert_skill(&SkillRecord {
+            id: "legacy-skill".to_string(),
+            name: "legacy-skill".to_string(),
+            description: None,
+            source_type: "local".to_string(),
+            source_ref: None,
+            source_subpath: None,
+            source_revision: None,
+            central_path: central.path().to_string_lossy().to_string(),
+            content_hash: Some("legacy-hash".to_string()),
+            created_at: 1,
+            updated_at: 1,
+            last_sync_at: None,
+            last_seen_at: 1,
+            enabled: true,
+            status: "ok".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(super::backfill_skill_content_hashes(&store), 1);
+    assert_eq!(super::backfill_skill_content_hashes(&store), 0);
+    assert_eq!(
+        store
+            .get_skill_by_id("legacy-skill")
+            .unwrap()
+            .unwrap()
+            .content_hash
+            .as_deref(),
+        Some(expected_hash.as_str())
+    );
+}
+
+#[test]
+fn hash_migration_retries_a_legacy_skill_when_its_directory_returns() {
+    let (_dir, store) = make_store();
+    let central_root = tempfile::tempdir().unwrap();
+    let central_path = central_root.path().join("temporarily-missing");
+    store
+        .upsert_skill(&SkillRecord {
+            id: "missing-legacy-skill".to_string(),
+            name: "missing-legacy-skill".to_string(),
+            description: None,
+            source_type: "local".to_string(),
+            source_ref: None,
+            source_subpath: None,
+            source_revision: None,
+            central_path: central_path.to_string_lossy().to_string(),
+            content_hash: Some("legacy-hash".to_string()),
+            created_at: 1,
+            updated_at: 1,
+            last_sync_at: None,
+            last_seen_at: 1,
+            enabled: true,
+            status: "ok".to_string(),
+        })
+        .unwrap();
+
+    assert_eq!(super::backfill_skill_content_hashes(&store), 0);
+    assert!(store
+        .get_skill_by_id("missing-legacy-skill")
+        .unwrap()
+        .unwrap()
+        .content_hash
+        .is_none());
+
+    fs::create_dir_all(&central_path).unwrap();
+    fs::write(central_path.join("SKILL.md"), "restored").unwrap();
+    assert_eq!(super::backfill_skill_content_hashes(&store), 1);
+    assert!(store
+        .get_skill_by_id("missing-legacy-skill")
+        .unwrap()
+        .unwrap()
+        .content_hash
+        .is_some());
+}
+
+#[test]
 fn installs_local_skill_and_updates_from_source() {
     let app = tauri::test::mock_app();
     let (_dir, store) = make_store();
@@ -239,9 +322,11 @@ fn installs_local_skill_and_updates_from_source() {
     )
     .unwrap();
     assert!(res.central_path.exists());
+    assert!(res.content_hash.is_some());
 
     let skill = store.get_skill_by_id(&res.skill_id).unwrap().unwrap();
     assert_eq!(skill.name, "local1");
+    assert_eq!(skill.content_hash.as_deref(), res.content_hash.as_deref());
 
     // add a copy target so update will resync it
     let target_root = tempfile::tempdir().unwrap();
@@ -263,6 +348,7 @@ fn installs_local_skill_and_updates_from_source() {
     fs::write(source.path().join("a.txt"), b"v2").unwrap();
     let up = super::update_managed_skill_from_source(app.handle(), &store, &res.skill_id).unwrap();
     assert_eq!(up.skill_id, res.skill_id);
+    assert!(up.content_hash.is_some());
     assert!(up.updated_targets.contains(&"unknown_tool".to_string()));
     assert!(PathBuf::from(
         store
@@ -288,6 +374,317 @@ fn installs_local_skill_and_updates_from_source() {
         Err(e) => e,
     };
     assert!(format!("{:#}", err).contains("skill already exists"));
+}
+
+#[test]
+fn update_restores_a_missing_central_directory_from_local_source() {
+    let app = tauri::test::mock_app();
+    let (_dir, store) = make_store();
+    let central_root = tempfile::tempdir().unwrap();
+    set_central_path(&store, central_root.path());
+
+    let source = tempfile::tempdir().unwrap();
+    fs::write(
+        source.path().join("SKILL.md"),
+        b"---\nname: restored\n---\n",
+    )
+    .unwrap();
+    fs::write(source.path().join("version.txt"), b"v1").unwrap();
+    let installed = super::install_local_skill(
+        app.handle(),
+        &store,
+        source.path(),
+        Some("restored".to_string()),
+    )
+    .unwrap();
+
+    fs::remove_dir_all(&installed.central_path).unwrap();
+    fs::write(source.path().join("version.txt"), b"v2").unwrap();
+
+    let restored =
+        super::update_managed_skill_from_source(app.handle(), &store, &installed.skill_id).unwrap();
+
+    assert_eq!(restored.skill_id, installed.skill_id);
+    assert_eq!(
+        fs::read(restored.central_path.join("version.txt")).unwrap(),
+        b"v2"
+    );
+    assert!(restored.content_hash.is_some());
+}
+
+#[test]
+fn reimport_local_selection_replaces_the_existing_record() {
+    let app = tauri::test::mock_app();
+    let (_dir, store) = make_store();
+    let central_root = tempfile::tempdir().unwrap();
+    set_central_path(&store, central_root.path());
+
+    let original = tempfile::tempdir().unwrap();
+    fs::write(
+        original.path().join("SKILL.md"),
+        b"---\nname: original\n---\n",
+    )
+    .unwrap();
+    let installed = super::install_local_skill(
+        app.handle(),
+        &store,
+        original.path(),
+        Some("stable-name".to_string()),
+    )
+    .unwrap();
+
+    let replacement_root = tempfile::tempdir().unwrap();
+    let replacement = replacement_root.path().join("nested");
+    fs::create_dir_all(&replacement).unwrap();
+    fs::write(
+        replacement.join("SKILL.md"),
+        b"---\nname: replacement\n---\n",
+    )
+    .unwrap();
+    fs::write(replacement.join("new.txt"), b"replacement").unwrap();
+
+    let reimported = super::reimport_local_skill_from_selection(
+        &store,
+        &installed.skill_id,
+        replacement_root.path(),
+        "nested",
+    )
+    .unwrap();
+
+    assert_eq!(reimported.skill_id, installed.skill_id);
+    assert_eq!(reimported.name, "stable-name");
+    assert_eq!(store.list_skills().unwrap().len(), 1);
+    assert_eq!(
+        fs::read(reimported.central_path.join("new.txt")).unwrap(),
+        b"replacement"
+    );
+    let record = store.get_skill_by_id(&installed.skill_id).unwrap().unwrap();
+    assert_eq!(record.source_type, "local");
+    assert_eq!(
+        record.source_ref.as_deref(),
+        Some(replacement.to_string_lossy().as_ref())
+    );
+}
+
+#[test]
+fn reimport_git_selection_replaces_the_existing_record() {
+    let app = tauri::test::mock_app();
+    let (_dir, store) = make_store();
+    let central_root = tempfile::tempdir().unwrap();
+    set_central_path(&store, central_root.path());
+
+    let original = tempfile::tempdir().unwrap();
+    fs::write(
+        original.path().join("SKILL.md"),
+        b"---\nname: original\n---\n",
+    )
+    .unwrap();
+    let installed = super::install_local_skill(
+        app.handle(),
+        &store,
+        original.path(),
+        Some("stable-name".to_string()),
+    )
+    .unwrap();
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    let selected = repo_dir.path().join("skills/replacement");
+    fs::create_dir_all(&selected).unwrap();
+    fs::write(selected.join("SKILL.md"), b"---\nname: replacement\n---\n").unwrap();
+    fs::write(selected.join("new.txt"), b"git replacement").unwrap();
+    let repo = init_git_repo(repo_dir.path());
+    commit_all(&repo, "add replacement");
+    let repo_url = repo_dir.path().to_string_lossy().to_string();
+
+    let reimported = super::reimport_git_skill_from_selection(
+        app.handle(),
+        &store,
+        &installed.skill_id,
+        &repo_url,
+        "skills/replacement",
+    )
+    .unwrap();
+
+    assert_eq!(reimported.skill_id, installed.skill_id);
+    assert_eq!(reimported.name, "stable-name");
+    assert_eq!(
+        fs::read(reimported.central_path.join("new.txt")).unwrap(),
+        b"git replacement"
+    );
+    let record = store.get_skill_by_id(&installed.skill_id).unwrap().unwrap();
+    assert_eq!(record.source_type, "git");
+    assert_eq!(record.source_ref.as_deref(), Some(repo_url.as_str()));
+    assert_eq!(record.source_subpath.as_deref(), Some("skills/replacement"));
+    assert!(record.source_revision.is_some());
+}
+
+#[test]
+fn git_update_persists_an_inferred_multi_skill_subpath() {
+    let app = tauri::test::mock_app();
+    let (_dir, store) = make_store();
+    let central_root = tempfile::tempdir().unwrap();
+    let central_path = central_root.path().join("stable-name");
+    fs::create_dir_all(&central_path).unwrap();
+    fs::write(
+        central_path.join("SKILL.md"),
+        b"---\nname: stable-name\n---\nold",
+    )
+    .unwrap();
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo_dir.path().join("skills/a")).unwrap();
+    fs::create_dir_all(repo_dir.path().join("skills/b")).unwrap();
+    fs::write(
+        repo_dir.path().join("skills/a/SKILL.md"),
+        b"---\nname: stable-name\n---\nnew",
+    )
+    .unwrap();
+    fs::write(
+        repo_dir.path().join("skills/b/SKILL.md"),
+        b"---\nname: other\n---\n",
+    )
+    .unwrap();
+    let repo = init_git_repo(repo_dir.path());
+    commit_all(&repo, "add skills");
+    let record = SkillRecord {
+        id: "legacy-git".to_string(),
+        name: "stable-name".to_string(),
+        description: None,
+        source_type: "git".to_string(),
+        source_ref: Some(repo_dir.path().to_string_lossy().to_string()),
+        source_subpath: None,
+        source_revision: None,
+        central_path: central_path.to_string_lossy().to_string(),
+        content_hash: None,
+        created_at: 1,
+        updated_at: 1,
+        last_sync_at: None,
+        last_seen_at: 1,
+        enabled: true,
+        status: "ok".to_string(),
+    };
+    store.upsert_skill(&record).unwrap();
+
+    super::update_managed_skill_from_source(app.handle(), &store, &record.id).unwrap();
+
+    let updated = store.get_skill_by_id(&record.id).unwrap().unwrap();
+    assert_eq!(updated.source_subpath.as_deref(), Some("skills/a"));
+    assert!(fs::read_to_string(central_path.join("SKILL.md"))
+        .unwrap()
+        .contains("new"));
+}
+
+#[test]
+fn discovered_import_reuses_same_managed_skill() {
+    let app = tauri::test::mock_app();
+    let (_dir, store) = make_store();
+    let central_root = tempfile::tempdir().unwrap();
+    set_central_path(&store, central_root.path());
+
+    let original = tempfile::tempdir().unwrap();
+    fs::write(original.path().join("SKILL.md"), b"# Same").unwrap();
+    let installed = super::install_local_skill(
+        app.handle(),
+        &store,
+        original.path(),
+        Some("same-skill".to_string()),
+    )
+    .unwrap();
+
+    let discovered = tempfile::tempdir().unwrap();
+    fs::write(discovered.path().join("SKILL.md"), b"# Same").unwrap();
+    fs::write(discovered.path().join("_skillhub_meta.json"), b"{}").unwrap();
+    let reused =
+        super::import_discovered_skill(app.handle(), &store, discovered.path(), "same-skill", None)
+            .unwrap();
+
+    assert_eq!(reused.skill_id, installed.skill_id);
+    assert_eq!(store.list_skills().unwrap().len(), 1);
+}
+
+#[test]
+fn discovered_import_requires_resolution_and_can_replace_managed_skill() {
+    let app = tauri::test::mock_app();
+    let (_dir, store) = make_store();
+    let central_root = tempfile::tempdir().unwrap();
+    set_central_path(&store, central_root.path());
+
+    let original = tempfile::tempdir().unwrap();
+    fs::write(original.path().join("SKILL.md"), b"# Hub version").unwrap();
+    let installed = super::install_local_skill(
+        app.handle(),
+        &store,
+        original.path(),
+        Some("conflicting-skill".to_string()),
+    )
+    .unwrap();
+
+    let discovered = tempfile::tempdir().unwrap();
+    fs::write(discovered.path().join("SKILL.md"), b"# Discovered version").unwrap();
+    let error = super::import_discovered_skill(
+        app.handle(),
+        &store,
+        discovered.path(),
+        "conflicting-skill",
+        None,
+    )
+    .unwrap_err();
+    assert!(error.to_string().starts_with("HUB_NAME_CONFLICT|"));
+
+    let kept = super::import_discovered_skill(
+        app.handle(),
+        &store,
+        discovered.path(),
+        "conflicting-skill",
+        Some("use_hub"),
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(kept.central_path.join("SKILL.md")).unwrap(),
+        "# Hub version"
+    );
+
+    let target_root = tempfile::tempdir().unwrap();
+    let target_path = target_root.path().join("conflicting-skill");
+    fs::create_dir_all(&target_path).unwrap();
+    fs::write(target_path.join("SKILL.md"), b"# Hub version").unwrap();
+    store
+        .upsert_skill_target(&SkillTargetRecord {
+            id: "copy-target".to_string(),
+            skill_id: installed.skill_id.clone(),
+            tool: "unknown_tool".to_string(),
+            scope: "global".to_string(),
+            project_path: None,
+            target_path: target_path.to_string_lossy().to_string(),
+            mode: "copy".to_string(),
+            status: "ok".to_string(),
+            last_error: None,
+            synced_at: None,
+        })
+        .unwrap();
+
+    let replaced = super::import_discovered_skill(
+        app.handle(),
+        &store,
+        discovered.path(),
+        "conflicting-skill",
+        Some("replace_hub"),
+    )
+    .unwrap();
+    assert_eq!(replaced.skill_id, installed.skill_id);
+    assert_eq!(
+        fs::read_to_string(replaced.central_path.join("SKILL.md")).unwrap(),
+        "# Discovered version"
+    );
+    assert_eq!(
+        fs::read_to_string(target_path.join("SKILL.md")).unwrap(),
+        "# Discovered version"
+    );
+    let record = store.get_skill_by_id(&installed.skill_id).unwrap().unwrap();
+    assert_eq!(
+        record.source_ref.as_deref(),
+        Some(discovered.path().to_string_lossy().as_ref())
+    );
 }
 
 #[test]

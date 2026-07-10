@@ -16,6 +16,7 @@ type SkillsListProps = {
   loading: boolean
   bulkMode: boolean
   selectedSkillIds: string[]
+  highlightedSkillIds: string[]
   getGithubInfo: (url: string | null | undefined) => GithubInfo | null
   getSkillSourceLabel: (skill: ManagedSkill) => string
   formatRelative: (ms: number | null | undefined) => string
@@ -23,7 +24,6 @@ type SkillsListProps = {
   onUpdateSkill: (skill: ManagedSkill) => void
   onDeleteSkill: (skillId: string) => void
   onToggleSkillEnabled: (skill: ManagedSkill) => void
-  onToggleTool: (skill: ManagedSkill, toolId: string) => void
   onOpenScope: (skill: ManagedSkill) => void
   onOpenDetail: (skill: ManagedSkill) => void
   onEditTags: (skill: ManagedSkill) => void
@@ -40,6 +40,7 @@ const SkillsList = ({
   loading,
   bulkMode,
   selectedSkillIds,
+  highlightedSkillIds,
   getGithubInfo,
   getSkillSourceLabel,
   formatRelative,
@@ -47,7 +48,6 @@ const SkillsList = ({
   onUpdateSkill,
   onDeleteSkill,
   onToggleSkillEnabled,
-  onToggleTool,
   onOpenScope,
   onOpenDetail,
   onEditTags,
@@ -57,6 +57,7 @@ const SkillsList = ({
   t,
 }: SkillsListProps) => {
   const selectedSkillSet = new Set(selectedSkillIds)
+  const highlightedSkillSet = new Set(highlightedSkillIds)
 
   return (
     <div className="skills-list">
@@ -96,13 +97,13 @@ const SkillsList = ({
               loading={loading}
               bulkMode={bulkMode}
               bulkSelected={selectedSkillSet.has(skill.id)}
+              highlighted={highlightedSkillSet.has(skill.id)}
               getGithubInfo={getGithubInfo}
               getSkillSourceLabel={getSkillSourceLabel}
               formatRelative={formatRelative}
               onUpdate={onUpdateSkill}
               onDelete={onDeleteSkill}
               onToggleEnabled={onToggleSkillEnabled}
-              onToggleTool={onToggleTool}
               onOpenScope={onOpenScope}
               onOpenDetail={onOpenDetail}
               onEditTags={onEditTags}

@@ -8,6 +8,7 @@ import {
   Folder,
   FolderOpen,
   GitBranch,
+  Share2,
 } from 'lucide-react'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import {
@@ -25,6 +26,7 @@ import type { ManagedSkill, SkillFileEntry } from './types'
 type SkillDetailViewProps = {
   skill: ManagedSkill
   onBack: () => void
+  onOpenAssignment: (skill: ManagedSkill) => void
   invokeTauri: <T>(command: string, args?: Record<string, unknown>) => Promise<T>
   formatRelative: (ms: number | null | undefined) => string
   t: TFunction
@@ -397,6 +399,7 @@ FileContentRenderer.displayName = 'FileContentRenderer'
 const SkillDetailView = ({
   skill,
   onBack,
+  onOpenAssignment,
   invokeTauri,
   formatRelative,
   t,
@@ -501,6 +504,14 @@ const SkillDetailView = ({
           {t('detail.back')}
         </button>
         <div className="detail-skill-name">{skill.name}</div>
+        <button
+          className="btn btn-secondary detail-assignment-btn"
+          type="button"
+          onClick={() => onOpenAssignment(skill)}
+        >
+          <Share2 size={15} />
+          {t('assignment.open')}
+        </button>
         {skill.description ? (
           <div className="detail-desc">{skill.description}</div>
         ) : null}

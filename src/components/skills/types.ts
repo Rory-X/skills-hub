@@ -8,12 +8,21 @@ export type OnboardingVariant = {
   plugin_name?: string | null
   plugin_version?: string | null
   plugin_scope?: string | null
+  hub_relation?: 'same' | 'different' | 'unknown' | null
+}
+
+export type OnboardingHubSkill = {
+  id: string
+  name: string
+  central_path: string
+  fingerprint?: string | null
 }
 
 export type OnboardingGroup = {
   name: string
   variants: OnboardingVariant[]
   has_conflict: boolean
+  hub_skill?: OnboardingHubSkill | null
 }
 
 export type OnboardingPlan = {
@@ -60,6 +69,73 @@ export type ManagedSkill = {
     target_path: string
     synced_at?: number | null
   }[]
+  assignments: SkillAssignmentDto[]
+  source_issue?: 'source_missing' | 'source_invalid' | null
+  pending_assignment: boolean
+  assignment_issue_count: number
+}
+
+export type SkillAssignmentDto = {
+  tool: string
+  scope: 'global' | 'project' | string
+  project_id?: string | null
+  project_name?: string | null
+  project_path?: string | null
+  ownership: 'hub' | 'native' | string
+  state: 'active' | 'suspended' | 'error' | string
+  last_error?: string | null
+  valid: boolean
+  issue_kind?: string | null
+  issue_key?: string | null
+  issue_fingerprint?: string | null
+  can_ignore: boolean
+  issue_ignored: boolean
+}
+
+export type AssignmentDraftDto = {
+  global_tools: string[]
+  projects: {
+    project_id: string
+    tool_keys: string[]
+  }[]
+}
+
+export type AssignmentPreviewItemDto = {
+  key: string
+  skill_id: string
+  skill_name: string
+  tool: string
+  scope: 'global' | 'project' | string
+  project_id?: string | null
+  project_name?: string | null
+  target_path?: string | null
+  outcome:
+    | 'ready'
+    | 'assigned'
+    | 'same_content'
+    | 'conflict'
+    | 'unavailable'
+    | 'remove'
+    | string
+  blocking: boolean
+}
+
+export type AssignmentPreviewDto = {
+  items: AssignmentPreviewItemDto[]
+}
+
+export type AssignmentApplyResultDto = {
+  skills: {
+    skill_id: string
+    skill_name: string
+    succeeded: number
+    failed: number
+    skipped: number
+    errors: string[]
+  }[]
+  succeeded: number
+  failed: number
+  skipped: number
 }
 
 export type GitSkillCandidate = {
@@ -265,6 +341,27 @@ export type ProjectIssueKind =
   | 'git_exclude_unavailable'
   | 'library_skill_unavailable'
 
+export type ProjectIssueActionKind =
+  | 'delete_invalid_skill'
+  | 'keep_project_variant'
+  | 'replace_with_library'
+  | 'keep_project_version'
+  | 'retry_injection'
+  | 'remove_stale_target'
+  | 'repair_git_exclude'
+  | 'disable_git_exclude'
+  | 'initialize_git_repository'
+  | 'enable_library_skill'
+  | 'remove_unavailable_library_skill'
+
+export type ProjectIssueActionDto = {
+  kind: ProjectIssueActionKind
+  value?: string | null
+  label?: string | null
+  confirmation_required: boolean
+  destructive: boolean
+}
+
 export type ProjectIssueDto = {
   id: string
   kind: ProjectIssueKind
@@ -272,7 +369,9 @@ export type ProjectIssueDto = {
   skill_name?: string | null
   tool_key?: string | null
   path?: string | null
-  fixable: boolean
+  actions: ProjectIssueActionDto[]
+  fingerprint: string
+  can_ignore: boolean
 }
 
 export type ProjectDetailDto = {

@@ -73,7 +73,7 @@ pub fn sync_dir_hybrid_with_overwrite(
         }
 
         if overwrite {
-            std::fs::remove_dir_all(target)
+            remove_path_any(target)
                 .with_context(|| format!("remove existing target {:?}", target))?;
             did_replace = true;
         } else {

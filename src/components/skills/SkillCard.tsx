@@ -1,5 +1,16 @@
 import { memo, useState } from 'react'
-import { Box, Copy, Folder, Github, Power, RefreshCw, Tag, Trash2 } from 'lucide-react'
+import {
+  AlertTriangle,
+  Box,
+  Copy,
+  Folder,
+  Github,
+  Power,
+  RefreshCw,
+  Share2,
+  Tag,
+  Trash2,
+} from 'lucide-react'
 import { toast } from 'sonner'
 import type { TFunction } from 'i18next'
 import type { ManagedSkill, ToolOption } from './types'
@@ -15,13 +26,13 @@ type SkillCardProps = {
   loading: boolean
   bulkMode: boolean
   bulkSelected: boolean
+  highlighted: boolean
   getGithubInfo: (url: string | null | undefined) => GithubInfo | null
   getSkillSourceLabel: (skill: ManagedSkill) => string
   formatRelative: (ms: number | null | undefined) => string
   onUpdate: (skill: ManagedSkill) => void
   onDelete: (skillId: string) => void
   onToggleEnabled: (skill: ManagedSkill) => void
-  onToggleTool: (skill: ManagedSkill, toolId: string) => void
   onOpenScope: (skill: ManagedSkill) => void
   onOpenDetail: (skill: ManagedSkill) => void
   onEditTags: (skill: ManagedSkill) => void
@@ -39,13 +50,13 @@ const SkillCard = ({
   loading,
   bulkMode,
   bulkSelected,
+  highlighted,
   getGithubInfo,
   getSkillSourceLabel,
   formatRelative,
   onUpdate,
   onDelete,
   onToggleEnabled,
-  onToggleTool,
   onOpenScope,
   onOpenDetail,
   onEditTags,
@@ -66,6 +77,15 @@ const SkillCard = ({
   const copyValue = (github?.href ?? skill.source_ref ?? '').trim()
   const skillScope = getSkillScope(skill)
   const projectCount = getSkillProjects(skill).length
+  const globalAssignmentCount = skill.assignments.filter(
+    (assignment) => assignment.scope === 'global',
+  ).length
+  const projectAssignmentCount = new Set(
+    skill.assignments
+      .filter((assignment) => assignment.scope === 'project')
+      .map((assignment) => assignment.project_id)
+      .filter(Boolean),
+  ).size
   const skillEnabled = skill.enabled !== false
 
   const handleCopy = async () => {
@@ -79,14 +99,19 @@ const SkillCard = ({
   }
 
   // Split tools into synced and remaining for badge display
-  const syncedTools: { tool: ToolOption; target: (typeof skill.targets)[0] }[] = []
+  const syncedTools: {
+    tool: ToolOption
+    assignment: (typeof skill.assignments)[0]
+  }[] = []
   const unsyncedTools: ToolOption[] = []
   for (const tool of installedTools) {
-    const target = skill.targets.find(
-      (tgt) => tgt.tool === tool.id && (tgt.scope ?? 'global') === skillScope,
+    const toolAssignments = skill.assignments.filter(
+      (item) => item.tool === tool.id,
     )
-    if (target && (!skillEnabled || target.status !== 'disabled')) {
-      syncedTools.push({ tool, target })
+    const assignment =
+      toolAssignments.find((item) => item.valid) ?? toolAssignments[0]
+    if (assignment) {
+      syncedTools.push({ tool, assignment })
     } else {
       unsyncedTools.push(tool)
     }
@@ -100,7 +125,7 @@ const SkillCard = ({
 
   return (
     <div
-      className={`skill-card${bulkMode ? ' bulk-mode' : ''}${bulkSelected ? ' bulk-selected' : ''}${!skillEnabled ? ' disabled-skill' : ''}`}
+      className={`skill-card${bulkMode ? ' bulk-mode' : ''}${bulkSelected ? ' bulk-selected' : ''}${highlighted ? ' newly-added' : ''}${!skillEnabled ? ' disabled-skill' : ''}`}
     >
       {bulkMode ? (
         <label className="bulk-skill-check" aria-label={t('bulk.toggleSkill')}>
@@ -149,6 +174,17 @@ const SkillCard = ({
           {!skillEnabled ? (
             <span className="skill-disabled-badge">{t('disabled')}</span>
           ) : null}
+          {skill.pending_assignment ? (
+            <span className="skill-pending-badge">{t('assignment.pendingBadge')}</span>
+          ) : null}
+          {skill.assignment_issue_count > 0 ? (
+            <span className="skill-attention-badge">
+              <AlertTriangle size={12} />
+              {t('assignment.needsAttention', {
+                count: skill.assignment_issue_count,
+              })}
+            </span>
+          ) : null}
         </div>
         {skill.description ? (
           <div className="skill-desc">{skill.description}</div>
@@ -196,22 +232,20 @@ const SkillCard = ({
             type="button"
             onClick={() => onOpenScope(skill)}
           >
-            {skillScope === 'project'
-              ? t('scope.projectCount', { count: projectCount })
-              : t('scope.globalBadge')}
+            {t('assignment.summary', {
+              global: globalAssignmentCount,
+              projects: projectAssignmentCount || projectCount,
+            })}
           </button>
         </div>
         <div className={`tool-matrix${!expanded && needsCollapse ? ' collapsed' : ''}`}>
-          {visibleSynced.map(({ tool, target }) => (
+          {visibleSynced.map(({ tool, assignment }) => (
             <button
               key={`${skill.id}-${tool.id}`}
               type="button"
-              className="tool-pill active"
-              title={`${tool.label} (${target.mode ?? t('unknown')})`}
-              onClick={() => {
-                if (skillEnabled) void onToggleTool(skill, tool.id)
-              }}
-              disabled={!skillEnabled}
+              className={`tool-pill active${assignment.state === 'error' && !assignment.issue_ignored ? ' error' : ''}`}
+              title={`${tool.label} (${assignment.ownership})`}
+              onClick={() => onOpenScope(skill)}
             >
               <span className="status-badge" />
               {tool.label}
@@ -235,10 +269,8 @@ const SkillCard = ({
                   type="button"
                   className={`tool-pill ${disabled ? 'disabled' : 'inactive'}`}
                   title={tool.label}
-                  onClick={() => {
-                    if (!disabled && skillEnabled) void onToggleTool(skill, tool.id)
-                  }}
-                  disabled={disabled || !skillEnabled}
+                  onClick={() => onOpenScope(skill)}
+                  disabled={disabled}
                 >
                   {tool.label}
                 </button>
@@ -247,6 +279,16 @@ const SkillCard = ({
         </div>
       </div>
       <div className="skill-actions-col">
+        <button
+          className="card-btn assignment-action"
+          type="button"
+          onClick={() => onOpenScope(skill)}
+          disabled={loading}
+          aria-label={t('assignment.open')}
+          title={t('assignment.open')}
+        >
+          <Share2 size={16} />
+        </button>
         <button
           className={`card-btn tag-action${skill.tags.length > 0 ? ' has-tags' : ''}`}
           type="button"

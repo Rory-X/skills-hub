@@ -59,6 +59,26 @@ fn hybrid_sync_with_overwrite_replaces_existing() {
     assert!(out.replaced);
 }
 
+#[cfg(unix)]
+#[test]
+fn hybrid_overwrite_replaces_only_the_symlink_and_preserves_its_old_target() {
+    use std::os::unix::fs::symlink;
+
+    let old_source = tempfile::tempdir().unwrap();
+    fs::write(old_source.path().join("old.txt"), b"old").unwrap();
+    let new_source = tempfile::tempdir().unwrap();
+    fs::write(new_source.path().join("new.txt"), b"new").unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    let target = dst_dir.path().join("t");
+    symlink(old_source.path(), &target).unwrap();
+
+    let out = sync_dir_hybrid_with_overwrite(new_source.path(), &target, true).unwrap();
+
+    assert!(out.replaced);
+    assert_eq!(fs::read(old_source.path().join("old.txt")).unwrap(), b"old");
+    assert_eq!(fs::read(target.join("new.txt")).unwrap(), b"new");
+}
+
 #[test]
 fn cursor_sync_forces_copy() {
     let src_dir = tempfile::tempdir().unwrap();

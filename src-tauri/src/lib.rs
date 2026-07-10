@@ -78,6 +78,10 @@ pub fn run() {
 
             // Backfill description for skills that were installed before V2 schema.
             core::installer::backfill_skill_descriptions(&store);
+            let backfilled_hashes = core::installer::backfill_skill_content_hashes(&store);
+            if backfilled_hashes > 0 {
+                log::info!("backfilled content hashes for {backfilled_hashes} skills");
+            }
 
             // Best-effort cleanup of our own old git temp directories.
             // Safety:
@@ -123,6 +127,8 @@ pub fn run() {
             commands::inject_project_skill,
             commands::remove_project_skill,
             commands::repair_project_issue,
+            commands::ignore_project_issue,
+            commands::ignore_all_project_issues,
             commands::collect_project_skill,
             commands::get_tool_config,
             commands::set_tool_config,
@@ -143,9 +149,14 @@ pub fn run() {
             commands::install_git,
             commands::list_git_skills_cmd,
             commands::install_git_selection,
+            commands::reimport_local_selection,
+            commands::reimport_git_selection,
             commands::sync_skill_dir,
-            commands::sync_skill_to_tool,
-            commands::unsync_skill_from_tool,
+            commands::preview_skill_assignments,
+            commands::apply_skill_assignments,
+            commands::resume_skill_assignments,
+            commands::ignore_assignment_issue,
+            commands::ignore_all_assignment_issues,
             commands::set_skill_enabled,
             commands::update_managed_skill,
             commands::search_github,

@@ -1,6 +1,28 @@
 use std::fs;
 
-use super::build_onboarding_plan_in_home;
+use crate::core::skill_store::SkillRecord;
+
+use super::{build_onboarding_plan_in_home, build_onboarding_plan_with_managed_skills_in_home};
+
+fn managed_skill(name: &str, central_path: &std::path::Path) -> SkillRecord {
+    SkillRecord {
+        id: format!("managed-{name}"),
+        name: name.to_string(),
+        description: None,
+        source_type: "local".to_string(),
+        source_ref: None,
+        source_subpath: None,
+        source_revision: None,
+        central_path: central_path.to_string_lossy().to_string(),
+        content_hash: None,
+        created_at: 0,
+        updated_at: 0,
+        last_sync_at: None,
+        last_seen_at: 0,
+        enabled: true,
+        status: "ok".to_string(),
+    }
+}
 
 #[test]
 fn groups_by_name_and_detects_conflicts_by_fingerprint() {
@@ -27,6 +49,60 @@ fn groups_by_name_and_detects_conflicts_by_fingerprint() {
     assert_eq!(plan.groups[0].name, "foo");
     assert!(plan.groups[0].has_conflict, "同名但内容不同应冲突");
     assert_eq!(plan.groups[0].variants.len(), 2);
+}
+
+#[test]
+fn marks_discovered_variant_that_matches_managed_skill() {
+    let home = tempfile::tempdir().unwrap();
+    let central = home.path().join("central/web-deploy");
+    let discovered = home.path().join(".codex/skills/web-deploy");
+    fs::create_dir_all(&central).unwrap();
+    fs::create_dir_all(&discovered).unwrap();
+    fs::write(central.join("SKILL.md"), b"# Web deploy").unwrap();
+    fs::write(discovered.join("SKILL.md"), b"# Web deploy").unwrap();
+    fs::write(discovered.join("_skillhub_meta.json"), b"{}").unwrap();
+
+    let plan = build_onboarding_plan_with_managed_skills_in_home(
+        home.path(),
+        Some(home.path().join("central").as_path()),
+        None,
+        &[managed_skill("web-deploy", &central)],
+    )
+    .unwrap();
+
+    let group = plan
+        .groups
+        .iter()
+        .find(|group| group.name == "web-deploy")
+        .unwrap();
+    assert_eq!(group.hub_skill.as_ref().unwrap().id, "managed-web-deploy");
+    assert_eq!(group.variants[0].hub_relation.as_deref(), Some("same"));
+}
+
+#[test]
+fn marks_discovered_variant_that_differs_from_managed_skill() {
+    let home = tempfile::tempdir().unwrap();
+    let central = home.path().join("central/demo");
+    let discovered = home.path().join(".cursor/skills/demo");
+    fs::create_dir_all(&central).unwrap();
+    fs::create_dir_all(&discovered).unwrap();
+    fs::write(central.join("SKILL.md"), b"# Hub version").unwrap();
+    fs::write(discovered.join("SKILL.md"), b"# Discovered version").unwrap();
+
+    let plan = build_onboarding_plan_with_managed_skills_in_home(
+        home.path(),
+        Some(home.path().join("central").as_path()),
+        None,
+        &[managed_skill("demo", &central)],
+    )
+    .unwrap();
+
+    let group = plan
+        .groups
+        .iter()
+        .find(|group| group.name == "demo")
+        .unwrap();
+    assert_eq!(group.variants[0].hub_relation.as_deref(), Some("different"));
 }
 
 #[test]

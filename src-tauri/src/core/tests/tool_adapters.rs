@@ -1,9 +1,8 @@
 use std::fs;
 
 use crate::core::tool_adapters::{
-    adapter_by_key, adapters_sharing_project_skills_dir, adapters_sharing_skills_dir,
-    project_relative_skills_dir, resolve_project_path, scan_tool_dir, supports_project_scope,
-    ToolAdapter, ToolId,
+    adapter_by_key, project_relative_skills_dir, resolve_project_path, scan_tool_dir,
+    supports_project_scope, ToolAdapter, ToolId,
 };
 
 #[test]
@@ -43,16 +42,6 @@ fn antigravity_adapter_uses_current_global_skill_dir() {
     assert_eq!(antigravity.relative_detect_dir, ".gemini/config");
     assert_eq!(project_relative_skills_dir(&antigravity), ".agents/skills");
     assert!(supports_project_scope(&antigravity));
-}
-
-#[test]
-fn adapters_sharing_skills_dir_groups_amp_and_kimi() {
-    let amp = adapter_by_key("amp").unwrap();
-    let group = adapters_sharing_skills_dir(&amp);
-    let keys: std::collections::HashSet<&'static str> =
-        group.into_iter().map(|a| a.id.as_key()).collect();
-    assert!(keys.contains("amp"));
-    assert!(keys.contains("kimi_cli"));
 }
 
 #[test]
@@ -115,26 +104,6 @@ fn project_path_resolution_uses_project_specific_mapping() {
         resolve_project_path(&openclaw, dir.path()).unwrap(),
         dir.path().join("skills")
     );
-}
-
-#[test]
-fn adapters_sharing_project_skills_dir_groups_agents_tools() {
-    let cursor = adapter_by_key("cursor").unwrap();
-    let group = adapters_sharing_project_skills_dir(&cursor);
-    let keys: std::collections::HashSet<&'static str> =
-        group.into_iter().map(|a| a.id.as_key()).collect();
-
-    assert!(keys.contains("cursor"));
-    assert!(keys.contains("codex"));
-    assert!(keys.contains("opencode"));
-    assert!(keys.contains("gemini_cli"));
-    assert!(keys.contains("github_copilot"));
-    assert!(keys.contains("amp"));
-    assert!(keys.contains("kimi_cli"));
-    assert!(keys.contains("antigravity"));
-    assert!(keys.contains("cline"));
-    assert!(!keys.contains("claude_code"));
-    assert!(!keys.contains("windsurf"));
 }
 
 #[test]

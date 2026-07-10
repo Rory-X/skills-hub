@@ -7,19 +7,23 @@ import {
   ChevronDown,
   ChevronRight,
   FolderGit2,
+  EyeOff,
   Library,
   Plus,
   RefreshCw,
   Search,
   Trash2,
   Wrench,
+  X,
 } from 'lucide-react'
 import type { TFunction } from 'i18next'
 import type {
   ProjectDetailDto,
+  ProjectIssueActionDto,
   ProjectIssueDto,
   ProjectSkillDto,
 } from '../skills/types'
+import { getDirectProjectIssueAction } from './projectIssueResolution'
 
 type ProjectTab = 'current' | 'library' | 'attention'
 
@@ -33,7 +37,12 @@ type ProjectDetailPageProps = {
   onInjectSkill: (skillId: string) => void
   onRemoveSkill: (skillId: string) => void
   onCollectSkill: (discoveredSkillId: string, name: string) => void
-  onRepairIssue: (issueId: string) => void
+  onResolveIssue: (
+    issueId: string,
+    action: ProjectIssueActionDto,
+  ) => void
+  onIgnoreIssue: (issueId: string, fingerprint: string) => void
+  onIgnoreAllIssues: () => void
   t: TFunction
 }
 
@@ -47,12 +56,16 @@ const ProjectDetailPage = ({
   onInjectSkill,
   onRemoveSkill,
   onCollectSkill,
-  onRepairIssue,
+  onResolveIssue,
+  onIgnoreIssue,
+  onIgnoreAllIssues,
   t,
 }: ProjectDetailPageProps) => {
   const [activeTab, setActiveTab] = useState<ProjectTab>('current')
   const [librarySearch, setLibrarySearch] = useState('')
   const [expandedSkills, setExpandedSkills] = useState<Record<string, boolean>>({})
+  const [resolutionIssue, setResolutionIssue] = useState<ProjectIssueDto | null>(null)
+  const [selectedActionIndex, setSelectedActionIndex] = useState(0)
   const toolLabels = useMemo(
     () =>
       Object.fromEntries(
@@ -78,6 +91,31 @@ const ProjectDetailPage = ({
     if (enabled) next.add(toolKey)
     else next.delete(toolKey)
     onToolsChange([...next])
+  }
+
+  const openIssueResolution = (issue: ProjectIssueDto) => {
+    const directAction = getDirectProjectIssueAction(issue)
+    if (directAction) {
+      onResolveIssue(issue.id, directAction)
+      return
+    }
+    setSelectedActionIndex(0)
+    setResolutionIssue(issue)
+  }
+
+  const closeIssueResolution = () => {
+    if (loading) return
+    setResolutionIssue(null)
+    setSelectedActionIndex(0)
+  }
+
+  const confirmIssueResolution = () => {
+    const action = resolutionIssue?.actions[selectedActionIndex]
+    if (!resolutionIssue || !action) return
+    const issueId = resolutionIssue.id
+    setResolutionIssue(null)
+    setSelectedActionIndex(0)
+    onResolveIssue(issueId, action)
   }
 
   const renderSkillRow = (skill: ProjectSkillDto) => {
@@ -187,17 +225,31 @@ const ProjectDetailPage = ({
           <span>{t(`projects.issues.${issue.kind}.recommendation`, variables)}</span>
           {issue.path ? <code>{issue.path}</code> : null}
         </div>
-        {issue.fixable ? (
-          <button
-            className="btn btn-secondary"
-            type="button"
-            onClick={() => onRepairIssue(issue.id)}
-            disabled={loading}
-          >
-            <Wrench size={15} />
-            {t('projects.repair')}
-          </button>
-        ) : null}
+        <div className="project-issue-actions">
+          {issue.can_ignore ? (
+            <button
+              className="icon-btn"
+              type="button"
+              onClick={() => onIgnoreIssue(issue.id, issue.fingerprint)}
+              disabled={loading}
+              title={t('projects.ignoreIssue')}
+              aria-label={t('projects.ignoreIssue')}
+            >
+              <EyeOff size={16} />
+            </button>
+          ) : null}
+          {issue.actions.length > 0 ? (
+            <button
+              className="btn btn-secondary"
+              type="button"
+              onClick={() => openIssueResolution(issue)}
+              disabled={loading}
+            >
+              <Wrench size={15} />
+              {t('projects.handleIssue')}
+            </button>
+          ) : null}
+        </div>
       </div>
     )
   }
@@ -363,6 +415,19 @@ const ProjectDetailPage = ({
                         <Wrench size={15} />
                         {t('projects.review')}
                       </button>
+                    ) : skill.availability === 'conflict' ? (
+                      <button
+                        className="btn btn-secondary"
+                        type="button"
+                        onClick={() => {
+                          setActiveTab('attention')
+                          onInjectSkill(skill.skill_id)
+                        }}
+                        disabled={loading}
+                      >
+                        <Wrench size={15} />
+                        {t('projects.handleIssue')}
+                      </button>
                     ) : null}
                   </div>
                 ))}
@@ -375,11 +440,117 @@ const ProjectDetailPage = ({
             {t('projects.attentionEmpty')}
           </div>
         ) : (
-          <div className="project-issues-list">
-            {detail.issues.map(renderIssue)}
-          </div>
+          <>
+            {detail.issues.some((issue) => issue.can_ignore) ? (
+              <div className="project-issues-toolbar">
+                <button
+                  className="btn btn-secondary"
+                  type="button"
+                  onClick={onIgnoreAllIssues}
+                  disabled={loading}
+                >
+                  <EyeOff size={15} />
+                  {t('projects.ignoreAll')}
+                </button>
+              </div>
+            ) : null}
+            <div className="project-issues-list">
+              {detail.issues.map(renderIssue)}
+            </div>
+          </>
         )}
       </div>
+
+      {resolutionIssue ? (
+        <div className="modal-backdrop" onClick={closeIssueResolution}>
+          <div
+            className="modal project-issue-resolution-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="project-issue-resolution-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="project-issue-resolution-head">
+              <div>
+                <h2 id="project-issue-resolution-title">
+                  {t('projects.resolutionDialog.title')}
+                </h2>
+                <p>
+                  {t(
+                    `projects.issues.${resolutionIssue.kind}.title`,
+                    {
+                      skill: resolutionIssue.skill_name ?? t('unknown'),
+                      tool: resolutionIssue.tool_key
+                        ? toolLabels[resolutionIssue.tool_key] ??
+                          resolutionIssue.tool_key
+                        : t('unknown'),
+                    },
+                  )}
+                </p>
+              </div>
+              <button
+                className="icon-btn"
+                type="button"
+                onClick={closeIssueResolution}
+                disabled={loading}
+                aria-label={t('cancel')}
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <fieldset className="project-issue-resolution-options">
+              <legend>{t('projects.resolutionDialog.choose')}</legend>
+              {resolutionIssue.actions.map((action, index) => (
+                <label
+                  className={selectedActionIndex === index ? 'selected' : ''}
+                  key={`${action.kind}:${action.value ?? index}`}
+                >
+                  <input
+                    type="radio"
+                    name="project-issue-resolution"
+                    checked={selectedActionIndex === index}
+                    onChange={() => setSelectedActionIndex(index)}
+                    disabled={loading}
+                  />
+                  <span>
+                    <strong>
+                      {t(`projects.issueActions.${action.kind}`)}
+                    </strong>
+                    {action.label ? <code>{action.label}</code> : null}
+                    {action.destructive ? (
+                      <small>{t('projects.resolutionDialog.changesFiles')}</small>
+                    ) : null}
+                  </span>
+                </label>
+              ))}
+            </fieldset>
+
+            <div className="project-issue-resolution-actions">
+              <button
+                className="btn btn-secondary"
+                type="button"
+                onClick={closeIssueResolution}
+                disabled={loading}
+              >
+                {t('cancel')}
+              </button>
+              <button
+                className={`btn ${
+                  resolutionIssue.actions[selectedActionIndex]?.destructive
+                    ? 'btn-danger-solid'
+                    : 'btn-primary'
+                }`}
+                type="button"
+                onClick={confirmIssueResolution}
+                disabled={loading || !resolutionIssue.actions[selectedActionIndex]}
+              >
+                {t('projects.resolutionDialog.confirm')}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }

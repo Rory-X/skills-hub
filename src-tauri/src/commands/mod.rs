@@ -4,6 +4,14 @@ use tauri::State;
 
 use std::sync::Arc;
 
+use crate::core::assignments::{
+    apply_skill_assignments as apply_skill_assignments_core,
+    ignore_all_assignment_issues as ignore_all_assignment_issues_core,
+    ignore_assignment_issue as ignore_assignment_issue_core, managed_skill_projections,
+    preview_skill_assignments as preview_skill_assignments_core,
+    resume_skill_assignment as resume_skill_assignment_core, AssignmentConflictKey,
+    AssignmentDraft, AssignmentProjection, AssignmentToolSpec, ProjectAssignmentDraft,
+};
 use crate::core::auto_update::{
     get_auto_update_config as get_auto_update_config_core, record_auto_update_triggered,
     run_auto_update_now as run_auto_update_now_core,
@@ -19,12 +27,12 @@ use crate::core::cache_cleanup::{
 };
 use crate::core::cancel_token::CancelToken;
 use crate::core::central_repo::{ensure_central_repo, resolve_central_repo_path};
-use crate::core::content_hash::hash_dir;
 use crate::core::featured_skills::{fetch_featured_skills, FeaturedSkill};
 use crate::core::github_search::{search_github_repos, RepoSummary};
 use crate::core::installer::{
-    install_git_skill, install_git_skill_from_selection, install_local_skill,
-    install_local_skill_from_selection, list_git_skills, list_local_skills,
+    import_discovered_skill, install_git_skill, install_git_skill_from_selection,
+    install_local_skill, install_local_skill_from_selection, list_git_skills, list_local_skills,
+    reimport_git_skill_from_selection, reimport_local_skill_from_selection,
     update_managed_skill_from_source, GitSkillCandidate, InstallResult, LocalSkillCandidate,
 };
 use crate::core::network_proxy::{
@@ -36,27 +44,24 @@ use crate::core::network_proxy::{
 use crate::core::onboarding::{build_onboarding_plan, OnboardingPlan};
 use crate::core::projects::{
     build_project_detail_data, build_project_summary_data, collect_project_skill_and_scan,
-    import_project_and_scan, inject_project_skill_and_scan, refresh_project,
-    remove_project_skill_and_scan, repair_project_issue_and_scan, update_project_and_scan,
-    ProjectIssue, ProjectToolSpec,
+    ignore_all_project_issues_and_scan, ignore_project_issue_and_scan, import_project_and_scan,
+    inject_project_skill_and_scan, refresh_project, remove_project_skill_and_scan,
+    repair_project_issue_and_scan, update_project_and_scan, visible_project_issue_projections,
+    ProjectIssue, ProjectIssueProjection, ProjectToolSpec,
 };
-use crate::core::skill_store::{ProjectRecord, SkillStore, SkillTargetRecord};
+use crate::core::skill_store::{ProjectRecord, SkillStore};
 use crate::core::skills_search::{
     search_skills_online as search_skills_online_core, OnlineSkillResult,
 };
-use crate::core::sync_engine::{
-    copy_dir_recursive, sync_dir_for_tool_with_overwrite, sync_dir_hybrid, SyncMode,
-};
+use crate::core::sync_engine::{copy_dir_recursive, sync_dir_hybrid, SyncMode};
 use crate::core::system_scheduler::{
     current_scheduler_config, get_auto_update_task_status, install_auto_update_task,
     trigger_auto_update_task_now, uninstall_auto_update_task,
 };
 use crate::core::tool_adapters::{
-    adapter_by_key, adapters_sharing_project_skills_dir, is_builtin_tool_enabled,
-    is_tool_installed, load_tool_config, project_relative_skills_dir, resolve_default_path,
-    save_tool_config, supports_project_scope, CustomToolConfig, ToolConfig,
+    is_builtin_tool_enabled, is_tool_installed, load_tool_config, project_relative_skills_dir,
+    resolve_default_path, save_tool_config, supports_project_scope, CustomToolConfig, ToolConfig,
 };
-use uuid::Uuid;
 
 const RECENT_PROJECTS_SETTING: &str = "recent_projects_v1";
 
@@ -67,6 +72,7 @@ fn format_anyhow_error(err: anyhow::Error) -> String {
         || first.starts_with("TARGET_EXISTS|")
         || first.starts_with("TOOL_NOT_INSTALLED|")
         || first.starts_with("PROJECT_LIBRARY_NAME_REQUIRED|")
+        || first.starts_with("HUB_NAME_CONFLICT|")
     {
         return first;
     }
@@ -256,46 +262,6 @@ fn runtime_tools(store: &SkillStore, include_disabled: bool) -> anyhow::Result<V
     }
 
     Ok(tools)
-}
-
-fn runtime_tool_by_key(store: &SkillStore, key: &str) -> anyhow::Result<RuntimeTool> {
-    runtime_tools(store, false)?
-        .into_iter()
-        .find(|tool| tool.key == key)
-        .ok_or_else(|| anyhow::anyhow!("TOOL_NOT_INSTALLED|{}", key))
-}
-
-fn runtime_tools_sharing_dir(
-    store: &SkillStore,
-    selected: &RuntimeTool,
-    scope: &str,
-) -> anyhow::Result<Vec<RuntimeTool>> {
-    let tools = runtime_tools(store, false)?;
-    let shared = tools
-        .into_iter()
-        .filter(|tool| {
-            tool.installed
-                && if scope == "project" {
-                    tool.project_skills_dir == selected.project_skills_dir
-                } else {
-                    tool.skills_dir == selected.skills_dir
-                }
-        })
-        .collect::<Vec<_>>();
-    Ok(shared)
-}
-
-fn resolve_runtime_tool_root(
-    tool: &RuntimeTool,
-    project_root: Option<&std::path::Path>,
-) -> anyhow::Result<std::path::PathBuf> {
-    if let Some(project_root) = project_root {
-        if !tool.supports_project_scope {
-            anyhow::bail!("PROJECT_SCOPE_UNSUPPORTED|{}", tool.key);
-        }
-        return Ok(project_root.join(&tool.project_skills_dir));
-    }
-    Ok(tool.skills_dir.clone())
 }
 
 #[tauri::command]
@@ -652,14 +618,6 @@ fn expand_home_path(input: &str) -> Result<std::path::PathBuf, anyhow::Error> {
     Ok(std::path::PathBuf::from(trimmed))
 }
 
-fn normalize_scope(scope: Option<&str>) -> Result<&'static str, anyhow::Error> {
-    match scope.unwrap_or("global") {
-        "global" => Ok("global"),
-        "project" => Ok("project"),
-        other => anyhow::bail!("invalid scope: {}", other),
-    }
-}
-
 #[derive(Clone, Debug, Serialize)]
 pub struct ProjectSummaryDto {
     pub id: String,
@@ -713,6 +671,15 @@ pub struct ProjectLibrarySkillDto {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct ProjectIssueActionDto {
+    pub kind: String,
+    pub value: Option<String>,
+    pub label: Option<String>,
+    pub confirmation_required: bool,
+    pub destructive: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct ProjectIssueDto {
     pub id: String,
     pub kind: String,
@@ -720,7 +687,9 @@ pub struct ProjectIssueDto {
     pub skill_name: Option<String>,
     pub tool_key: Option<String>,
     pub path: Option<String>,
-    pub fixable: bool,
+    pub actions: Vec<ProjectIssueActionDto>,
+    pub fingerprint: String,
+    pub can_ignore: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -864,12 +833,21 @@ pub async fn repair_project_issue(
     store: State<'_, SkillStore>,
     projectId: String,
     issueId: String,
+    actionKind: String,
+    actionValue: Option<String>,
 ) -> Result<ProjectDetailDto, String> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let runtime_tools = runtime_project_tools(&store)?;
         let specs = project_specs_from_runtime(&runtime_tools);
-        let project = repair_project_issue_and_scan(&store, &projectId, &issueId, &specs)?;
+        let project = repair_project_issue_and_scan(
+            &store,
+            &projectId,
+            &issueId,
+            &actionKind,
+            actionValue.as_deref(),
+            &specs,
+        )?;
         build_project_detail(&store, &project, &runtime_tools)
     })
     .await
@@ -929,6 +907,7 @@ fn build_project_summary(
     specs: &[ProjectToolSpec],
 ) -> anyhow::Result<ProjectSummaryDto> {
     let data = build_project_summary_data(store, project, specs)?;
+    let attention_count = visible_project_issues(store, project, data.issues)?.len();
     Ok(ProjectSummaryDto {
         id: project.id.clone(),
         name: project.name.clone(),
@@ -939,7 +918,7 @@ fn build_project_summary(
         updated_at: project.updated_at,
         last_scanned_at: project.last_scanned_at,
         skill_count: data.skill_count,
-        attention_count: data.issues.len(),
+        attention_count,
     })
 }
 
@@ -950,6 +929,7 @@ fn build_project_detail(
 ) -> anyhow::Result<ProjectDetailDto> {
     let specs = project_specs_from_runtime(runtime_tools);
     let data = build_project_detail_data(store, project, &specs)?;
+    let issues = visible_project_issues(store, project, data.issues)?;
     let summary = build_project_summary(store, project, &specs)?;
     let tools = runtime_tools
         .iter()
@@ -998,11 +978,17 @@ fn build_project_detail(
                 availability: skill.availability,
             })
             .collect(),
-        issues: data.issues.into_iter().map(project_issue_dto).collect(),
+        issues,
     })
 }
 
-fn project_issue_dto(issue: ProjectIssue) -> ProjectIssueDto {
+fn project_issue_dto(projection: ProjectIssueProjection) -> ProjectIssueDto {
+    let ProjectIssueProjection {
+        issue,
+        fingerprint,
+        can_ignore,
+        ..
+    } = projection;
     ProjectIssueDto {
         id: issue.id,
         kind: issue.kind,
@@ -1010,8 +996,70 @@ fn project_issue_dto(issue: ProjectIssue) -> ProjectIssueDto {
         skill_name: issue.skill_name,
         tool_key: issue.tool_key,
         path: issue.path,
-        fixable: issue.fixable,
+        actions: issue
+            .actions
+            .into_iter()
+            .map(|action| ProjectIssueActionDto {
+                kind: action.kind,
+                value: action.value,
+                label: action.label,
+                confirmation_required: action.confirmation_required,
+                destructive: action.destructive,
+            })
+            .collect(),
+        fingerprint,
+        can_ignore,
     }
+}
+
+fn visible_project_issues(
+    store: &SkillStore,
+    project: &ProjectRecord,
+    issues: Vec<ProjectIssue>,
+) -> anyhow::Result<Vec<ProjectIssueDto>> {
+    Ok(visible_project_issue_projections(store, project, issues)?
+        .into_iter()
+        .map(project_issue_dto)
+        .collect())
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn ignore_project_issue(
+    store: State<'_, SkillStore>,
+    projectId: String,
+    issueId: String,
+    fingerprint: String,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime_tools = runtime_project_tools(&store)?;
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project =
+            ignore_project_issue_and_scan(&store, &projectId, &issueId, &fingerprint, &specs)?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn ignore_all_project_issues(
+    store: State<'_, SkillStore>,
+    projectId: String,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime_tools = runtime_project_tools(&store)?;
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project = ignore_all_project_issues_and_scan(&store, &projectId, &specs)?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
 }
 
 #[tauri::command]
@@ -1244,10 +1292,281 @@ pub async fn install_git_selection(
     .map_err(format_anyhow_error)
 }
 
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn reimport_local_selection(
+    store: State<'_, SkillStore>,
+    skillId: String,
+    basePath: String,
+    subpath: String,
+) -> Result<InstallResultDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let base = std::path::PathBuf::from(basePath);
+        let result = reimport_local_skill_from_selection(&store, &skillId, &base, &subpath)?;
+        Ok::<_, anyhow::Error>(to_install_dto(result))
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn reimport_git_selection(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    skillId: String,
+    repoUrl: String,
+    subpath: String,
+) -> Result<InstallResultDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = reimport_git_skill_from_selection(&app, &store, &skillId, &repoUrl, &subpath)?;
+        Ok::<_, anyhow::Error>(to_install_dto(result))
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
 #[derive(Debug, Serialize)]
 pub struct SyncResultDto {
     pub mode_used: String,
     pub target_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AssignmentDraftDto {
+    pub global_tools: Vec<String>,
+    pub projects: Vec<ProjectAssignmentDraftDto>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ProjectAssignmentDraftDto {
+    pub project_id: String,
+    pub tool_keys: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AssignmentPreviewItemDto {
+    pub key: String,
+    pub skill_id: String,
+    pub skill_name: String,
+    pub tool: String,
+    pub scope: String,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub target_path: Option<String>,
+    pub outcome: String,
+    pub blocking: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AssignmentPreviewDto {
+    pub items: Vec<AssignmentPreviewItemDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillAssignmentApplyResultDto {
+    pub skill_id: String,
+    pub skill_name: String,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AssignmentApplyResultDto {
+    pub skills: Vec<SkillAssignmentApplyResultDto>,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub skipped: usize,
+}
+
+impl From<AssignmentDraftDto> for AssignmentDraft {
+    fn from(draft: AssignmentDraftDto) -> Self {
+        Self {
+            global_tools: draft.global_tools,
+            projects: draft
+                .projects
+                .into_iter()
+                .map(|project| ProjectAssignmentDraft {
+                    project_id: project.project_id,
+                    tool_keys: project.tool_keys,
+                })
+                .collect(),
+        }
+    }
+}
+
+fn assignment_tool_specs(store: &SkillStore) -> anyhow::Result<Vec<AssignmentToolSpec>> {
+    Ok(runtime_tools(store, true)?
+        .into_iter()
+        .map(|tool| AssignmentToolSpec {
+            key: tool.key,
+            label: tool.label,
+            global_skills_dir: tool.skills_dir,
+            project_skills_dir: tool.project_skills_dir,
+            global_available: tool.installed,
+            enabled: tool.enabled,
+            supports_project_scope: tool.supports_project_scope,
+        })
+        .collect())
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn preview_skill_assignments(
+    store: State<'_, SkillStore>,
+    skillIds: Vec<String>,
+    draft: AssignmentDraftDto,
+    additive: Option<bool>,
+) -> Result<AssignmentPreviewDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let tools = assignment_tool_specs(&store)?;
+        let draft: AssignmentDraft = draft.into();
+        let mut items = Vec::new();
+        for preview in preview_skill_assignments_core(
+            &store,
+            &skillIds,
+            &draft,
+            &tools,
+            additive.unwrap_or(false),
+        )? {
+            items.extend(
+                preview
+                    .items
+                    .into_iter()
+                    .map(|item| AssignmentPreviewItemDto {
+                        key: AssignmentConflictKey::new(&preview.skill.id, item.key).encode(),
+                        skill_id: preview.skill.id.clone(),
+                        skill_name: preview.skill.name.clone(),
+                        tool: item.tool,
+                        scope: item.scope,
+                        project_id: item.project_id,
+                        project_name: item.project_name,
+                        target_path: item.target_path,
+                        outcome: item.outcome,
+                        blocking: item.blocking,
+                    }),
+            );
+        }
+        Ok::<_, anyhow::Error>(AssignmentPreviewDto { items })
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn apply_skill_assignments(
+    store: State<'_, SkillStore>,
+    skillIds: Vec<String>,
+    draft: AssignmentDraftDto,
+    replaceConflictKeys: Vec<String>,
+    additive: Option<bool>,
+) -> Result<AssignmentApplyResultDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let tools = assignment_tool_specs(&store)?;
+        let draft: AssignmentDraft = draft.into();
+        let replacements = replaceConflictKeys
+            .into_iter()
+            .map(|key| AssignmentConflictKey::decode(&key))
+            .collect::<anyhow::Result<std::collections::HashSet<_>>>()?;
+        let results = apply_skill_assignments_core(
+            &store,
+            &skillIds,
+            &draft,
+            &tools,
+            &replacements,
+            additive.unwrap_or(false),
+        )?
+        .into_iter()
+        .map(|outcome| SkillAssignmentApplyResultDto {
+            skill_id: outcome.skill.id,
+            skill_name: outcome.skill.name,
+            succeeded: outcome.summary.succeeded,
+            failed: outcome.summary.failed,
+            skipped: outcome.summary.skipped,
+            errors: outcome.summary.errors,
+        })
+        .collect::<Vec<_>>();
+        Ok::<_, anyhow::Error>(AssignmentApplyResultDto {
+            succeeded: results.iter().map(|result| result.succeeded).sum(),
+            failed: results.iter().map(|result| result.failed).sum(),
+            skipped: results.iter().map(|result| result.skipped).sum(),
+            skills: results,
+        })
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn resume_skill_assignments(
+    store: State<'_, SkillStore>,
+    skillId: String,
+) -> Result<SkillAssignmentApplyResultDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let skill = store
+            .get_skill_by_id(&skillId)?
+            .with_context(|| format!("skill not found: {skillId}"))?;
+        let tools = assignment_tool_specs(&store)?;
+        let summary = resume_skill_assignment_core(&store, &skill.id, &tools)?;
+        Ok::<_, anyhow::Error>(SkillAssignmentApplyResultDto {
+            skill_id: skill.id,
+            skill_name: skill.name,
+            succeeded: summary.succeeded,
+            failed: summary.failed,
+            skipped: summary.skipped,
+            errors: summary.errors,
+        })
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn ignore_assignment_issue(
+    store: State<'_, SkillStore>,
+    skillId: String,
+    issueKey: String,
+    fingerprint: String,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let tools = assignment_tool_specs(&store)?;
+        ignore_assignment_issue_core(&store, &skillId, &issueKey, &fingerprint, &tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn ignore_all_assignment_issues(
+    store: State<'_, SkillStore>,
+    skillIds: Vec<String>,
+) -> Result<usize, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let tools = assignment_tool_specs(&store)?;
+        ignore_all_assignment_issues_core(&store, &skillIds, &tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
 }
 
 #[tauri::command]
@@ -1267,221 +1586,6 @@ pub async fn sync_skill_dir(
             .to_string(),
             target_path: result.target_path.to_string_lossy().to_string(),
         })
-    })
-    .await
-    .map_err(|err| err.to_string())?
-    .map_err(format_anyhow_error)
-}
-
-#[tauri::command]
-#[allow(non_snake_case)]
-#[allow(clippy::too_many_arguments)]
-pub async fn sync_skill_to_tool(
-    store: State<'_, SkillStore>,
-    sourcePath: String,
-    skillId: String,
-    tool: String,
-    name: String,
-    overwrite: Option<bool>,
-    overwriteIfSameContent: Option<bool>,
-    scope: Option<String>,
-    projectPath: Option<String>,
-) -> Result<SyncResultDto, String> {
-    let store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let runtime_tool = runtime_tool_by_key(&store, &tool)?;
-        let scope = normalize_scope(scope.as_deref())?;
-        if scope == "project" && !runtime_tool.supports_project_scope {
-            anyhow::bail!("PROJECT_SCOPE_UNSUPPORTED|{}", runtime_tool.key);
-        }
-        let project_root = if scope == "project" {
-            let raw = projectPath
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("projectPath is required for project scope"))?;
-            let path = expand_home_path(raw)?;
-            if !path.is_dir() {
-                anyhow::bail!("projectPath must be an existing directory: {:?}", path);
-            }
-            Some(path)
-        } else {
-            None
-        };
-
-        if scope == "global" && !runtime_tool.installed {
-            anyhow::bail!("TOOL_NOT_INSTALLED|{}", runtime_tool.key);
-        }
-        let tool_root = resolve_runtime_tool_root(&runtime_tool, project_root.as_deref())?;
-        // Pre-check: ensure the skills directory is writable (fixes #20 — Windows OS error 5).
-        if let Err(err) = std::fs::create_dir_all(&tool_root) {
-            if err.kind() == std::io::ErrorKind::PermissionDenied {
-                anyhow::bail!(
-                    "TOOL_NOT_WRITABLE|{}|{}",
-                    runtime_tool.label,
-                    tool_root.to_string_lossy()
-                );
-            }
-            anyhow::bail!("failed to create skills dir {:?}: {}", tool_root, err);
-        }
-        let target = tool_root.join(&name);
-        let project_path_for_record = project_root
-            .as_ref()
-            .map(|path| path.to_string_lossy().to_string());
-        if let Some(existing) =
-            store.get_skill_target(&skillId, &tool, scope, project_path_for_record.as_deref())?
-        {
-            if existing.status != "disabled"
-                && existing.target_path == target.to_string_lossy()
-                && target.exists()
-            {
-                return Ok::<_, anyhow::Error>(SyncResultDto {
-                    mode_used: existing.mode,
-                    target_path: existing.target_path,
-                });
-            }
-        }
-        let overwrite = overwrite.unwrap_or(false)
-            || (overwriteIfSameContent.unwrap_or(false)
-                && target_has_same_content(sourcePath.as_ref(), &target));
-        let result =
-            sync_dir_for_tool_with_overwrite(&tool, sourcePath.as_ref(), &target, overwrite)
-                .map_err(|err| {
-                    let msg = err.to_string();
-                    if msg.contains("target already exists") {
-                        anyhow::anyhow!("TARGET_EXISTS|{}", target.to_string_lossy())
-                    } else if msg.contains("os error 5")
-                        || msg.contains("Access is denied")
-                        || msg.contains("Permission denied")
-                    {
-                        anyhow::anyhow!(
-                            "TOOL_NOT_WRITABLE|{}|{}",
-                            runtime_tool.label,
-                            tool_root.to_string_lossy()
-                        )
-                    } else {
-                        anyhow::anyhow!(msg)
-                    }
-                })?;
-
-        // Some tools share the same skills directory; keep DB records consistent across them.
-        let group = runtime_tools_sharing_dir(&store, &runtime_tool, scope)?;
-        for a in group {
-            let record = SkillTargetRecord {
-                id: Uuid::new_v4().to_string(),
-                skill_id: skillId.clone(),
-                tool: a.key,
-                scope: scope.to_string(),
-                project_path: project_path_for_record.clone(),
-                target_path: result.target_path.to_string_lossy().to_string(),
-                mode: match result.mode_used {
-                    SyncMode::Auto => "auto",
-                    SyncMode::Symlink => "symlink",
-                    SyncMode::Junction => "junction",
-                    SyncMode::Copy => "copy",
-                }
-                .to_string(),
-                status: "ok".to_string(),
-                last_error: None,
-                synced_at: Some(now_ms()),
-            };
-            store.upsert_skill_target(&record)?;
-        }
-
-        Ok::<_, anyhow::Error>(SyncResultDto {
-            mode_used: match result.mode_used {
-                SyncMode::Auto => "auto",
-                SyncMode::Symlink => "symlink",
-                SyncMode::Junction => "junction",
-                SyncMode::Copy => "copy",
-            }
-            .to_string(),
-            target_path: result.target_path.to_string_lossy().to_string(),
-        })
-    })
-    .await
-    .map_err(|err| err.to_string())?
-    .map_err(format_anyhow_error)
-}
-
-fn target_has_same_content(source: &std::path::Path, target: &std::path::Path) -> bool {
-    if !source.is_dir() || !target.is_dir() {
-        return false;
-    }
-    match (hash_dir(source), hash_dir(target)) {
-        (Ok(source_hash), Ok(target_hash)) => source_hash == target_hash,
-        _ => false,
-    }
-}
-
-#[tauri::command]
-#[allow(non_snake_case)]
-pub async fn unsync_skill_from_tool(
-    store: State<'_, SkillStore>,
-    skillId: String,
-    tool: String,
-    scope: Option<String>,
-    projectPath: Option<String>,
-) -> Result<(), String> {
-    let store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let scope = normalize_scope(scope.as_deref())?;
-        let project_path = if scope == "project" {
-            let raw = projectPath
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("projectPath is required for project scope"))?;
-            Some(expand_home_path(raw)?.to_string_lossy().to_string())
-        } else {
-            None
-        };
-
-        // Some tools share the same skills directory; unsync should update all of them.
-        let group_tool_keys: Vec<String> =
-            if let Ok(runtime_tool) = runtime_tool_by_key(&store, &tool) {
-                runtime_tools_sharing_dir(&store, &runtime_tool, scope)?
-                    .into_iter()
-                    .map(|tool| tool.key)
-                    .collect()
-            } else if let Some(adapter) = adapter_by_key(&tool) {
-                let group = if scope == "project" {
-                    adapters_sharing_project_skills_dir(&adapter)
-                } else {
-                    crate::core::tool_adapters::adapters_sharing_skills_dir(&adapter)
-                };
-                // If none of the group tools are installed, do nothing (treat as already not effective).
-                if scope == "global" {
-                    let mut any_installed = false;
-                    for a in &group {
-                        if is_tool_installed(a)? {
-                            any_installed = true;
-                            break;
-                        }
-                    }
-                    if !any_installed {
-                        return Ok::<_, anyhow::Error>(());
-                    }
-                }
-                group
-                    .into_iter()
-                    .map(|a| a.id.as_key().to_string())
-                    .collect()
-            } else {
-                vec![tool.clone()]
-            };
-
-        // Remove filesystem target once (shared dir => shared target path).
-        let mut removed = false;
-        for k in &group_tool_keys {
-            if let Some(target) =
-                store.get_skill_target(&skillId, k, scope, project_path.as_deref())?
-            {
-                if !removed {
-                    remove_path_any(&target.target_path).map_err(anyhow::Error::msg)?;
-                    removed = true;
-                }
-                store.delete_skill_target(&skillId, k, scope, project_path.as_deref())?;
-            }
-        }
-
-        Ok::<_, anyhow::Error>(())
     })
     .await
     .map_err(|err| err.to_string())?
@@ -1514,6 +1618,7 @@ pub async fn set_skill_enabled(
                     "disabled",
                 )?;
             }
+            store.set_skill_assignments_state(&skillId, "suspended")?;
             store.set_skill_enabled(&skillId, false)?;
             if !remove_failures.is_empty() {
                 anyhow::bail!(
@@ -1673,6 +1778,7 @@ pub async fn import_existing_skill(
     store: State<'_, SkillStore>,
     sourcePath: String,
     name: Option<String>,
+    conflictResolution: Option<String>,
 ) -> Result<InstallResultDto, String> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -1682,7 +1788,14 @@ pub async fn import_existing_skill(
         if !source.join("SKILL.md").exists() {
             anyhow::bail!("SKILL_INVALID|missing_skill_md");
         }
-        let result = install_local_skill(&app, &store, source, name)?;
+        let name = name.unwrap_or_else(|| {
+            source
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unnamed-skill".to_string())
+        });
+        let result =
+            import_discovered_skill(&app, &store, source, &name, conflictResolution.as_deref())?;
         Ok::<_, anyhow::Error>(to_install_dto(result))
     })
     .await
@@ -1705,6 +1818,28 @@ pub struct ManagedSkillDto {
     pub status: String,
     pub tags: Vec<TagDto>,
     pub targets: Vec<SkillTargetDto>,
+    pub assignments: Vec<SkillAssignmentDto>,
+    pub source_issue: Option<String>,
+    pub pending_assignment: bool,
+    pub assignment_issue_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillAssignmentDto {
+    pub tool: String,
+    pub scope: String,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub project_path: Option<String>,
+    pub ownership: String,
+    pub state: String,
+    pub last_error: Option<String>,
+    pub valid: bool,
+    pub issue_kind: Option<String>,
+    pub issue_key: Option<String>,
+    pub issue_fingerprint: Option<String>,
+    pub can_ignore: bool,
+    pub issue_ignored: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1733,8 +1868,14 @@ pub struct SkillTargetDto {
 }
 
 #[tauri::command]
-pub fn get_managed_skills(store: State<'_, SkillStore>) -> Result<Vec<ManagedSkillDto>, String> {
-    get_managed_skills_impl(store.inner())
+pub async fn get_managed_skills(
+    store: State<'_, SkillStore>,
+) -> Result<Vec<ManagedSkillDto>, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || get_managed_skills_impl(&store))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(format_anyhow_error)
 }
 
 #[tauri::command]
@@ -1964,52 +2105,87 @@ fn now_ms() -> i64 {
     now.as_millis() as i64
 }
 
-fn get_managed_skills_impl(store: &SkillStore) -> Result<Vec<ManagedSkillDto>, String> {
-    let skills = store.list_skills().map_err(|err| err.to_string())?;
-    Ok(skills
-        .into_iter()
-        .map(|skill| {
-            let targets = store
-                .list_skill_targets(&skill.id)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|target| SkillTargetDto {
-                    tool: target.tool,
-                    scope: target.scope,
-                    project_path: target.project_path,
-                    mode: target.mode,
-                    status: target.status,
-                    target_path: target.target_path,
-                    synced_at: target.synced_at,
-                })
-                .collect();
-            let tags = store
-                .get_skill_tags(&skill.id)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|tag| TagDto {
-                    id: tag.id,
-                    name: tag.name,
-                })
-                .collect();
+fn get_managed_skills_impl(store: &SkillStore) -> anyhow::Result<Vec<ManagedSkillDto>> {
+    let tools = assignment_tool_specs(store)?;
+    let projections = managed_skill_projections(store, &tools)?;
+    let mut managed = Vec::with_capacity(projections.len());
+    for projection in projections {
+        let skill = projection.skill;
+        let targets = projection
+            .targets
+            .into_iter()
+            .map(|target| SkillTargetDto {
+                tool: target.tool,
+                scope: target.scope,
+                project_path: target.project_path,
+                mode: target.mode,
+                status: target.status,
+                target_path: target.target_path,
+                synced_at: target.synced_at,
+            })
+            .collect();
+        let assignments = projection
+            .assignments
+            .into_iter()
+            .map(|projection| skill_assignment_dto(store, projection))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let tags = store
+            .get_skill_tags(&skill.id)?
+            .into_iter()
+            .map(|tag| TagDto {
+                id: tag.id,
+                name: tag.name,
+            })
+            .collect();
 
-            ManagedSkillDto {
-                id: skill.id,
-                name: skill.name,
-                description: skill.description,
-                source_type: skill.source_type,
-                source_ref: skill.source_ref,
-                central_path: skill.central_path,
-                created_at: skill.created_at,
-                updated_at: skill.updated_at,
-                last_sync_at: skill.last_sync_at,
-                enabled: skill.enabled,
-                status: skill.status,
-                tags,
-                targets,
-            }
-        })
-        .collect())
+        managed.push(ManagedSkillDto {
+            id: skill.id,
+            name: skill.name,
+            description: skill.description,
+            source_type: skill.source_type,
+            source_ref: skill.source_ref,
+            central_path: skill.central_path,
+            created_at: skill.created_at,
+            updated_at: skill.updated_at,
+            last_sync_at: skill.last_sync_at,
+            enabled: skill.enabled,
+            status: skill.status,
+            tags,
+            targets,
+            assignments,
+            source_issue: projection.source_issue,
+            pending_assignment: projection.pending_assignment,
+            assignment_issue_count: projection.assignment_issue_count,
+        });
+    }
+    Ok(managed)
+}
+
+fn skill_assignment_dto(
+    store: &SkillStore,
+    projection: AssignmentProjection,
+) -> anyhow::Result<SkillAssignmentDto> {
+    let assignment = projection.assignment;
+    let project = match assignment.project_id.as_deref() {
+        Some(project_id) => store.get_project(project_id)?,
+        None => None,
+    };
+    Ok(SkillAssignmentDto {
+        tool: assignment.tool,
+        scope: assignment.scope,
+        project_id: assignment.project_id,
+        project_name: project.as_ref().map(|item| item.name.clone()),
+        project_path: project.map(|item| item.root_path),
+        ownership: assignment.ownership,
+        state: projection.effective_state,
+        last_error: projection.effective_error,
+        valid: projection.valid,
+        issue_kind: projection.issue_kind,
+        issue_key: projection.issue_key,
+        issue_fingerprint: projection.issue_fingerprint,
+        can_ignore: projection.can_ignore,
+        issue_ignored: projection.ignored,
+    })
 }
 
 #[derive(Debug, Serialize)]

@@ -2,18 +2,27 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::content_hash::hash_dir;
-use super::installer::install_local_skill;
+use super::installer::{backfill_skill_content_hashes, install_local_skill};
 use super::skill_store::{
-    ProjectDiscoveredSkillRecord, ProjectRecord, ProjectSkillLinkRecord, SkillRecord, SkillStore,
-    SkillTargetRecord,
+    IgnoredIssueRecord, ProjectDiscoveredSkillRecord, ProjectRecord, ProjectSkillLinkRecord,
+    SkillAssignmentRecord, SkillRecord, SkillStore, SkillTargetRecord,
 };
-use super::sync_engine::{sync_dir_for_tool_with_overwrite, SyncMode};
+use super::sync_engine::{
+    sync_dir_copy_with_overwrite, sync_dir_for_tool_with_overwrite, SyncMode,
+};
 
 const GIT_EXCLUDE_BEGIN: &str = "# Skills Hub: begin";
 const GIT_EXCLUDE_END: &str = "# Skills Hub: end";
+
+enum ProjectConflictPolicy<'a> {
+    Preserve,
+    ReplaceAll,
+    ReplaceTools(&'a HashSet<String>),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectToolSpec {
@@ -38,7 +47,24 @@ pub struct ProjectIssue {
     pub skill_name: Option<String>,
     pub tool_key: Option<String>,
     pub path: Option<String>,
-    pub fixable: bool,
+    pub actions: Vec<ProjectIssueAction>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectIssueAction {
+    pub kind: String,
+    pub value: Option<String>,
+    pub label: Option<String>,
+    pub confirmation_required: bool,
+    pub destructive: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectIssueProjection {
+    pub issue: ProjectIssue,
+    pub fingerprint: String,
+    pub can_ignore: bool,
+    pub ignored: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -140,19 +166,6 @@ pub fn update_project_configuration(
     project.local_git_exclude_enabled = local_git_exclude_enabled;
     project.updated_at = now_ms();
     store.update_project(&project)?;
-
-    for mut link in store.list_project_skill_links(project_id)? {
-        if !link.enabled {
-            continue;
-        }
-        let tools_changed = link.desired_tools != project.enabled_tool_keys;
-        link.desired_tools = project.enabled_tool_keys.clone();
-        if tools_changed {
-            link.status = "pending".to_string();
-        }
-        link.updated_at = project.updated_at;
-        store.upsert_project_skill_link(&link)?;
-    }
     Ok(project)
 }
 
@@ -236,11 +249,21 @@ pub fn repair_project_issue_and_scan(
     store: &SkillStore,
     project_id: &str,
     issue_id: &str,
+    action_kind: &str,
+    action_value: Option<&str>,
     tool_specs: &[ProjectToolSpec],
 ) -> Result<ProjectRecord> {
     let project = require_project(store, project_id)?;
-    repair_project_issue(store, &project, tool_specs, issue_id)?;
     scan_project(store, &project, tool_specs)?;
+    let project = require_project(store, project_id)?;
+    repair_project_issue(
+        store,
+        &project,
+        tool_specs,
+        issue_id,
+        action_kind,
+        action_value,
+    )?;
     require_project(store, project_id)
 }
 
@@ -273,20 +296,23 @@ pub fn collect_project_skill<R: tauri::Runtime>(
     if discovered.status == "invalid_missing_skill_md" {
         anyhow::bail!("project skill is invalid: {}", discovered.absolute_path);
     }
-    if discovered.matched_skill_id.is_some() {
+    if let Some(skill_id) = discovered.matched_skill_id.clone() {
+        record_collected_project_skill(store, &discovered, &skill_id)?;
         return Ok(());
     }
 
+    backfill_skill_content_hashes(store);
     let library = store.list_skills()?;
     let same_name = library
         .iter()
         .filter(|skill| skill.name.eq_ignore_ascii_case(&discovered.name))
         .collect::<Vec<_>>();
-    let already_matched = same_name.iter().any(|skill| {
+    let already_matched = same_name.iter().find(|skill| {
         skill.content_hash.is_some()
             && skill.content_hash.as_ref() == discovered.content_hash.as_ref()
     });
-    if already_matched {
+    if let Some(skill) = already_matched {
+        record_collected_project_skill(store, &discovered, &skill.id)?;
         return Ok(());
     }
 
@@ -296,12 +322,56 @@ pub fn collect_project_skill<R: tauri::Runtime>(
     if !same_name.is_empty() && requested_name.is_none() {
         anyhow::bail!("PROJECT_LIBRARY_NAME_REQUIRED|{}", discovered.name);
     }
-    install_local_skill(
+    let installed = install_local_skill(
         app,
         store,
         Path::new(&discovered.absolute_path),
         requested_name,
     )?;
+    record_collected_project_skill(store, &discovered, &installed.skill_id)?;
+    Ok(())
+}
+
+fn record_collected_project_skill(
+    store: &SkillStore,
+    discovered: &ProjectDiscoveredSkillRecord,
+    skill_id: &str,
+) -> Result<()> {
+    let now = now_ms();
+    let mut desired_tools = store
+        .list_project_discovered_skills(&discovered.project_id)?
+        .into_iter()
+        .filter(|candidate| candidate.name.eq_ignore_ascii_case(&discovered.name))
+        .filter(|candidate| {
+            discovered.content_hash.is_some() && candidate.content_hash == discovered.content_hash
+        })
+        .flat_map(|candidate| candidate.tool_keys)
+        .collect::<Vec<_>>();
+    let existing = store.get_project_skill_link(&discovered.project_id, skill_id)?;
+    if let Some(link) = &existing {
+        desired_tools.extend(link.desired_tools.iter().cloned());
+    }
+    let desired_tools = normalized_keys(&desired_tools);
+    store.upsert_project_skill_link(&ProjectSkillLinkRecord {
+        project_id: discovered.project_id.clone(),
+        skill_id: skill_id.to_string(),
+        enabled: true,
+        desired_tools: desired_tools.clone(),
+        status: "ok".to_string(),
+        created_at: existing.as_ref().map(|link| link.created_at).unwrap_or(now),
+        updated_at: now,
+    })?;
+    for tool_key in desired_tools {
+        upsert_project_assignment(
+            store,
+            skill_id,
+            &discovered.project_id,
+            &tool_key,
+            "native",
+            "active",
+            None,
+        )?;
+    }
     Ok(())
 }
 
@@ -330,6 +400,7 @@ pub fn scan_project(
             .push(spec.key.clone());
     }
 
+    backfill_skill_content_hashes(store);
     let library = store.list_skills()?;
     let mut library_by_identity: HashMap<(String, String), String> = HashMap::new();
     for skill in library {
@@ -416,7 +487,79 @@ pub fn scan_project(
     }
     let records = found.into_values().collect::<Vec<_>>();
     store.replace_project_discovered_skills(&project.id, scanned_at, &records)?;
-    store.list_project_discovered_skills(&project.id)
+    let records = store.list_project_discovered_skills(&project.id)?;
+    reconcile_matched_native_assignments(store, project, &records)?;
+    Ok(records)
+}
+
+fn reconcile_matched_native_assignments(
+    store: &SkillStore,
+    project: &ProjectRecord,
+    records: &[ProjectDiscoveredSkillRecord],
+) -> Result<()> {
+    let mut tools_by_skill = BTreeMap::<String, BTreeSet<String>>::new();
+    for record in records {
+        let Some(skill_id) = record.matched_skill_id.as_deref() else {
+            continue;
+        };
+        tools_by_skill
+            .entry(skill_id.to_string())
+            .or_default()
+            .extend(record.tool_keys.iter().cloned());
+    }
+    for (skill_id, discovered_tools) in tools_by_skill {
+        let existing_link = store.get_project_skill_link(&project.id, &skill_id)?;
+        if existing_link.as_ref().is_some_and(|link| !link.enabled) {
+            continue;
+        }
+        let desired_tools = existing_link
+            .as_ref()
+            .map(|link| link.desired_tools.clone())
+            .unwrap_or_else(|| discovered_tools.iter().cloned().collect());
+        if existing_link.is_none() {
+            let now = now_ms();
+            store.upsert_project_skill_link(&ProjectSkillLinkRecord {
+                project_id: project.id.clone(),
+                skill_id: skill_id.clone(),
+                enabled: true,
+                desired_tools: desired_tools.clone(),
+                status: "ok".to_string(),
+                created_at: now,
+                updated_at: now,
+            })?;
+        }
+        for tool_key in desired_tools
+            .iter()
+            .filter(|tool| discovered_tools.contains(*tool))
+        {
+            let existing =
+                store.get_skill_assignment(&skill_id, tool_key, "project", Some(&project.id))?;
+            if existing
+                .as_ref()
+                .is_some_and(|assignment| assignment.ownership == "hub")
+            {
+                let target = store.get_skill_target(
+                    &skill_id,
+                    tool_key,
+                    "project",
+                    Some(&project.root_path),
+                )?;
+                if target.is_some() {
+                    continue;
+                }
+            }
+            upsert_project_assignment(
+                store,
+                &skill_id,
+                &project.id,
+                tool_key,
+                "native",
+                "active",
+                None,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub fn diagnose_project(
@@ -433,8 +576,16 @@ pub fn diagnose_project(
     let library = store.list_skills()?;
     let targets = store.list_project_skill_targets(&project.root_path)?;
     let mut issues = Vec::new();
+    let live_hashes = discovered
+        .iter()
+        .map(|item| (item.id.clone(), current_project_skill_hash(item)))
+        .collect::<HashMap<_, _>>();
 
     let library_by_name = group_library_by_name(&library);
+    let linked_skill_ids = links
+        .iter()
+        .map(|link| link.skill_id.as_str())
+        .collect::<HashSet<_>>();
     let mut discovered_by_name: BTreeMap<String, Vec<&ProjectDiscoveredSkillRecord>> =
         BTreeMap::new();
     for item in &discovered {
@@ -450,16 +601,39 @@ pub fn diagnose_project(
                 skill_name: Some(item.name.clone()),
                 tool_key: None,
                 path: Some(item.absolute_path.clone()),
-                fixable: false,
+                actions: vec![project_issue_action(
+                    "delete_invalid_skill",
+                    None,
+                    None,
+                    true,
+                    true,
+                )],
             });
         }
     }
     for (normalized_name, variants) in &discovered_by_name {
         let hashes = variants
             .iter()
-            .filter_map(|item| item.content_hash.as_deref())
+            .filter_map(|item| live_hashes.get(&item.id).and_then(Option::as_deref))
             .collect::<BTreeSet<_>>();
         if hashes.len() > 1 {
+            let mut seen_hashes = HashSet::new();
+            let actions = variants
+                .iter()
+                .filter_map(|item| {
+                    let hash = live_hashes.get(&item.id)?.as_ref()?;
+                    if !seen_hashes.insert(hash) {
+                        return None;
+                    }
+                    Some(project_issue_action(
+                        "keep_project_variant",
+                        Some(item.id.clone()),
+                        Some(item.relative_path.clone()),
+                        true,
+                        true,
+                    ))
+                })
+                .collect();
             issues.push(ProjectIssue {
                 id: format!("same_project_name_content_mismatch:{normalized_name}"),
                 kind: "same_project_name_content_mismatch".to_string(),
@@ -467,26 +641,47 @@ pub fn diagnose_project(
                 skill_name: variants.first().map(|item| item.name.clone()),
                 tool_key: None,
                 path: None,
-                fixable: false,
+                actions,
             });
         }
         if let Some(library_variants) = library_by_name.get(normalized_name) {
+            let linked_library_variants = library_variants
+                .iter()
+                .copied()
+                .filter(|skill| linked_skill_ids.contains(skill.id.as_str()))
+                .collect::<Vec<_>>();
+            let all_library_hashes_known = !linked_library_variants.is_empty()
+                && linked_library_variants
+                    .iter()
+                    .all(|skill| skill.content_hash.is_some());
             let any_match = variants.iter().any(|item| {
-                item.content_hash.as_ref().is_some_and(|hash| {
-                    library_variants
-                        .iter()
-                        .any(|skill| skill.content_hash.as_ref() == Some(hash))
+                live_hashes.get(&item.id).is_some_and(|live_hash| {
+                    live_hash.as_ref().is_some_and(|hash| {
+                        linked_library_variants
+                            .iter()
+                            .any(|skill| skill.content_hash.as_ref() == Some(hash))
+                    })
                 })
             });
-            if !any_match && variants.iter().any(|item| item.content_hash.is_some()) {
+            if all_library_hashes_known
+                && !any_match
+                && variants
+                    .iter()
+                    .any(|item| live_hashes.get(&item.id).is_some_and(Option::is_some))
+            {
                 issues.push(ProjectIssue {
                     id: format!("same_name_content_conflict:{normalized_name}"),
                     kind: "same_name_content_conflict".to_string(),
-                    skill_id: library_variants.first().map(|skill| skill.id.clone()),
+                    skill_id: linked_library_variants
+                        .first()
+                        .map(|skill| skill.id.clone()),
                     skill_name: variants.first().map(|item| item.name.clone()),
                     tool_key: None,
                     path: variants.first().map(|item| item.absolute_path.clone()),
-                    fixable: false,
+                    actions: vec![
+                        project_issue_action("replace_with_library", None, None, true, true),
+                        project_issue_action("keep_project_version", None, None, true, true),
+                    ],
                 });
             }
         }
@@ -496,6 +691,11 @@ pub fn diagnose_project(
         .iter()
         .map(|tool| (tool.key.as_str(), tool))
         .collect::<HashMap<_, _>>();
+    let enabled_project_tools = project
+        .enabled_tool_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
     let target_by_skill_tool = targets
         .iter()
         .map(|target| ((target.skill_id.as_str(), target.tool.as_str()), target))
@@ -510,6 +710,23 @@ pub fn diagnose_project(
         };
         let skill_name = Some(skill.name.clone());
         if !skill.enabled || !Path::new(&skill.central_path).is_dir() {
+            let mut actions = Vec::new();
+            if !skill.enabled && Path::new(&skill.central_path).is_dir() {
+                actions.push(project_issue_action(
+                    "enable_library_skill",
+                    None,
+                    None,
+                    false,
+                    false,
+                ));
+            }
+            actions.push(project_issue_action(
+                "remove_unavailable_library_skill",
+                None,
+                None,
+                true,
+                true,
+            ));
             issues.push(ProjectIssue {
                 id: format!("library_skill_unavailable:{}", link.skill_id),
                 kind: "library_skill_unavailable".to_string(),
@@ -517,12 +734,14 @@ pub fn diagnose_project(
                 skill_name,
                 tool_key: None,
                 path: Some(skill.central_path.clone()),
-                fixable: false,
+                actions,
             });
             continue;
         }
         for tool_key in &link.desired_tools {
-            if !tools.contains_key(tool_key.as_str()) {
+            if !tools.contains_key(tool_key.as_str())
+                || !enabled_project_tools.contains(tool_key.as_str())
+            {
                 continue;
             }
             match target_by_skill_tool.get(&(link.skill_id.as_str(), tool_key.as_str())) {
@@ -541,7 +760,13 @@ pub fn diagnose_project(
                     skill_name: skill_name.clone(),
                     tool_key: Some(tool_key.clone()),
                     path: None,
-                    fixable: true,
+                    actions: vec![project_issue_action(
+                        "retry_injection",
+                        None,
+                        None,
+                        false,
+                        false,
+                    )],
                 }),
                 Some(target) if target.status == "error" => issues.push(ProjectIssue {
                     id: format!("injection_failed:{}:{}", link.skill_id, tool_key),
@@ -550,7 +775,13 @@ pub fn diagnose_project(
                     skill_name: skill_name.clone(),
                     tool_key: Some(tool_key.clone()),
                     path: Some(target.target_path.clone()),
-                    fixable: true,
+                    actions: vec![project_issue_action(
+                        "retry_injection",
+                        None,
+                        None,
+                        false,
+                        false,
+                    )],
                 }),
                 Some(target) if std::fs::symlink_metadata(&target.target_path).is_err() => {
                     issues.push(ProjectIssue {
@@ -560,7 +791,13 @@ pub fn diagnose_project(
                         skill_name: skill_name.clone(),
                         tool_key: Some(tool_key.clone()),
                         path: Some(target.target_path.clone()),
-                        fixable: true,
+                        actions: vec![project_issue_action(
+                            "retry_injection",
+                            None,
+                            None,
+                            false,
+                            false,
+                        )],
                     });
                 }
                 _ => {}
@@ -575,6 +812,7 @@ pub fn diagnose_project(
                 link.skill_id.as_str(),
                 link.desired_tools
                     .iter()
+                    .filter(|tool| enabled_project_tools.contains(tool.as_str()))
                     .map(String::as_str)
                     .collect::<HashSet<_>>(),
             )
@@ -597,7 +835,13 @@ pub fn diagnose_project(
                     .map(|skill| skill.name.clone()),
                 tool_key: Some(target.tool.clone()),
                 path: Some(target.target_path.clone()),
-                fixable: true,
+                actions: vec![project_issue_action(
+                    "remove_stale_target",
+                    None,
+                    None,
+                    true,
+                    true,
+                )],
             });
         }
     }
@@ -611,21 +855,298 @@ pub fn diagnose_project(
             skill_name: None,
             tool_key: None,
             path: Some(path.to_string_lossy().to_string()),
-            fixable: true,
+            actions: vec![project_issue_action(
+                "repair_git_exclude",
+                None,
+                None,
+                false,
+                false,
+            )],
         }),
-        GitExcludeState::Unavailable => issues.push(ProjectIssue {
-            id: "git_exclude_unavailable".to_string(),
-            kind: "git_exclude_unavailable".to_string(),
-            skill_id: None,
-            skill_name: None,
-            tool_key: None,
-            path: None,
-            fixable: false,
-        }),
+        GitExcludeState::Unavailable { can_initialize } => {
+            let mut actions = vec![project_issue_action(
+                "disable_git_exclude",
+                None,
+                None,
+                true,
+                false,
+            )];
+            if can_initialize {
+                actions.push(project_issue_action(
+                    "initialize_git_repository",
+                    None,
+                    None,
+                    true,
+                    true,
+                ));
+            }
+            issues.push(ProjectIssue {
+                id: "git_exclude_unavailable".to_string(),
+                kind: "git_exclude_unavailable".to_string(),
+                skill_id: None,
+                skill_name: None,
+                tool_key: None,
+                path: None,
+                actions,
+            });
+        }
     }
 
     issues.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.id.cmp(&b.id)));
     Ok(issues)
+}
+
+pub fn project_issue_projections(
+    store: &SkillStore,
+    project: &ProjectRecord,
+    issues: Vec<ProjectIssue>,
+) -> Result<Vec<ProjectIssueProjection>> {
+    issues
+        .into_iter()
+        .map(|issue| {
+            let fingerprint = project_issue_fingerprint(store, project, &issue)?;
+            let can_ignore = can_ignore_project_issue(store, project, &issue)?;
+            let ignored = can_ignore
+                && store.is_issue_ignored("project", Some(&project.id), &issue.id, &fingerprint)?;
+            Ok(ProjectIssueProjection {
+                issue,
+                fingerprint,
+                can_ignore,
+                ignored,
+            })
+        })
+        .collect()
+}
+
+pub fn visible_project_issue_projections(
+    store: &SkillStore,
+    project: &ProjectRecord,
+    issues: Vec<ProjectIssue>,
+) -> Result<Vec<ProjectIssueProjection>> {
+    Ok(project_issue_projections(store, project, issues)?
+        .into_iter()
+        .filter(|projection| !projection.ignored)
+        .collect())
+}
+
+pub fn ignore_project_issue_and_scan(
+    store: &SkillStore,
+    project_id: &str,
+    issue_id: &str,
+    fingerprint: &str,
+    tool_specs: &[ProjectToolSpec],
+) -> Result<ProjectRecord> {
+    let project = refresh_project(store, project_id, tool_specs)?;
+    let projection = project_issue_projections(
+        store,
+        &project,
+        diagnose_project(store, &project, tool_specs)?,
+    )?
+    .into_iter()
+    .find(|projection| projection.issue.id == issue_id)
+    .with_context(|| format!("project issue no longer exists: {issue_id}"))?;
+    if projection.fingerprint != fingerprint {
+        anyhow::bail!("project issue changed; refresh and try again");
+    }
+    if !projection.can_ignore {
+        anyhow::bail!("this project issue cannot be ignored");
+    }
+    store.upsert_ignored_issue(&IgnoredIssueRecord {
+        id: Uuid::new_v4().to_string(),
+        scope: "project".to_string(),
+        scope_id: Some(project.id.clone()),
+        issue_key: projection.issue.id,
+        fingerprint: fingerprint.to_string(),
+        ignored_at: now_ms(),
+    })?;
+    Ok(project)
+}
+
+pub fn ignore_all_project_issues_and_scan(
+    store: &SkillStore,
+    project_id: &str,
+    tool_specs: &[ProjectToolSpec],
+) -> Result<ProjectRecord> {
+    let project = refresh_project(store, project_id, tool_specs)?;
+    for projection in project_issue_projections(
+        store,
+        &project,
+        diagnose_project(store, &project, tool_specs)?,
+    )? {
+        if !projection.can_ignore {
+            continue;
+        }
+        store.upsert_ignored_issue(&IgnoredIssueRecord {
+            id: Uuid::new_v4().to_string(),
+            scope: "project".to_string(),
+            scope_id: Some(project.id.clone()),
+            issue_key: projection.issue.id,
+            fingerprint: projection.fingerprint,
+            ignored_at: now_ms(),
+        })?;
+    }
+    Ok(project)
+}
+
+pub fn can_ignore_project_issue(
+    store: &SkillStore,
+    project: &ProjectRecord,
+    issue: &ProjectIssue,
+) -> Result<bool> {
+    if matches!(
+        issue.kind.as_str(),
+        "tool_removed_pending_unsync" | "git_exclude_drift" | "git_exclude_unavailable"
+    ) {
+        return Ok(true);
+    }
+    if !matches!(
+        issue.kind.as_str(),
+        "target_missing" | "tool_added_pending_sync" | "injection_failed"
+    ) {
+        return Ok(false);
+    }
+    let (Some(skill_id), Some(tool_key)) = (issue.skill_id.as_deref(), issue.tool_key.as_deref())
+    else {
+        return Ok(false);
+    };
+    let Some(skill) = store.get_skill_by_id(skill_id)? else {
+        return Ok(false);
+    };
+    let source_hash = if Path::new(&skill.central_path).is_dir() {
+        hash_dir(Path::new(&skill.central_path)).ok()
+    } else {
+        None
+    };
+    let Some(source_hash) = source_hash else {
+        return Ok(false);
+    };
+    for assignment in store.list_skill_assignments(skill_id)? {
+        if assignment.state != "active"
+            || (assignment.scope == "project"
+                && assignment.project_id.as_deref() == Some(project.id.as_str())
+                && assignment.tool == tool_key)
+        {
+            continue;
+        }
+        if project_assignment_exists(store, &assignment, &source_hash)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn project_assignment_exists(
+    store: &SkillStore,
+    assignment: &SkillAssignmentRecord,
+    source_hash: &str,
+) -> Result<bool> {
+    let project = assignment
+        .project_id
+        .as_deref()
+        .and_then(|project_id| store.get_project(project_id).transpose())
+        .transpose()?;
+    if let Some(project) = project.as_ref() {
+        if !Path::new(&project.root_path).is_dir()
+            || !project.enabled_tool_keys.contains(&assignment.tool)
+        {
+            return Ok(false);
+        }
+    }
+    if assignment.ownership == "native" {
+        let Some(project) = project else {
+            return Ok(false);
+        };
+        return Ok(store
+            .list_project_discovered_skills(&project.id)?
+            .into_iter()
+            .any(|item| {
+                item.matched_skill_id.as_deref() == Some(assignment.skill_id.as_str())
+                    && item.tool_keys.contains(&assignment.tool)
+                    && item.content_hash.as_deref() == Some(source_hash)
+                    && Path::new(&item.absolute_path).is_dir()
+            }));
+    }
+    let project_path = project.as_ref().map(|project| project.root_path.as_str());
+    let Some(target) = store.get_skill_target(
+        &assignment.skill_id,
+        &assignment.tool,
+        &assignment.scope,
+        project_path,
+    )?
+    else {
+        return Ok(false);
+    };
+    if target.status != "ok" || !Path::new(&target.target_path).is_dir() {
+        return Ok(false);
+    }
+    let target_path = Path::new(&target.target_path);
+    let hash_path =
+        std::fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    Ok(hash_dir(&hash_path)
+        .map(|hash| hash == source_hash)
+        .unwrap_or(false))
+}
+
+pub fn project_issue_fingerprint(
+    store: &SkillStore,
+    project: &ProjectRecord,
+    issue: &ProjectIssue,
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(issue.id.as_bytes());
+    hasher.update(issue.kind.as_bytes());
+    hasher.update([project.local_git_exclude_enabled as u8]);
+    for tool in &project.enabled_tool_keys {
+        hasher.update(tool.as_bytes());
+        hasher.update([0]);
+    }
+    if let Some(skill_id) = issue.skill_id.as_deref() {
+        hasher.update(skill_id.as_bytes());
+        if let Some(skill) = store.get_skill_by_id(skill_id)? {
+            hasher.update(skill.content_hash.unwrap_or_default().as_bytes());
+            hasher.update(skill.status.as_bytes());
+            hasher.update([skill.enabled as u8]);
+        }
+        for target in store
+            .list_project_skill_targets(&project.root_path)?
+            .into_iter()
+            .filter(|target| {
+                target.skill_id == skill_id
+                    && issue
+                        .tool_key
+                        .as_deref()
+                        .map_or(true, |tool| target.tool == tool)
+            })
+        {
+            hasher.update(target.tool.as_bytes());
+            hasher.update(target.status.as_bytes());
+            hasher.update(target.last_error.unwrap_or_default().as_bytes());
+            hasher.update(target.target_path.as_bytes());
+        }
+        for assignment in store.list_skill_assignments(skill_id)? {
+            hasher.update(assignment.tool.as_bytes());
+            hasher.update(assignment.scope.as_bytes());
+            hasher.update(assignment.project_id.unwrap_or_default().as_bytes());
+            hasher.update(assignment.ownership.as_bytes());
+            hasher.update(assignment.state.as_bytes());
+            hasher.update(assignment.last_error.unwrap_or_default().as_bytes());
+        }
+    }
+    if let Some(path) = issue.path.as_deref() {
+        let path = Path::new(path);
+        if path.is_dir() {
+            if let Ok(hash) = hash_dir(path) {
+                hasher.update(hash.as_bytes());
+            }
+        } else if let Ok(bytes) = std::fs::read(path) {
+            hasher.update(bytes);
+        }
+    }
+    for action in &issue.actions {
+        hasher.update(action.kind.as_bytes());
+        hasher.update(action.value.as_deref().unwrap_or_default().as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 pub fn build_project_summary_data(
@@ -834,7 +1355,132 @@ pub fn inject_project_skill(
     skill: &SkillRecord,
     tool_specs: &[ProjectToolSpec],
 ) -> Result<ProjectInjectionSummary> {
-    inject_project_skill_for_tools(store, project, skill, tool_specs, None)
+    inject_project_skill_for_tools(
+        store,
+        project,
+        skill,
+        tool_specs,
+        None,
+        None,
+        ProjectConflictPolicy::Preserve,
+    )
+}
+
+pub fn assign_project_skill_tools_and_scan(
+    store: &SkillStore,
+    project_id: &str,
+    skill_id: &str,
+    desired_tools: &[String],
+    tool_specs: &[ProjectToolSpec],
+    overwrite_conflict_tools: &HashSet<String>,
+) -> Result<ProjectInjectionSummary> {
+    let project = require_project(store, project_id)?;
+    let skill = store
+        .get_skill_by_id(skill_id)?
+        .with_context(|| format!("skill not found: {skill_id}"))?;
+    let desired_tools = normalized_keys(desired_tools);
+    let enabled = project
+        .enabled_tool_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if let Some(unavailable) = desired_tools
+        .iter()
+        .find(|tool| !enabled.contains(tool.as_str()))
+    {
+        anyhow::bail!("project tool is not enabled: {unavailable}");
+    }
+    validate_enabled_tool_specs(&desired_tools, tool_specs)?;
+
+    let desired = desired_tools
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let targets = store
+        .list_project_skill_targets(&project.root_path)?
+        .into_iter()
+        .filter(|target| target.skill_id == skill_id)
+        .collect::<Vec<_>>();
+    let mut removed_paths = HashSet::new();
+    for target in targets
+        .iter()
+        .filter(|target| !desired.contains(target.tool.as_str()))
+    {
+        let path_still_desired = targets.iter().any(|other| {
+            other.target_path == target.target_path && desired.contains(other.tool.as_str())
+        });
+        if !path_still_desired && removed_paths.insert(target.target_path.clone()) {
+            remove_target_if_still_owned(store, target)?;
+        }
+        store.delete_skill_target(skill_id, &target.tool, "project", Some(&project.root_path))?;
+    }
+
+    if desired_tools.is_empty() {
+        if let Some(mut link) = store.get_project_skill_link(&project.id, skill_id)? {
+            link.enabled = false;
+            link.desired_tools.clear();
+            link.status = "disabled".to_string();
+            link.updated_at = now_ms();
+            store.upsert_project_skill_link(&link)?;
+        }
+        scan_project(store, &project, tool_specs)?;
+        rebuild_project_git_exclude(store, &project)?;
+        return Ok(ProjectInjectionSummary::default());
+    }
+
+    let summary = inject_project_skill_for_tools(
+        store,
+        &project,
+        &skill,
+        tool_specs,
+        Some(&desired_tools),
+        None,
+        ProjectConflictPolicy::ReplaceTools(overwrite_conflict_tools),
+    )?;
+    scan_project(store, &project, tool_specs)?;
+    rebuild_project_git_exclude(store, &project)?;
+    Ok(summary)
+}
+
+pub fn add_project_skill_tools_and_scan(
+    store: &SkillStore,
+    project_id: &str,
+    skill_id: &str,
+    desired_tools: &[String],
+    added_tools: &[String],
+    tool_specs: &[ProjectToolSpec],
+    overwrite_conflict_tools: &HashSet<String>,
+) -> Result<ProjectInjectionSummary> {
+    let project = require_project(store, project_id)?;
+    let skill = store
+        .get_skill_by_id(skill_id)?
+        .with_context(|| format!("skill not found: {skill_id}"))?;
+    let desired_tools = normalized_keys(desired_tools);
+    let added_tools = normalized_keys(added_tools);
+    let enabled = project
+        .enabled_tool_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if let Some(unavailable) = added_tools
+        .iter()
+        .find(|tool| !enabled.contains(tool.as_str()))
+    {
+        anyhow::bail!("project tool is not enabled: {unavailable}");
+    }
+    validate_enabled_tool_specs(&added_tools, tool_specs)?;
+    let summary = inject_project_skill_for_tools(
+        store,
+        &project,
+        &skill,
+        tool_specs,
+        Some(&desired_tools),
+        Some(&added_tools),
+        ProjectConflictPolicy::ReplaceTools(overwrite_conflict_tools),
+    )?;
+    scan_project(store, &project, tool_specs)?;
+    rebuild_project_git_exclude(store, &project)?;
+    Ok(summary)
 }
 
 pub fn remove_project_skill(
@@ -861,6 +1507,13 @@ pub fn remove_project_skill(
         link.updated_at = now_ms();
         store.upsert_project_skill_link(&link)?;
     }
+    for assignment in store
+        .list_skill_assignments(skill_id)?
+        .into_iter()
+        .filter(|assignment| assignment.project_id.as_deref() == Some(project.id.as_str()))
+    {
+        store.delete_skill_assignment(skill_id, &assignment.tool, "project", Some(&project.id))?;
+    }
     Ok(())
 }
 
@@ -869,22 +1522,67 @@ pub fn repair_project_issue(
     project: &ProjectRecord,
     tool_specs: &[ProjectToolSpec],
     issue_id: &str,
+    action_kind: &str,
+    action_value: Option<&str>,
 ) -> Result<()> {
     let issue = diagnose_project(store, project, tool_specs)?
         .into_iter()
         .find(|item| item.id == issue_id)
         .with_context(|| format!("project issue no longer exists: {issue_id}"))?;
-    let reconcile_skill_id = issue.skill_id.clone();
-    match issue.kind.as_str() {
-        "tool_added_pending_sync" | "target_missing" | "injection_failed" => {
+    issue
+        .actions
+        .iter()
+        .find(|action| action.kind == action_kind && action.value.as_deref() == action_value)
+        .with_context(|| format!("project issue action is no longer available: {action_kind}"))?;
+    match action_kind {
+        "delete_invalid_skill" => {
+            let path = PathBuf::from(issue.path.context("issue is missing path")?);
+            ensure_project_child_path(project, &path)?;
+            if path.join("SKILL.md").is_file() {
+                anyhow::bail!("project skill was repaired after the last scan: {:?}", path);
+            }
+            remove_path_any(&path)?;
+        }
+        "keep_project_variant" => {
+            let discovered_skill_id = action_value.context("action is missing variant id")?;
+            replace_project_variants(store, project, &issue, discovered_skill_id)?;
+        }
+        "replace_with_library" => {
+            let skill_id = issue.skill_id.context("issue is missing skill id")?;
+            let skill = store
+                .get_skill_by_id(&skill_id)?
+                .with_context(|| format!("skill not found: {skill_id}"))?;
+            inject_project_skill_for_tools(
+                store,
+                project,
+                &skill,
+                tool_specs,
+                None,
+                None,
+                ProjectConflictPolicy::ReplaceAll,
+            )?;
+        }
+        "keep_project_version" => {
+            let skill_id = issue.skill_id.context("issue is missing skill id")?;
+            remove_project_skill(store, project, &skill_id)?;
+        }
+        "retry_injection" => {
             let skill_id = issue.skill_id.context("issue is missing skill id")?;
             let tool_key = issue.tool_key.context("issue is missing tool key")?;
             let skill = store
                 .get_skill_by_id(&skill_id)?
                 .with_context(|| format!("skill not found: {skill_id}"))?;
-            inject_project_skill_for_tools(store, project, &skill, tool_specs, Some(&[tool_key]))?;
+            inject_project_skill_for_tools(
+                store,
+                project,
+                &skill,
+                tool_specs,
+                None,
+                Some(&[tool_key]),
+                ProjectConflictPolicy::Preserve,
+            )?;
         }
-        "tool_removed_pending_unsync" => {
+        "remove_stale_target" => {
             let skill_id = issue.skill_id.context("issue is missing skill id")?;
             let tool_key = issue.tool_key.context("issue is missing tool key")?;
             let targets = store.list_project_skill_targets(&project.root_path)?;
@@ -908,11 +1606,129 @@ pub fn repair_project_issue(
                 )?;
             }
         }
-        "git_exclude_drift" => rebuild_project_git_exclude(store, project)?,
-        _ => anyhow::bail!("project issue requires manual resolution: {}", issue.kind),
+        "repair_git_exclude" => rebuild_project_git_exclude(store, project)?,
+        "disable_git_exclude" => {
+            let mut updated = project.clone();
+            updated.local_git_exclude_enabled = false;
+            updated.updated_at = now_ms();
+            store.update_project(&updated)?;
+        }
+        "initialize_git_repository" => {
+            git2::Repository::init(&project.root_path)
+                .with_context(|| format!("initialize Git repository at {}", project.root_path))?;
+            rebuild_project_git_exclude(store, project)?;
+        }
+        "enable_library_skill" => {
+            let skill_id = issue.skill_id.context("issue is missing skill id")?;
+            store.set_skill_enabled(&skill_id, true)?;
+            let skill = store
+                .get_skill_by_id(&skill_id)?
+                .with_context(|| format!("skill not found: {skill_id}"))?;
+            inject_project_skill_for_tools(
+                store,
+                project,
+                &skill,
+                tool_specs,
+                None,
+                None,
+                ProjectConflictPolicy::Preserve,
+            )?;
+        }
+        "remove_unavailable_library_skill" => {
+            let skill_id = issue.skill_id.context("issue is missing skill id")?;
+            remove_project_skill(store, project, &skill_id)?;
+        }
+        _ => anyhow::bail!("unsupported project issue action: {action_kind}"),
     }
-    if let Some(skill_id) = reconcile_skill_id {
+    scan_project(store, project, tool_specs)?;
+    let active_link_ids = store
+        .list_project_skill_links(&project.id)?
+        .into_iter()
+        .filter(|link| link.enabled)
+        .map(|link| link.skill_id)
+        .collect::<Vec<_>>();
+    for skill_id in active_link_ids {
         reconcile_project_link_status(store, project, tool_specs, &skill_id)?;
+    }
+    Ok(())
+}
+
+fn replace_project_variants(
+    store: &SkillStore,
+    project: &ProjectRecord,
+    issue: &ProjectIssue,
+    chosen_id: &str,
+) -> Result<()> {
+    let skill_name = issue
+        .skill_name
+        .as_deref()
+        .context("issue is missing skill name")?;
+    let variants = store
+        .list_project_discovered_skills(&project.id)?
+        .into_iter()
+        .filter(|item| {
+            item.name.eq_ignore_ascii_case(skill_name) && item.status != "invalid_missing_skill_md"
+        })
+        .collect::<Vec<_>>();
+    if variants
+        .iter()
+        .any(|item| current_project_skill_hash(item) != item.content_hash)
+    {
+        anyhow::bail!("project skill variants changed after the last scan");
+    }
+    let chosen = variants
+        .iter()
+        .find(|item| item.id == chosen_id)
+        .with_context(|| format!("project skill variant no longer exists: {chosen_id}"))?;
+    let chosen_path = PathBuf::from(&chosen.absolute_path);
+    ensure_project_child_path(project, &chosen_path)?;
+    let source = std::fs::canonicalize(&chosen_path)
+        .with_context(|| format!("resolve chosen project skill {:?}", chosen_path))?;
+
+    for variant in variants.iter().filter(|item| item.id != chosen_id) {
+        let target = PathBuf::from(&variant.absolute_path);
+        ensure_project_child_path(project, &target)?;
+        sync_dir_copy_with_overwrite(&source, &target, true)
+            .with_context(|| format!("replace project skill variant {:?}", target))?;
+        forget_project_targets_at_path(store, project, &target)?;
+    }
+    Ok(())
+}
+
+fn forget_project_targets_at_path(
+    store: &SkillStore,
+    project: &ProjectRecord,
+    path: &Path,
+) -> Result<()> {
+    let target_path = path.to_string_lossy();
+    for target in store
+        .list_project_skill_targets(&project.root_path)?
+        .into_iter()
+        .filter(|target| target.target_path == target_path)
+    {
+        store.delete_skill_target(
+            &target.skill_id,
+            &target.tool,
+            "project",
+            Some(&project.root_path),
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_project_child_path(project: &ProjectRecord, path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        anyhow::bail!("project issue path must be absolute: {:?}", path);
+    }
+    let project_root = std::fs::canonicalize(&project.root_path)
+        .with_context(|| format!("resolve project root {}", project.root_path))?;
+    let parent = path
+        .parent()
+        .with_context(|| format!("project issue path has no parent: {:?}", path))?;
+    let normalized_parent = std::fs::canonicalize(parent)
+        .with_context(|| format!("resolve project issue parent {:?}", parent))?;
+    if !normalized_parent.starts_with(&project_root) || path == project_root {
+        anyhow::bail!("project issue path escapes project root: {:?}", path);
     }
     Ok(())
 }
@@ -945,22 +1761,31 @@ fn inject_project_skill_for_tools(
     project: &ProjectRecord,
     skill: &SkillRecord,
     tool_specs: &[ProjectToolSpec],
+    desired_tools: Option<&[String]>,
     only_tools: Option<&[String]>,
+    conflict_policy: ProjectConflictPolicy<'_>,
 ) -> Result<ProjectInjectionSummary> {
     let now = now_ms();
-    let mut link = store
-        .get_project_skill_link(&project.id, &skill.id)?
-        .unwrap_or(ProjectSkillLinkRecord {
-            project_id: project.id.clone(),
-            skill_id: skill.id.clone(),
-            enabled: true,
-            desired_tools: project.enabled_tool_keys.clone(),
-            status: "pending".to_string(),
-            created_at: now,
-            updated_at: now,
-        });
+    let existing_link = store.get_project_skill_link(&project.id, &skill.id)?;
+    let next_desired_tools = desired_tools
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            existing_link
+                .as_ref()
+                .map(|link| link.desired_tools.clone())
+        })
+        .unwrap_or_else(|| project.enabled_tool_keys.clone());
+    let mut link = existing_link.unwrap_or(ProjectSkillLinkRecord {
+        project_id: project.id.clone(),
+        skill_id: skill.id.clone(),
+        enabled: true,
+        desired_tools: next_desired_tools.clone(),
+        status: "pending".to_string(),
+        created_at: now,
+        updated_at: now,
+    });
     link.enabled = true;
-    link.desired_tools = project.enabled_tool_keys.clone();
+    link.desired_tools = next_desired_tools;
     link.status = "pending".to_string();
     link.updated_at = now;
     store.upsert_project_skill_link(&link)?;
@@ -968,12 +1793,34 @@ fn inject_project_skill_for_tools(
     if !skill.enabled {
         link.status = "error".to_string();
         store.upsert_project_skill_link(&link)?;
+        for tool_key in &link.desired_tools {
+            upsert_project_assignment(
+                store,
+                &skill.id,
+                &project.id,
+                tool_key,
+                "hub",
+                "suspended",
+                None,
+            )?;
+        }
         anyhow::bail!("skill is disabled: {}", skill.name);
     }
     let source = PathBuf::from(&skill.central_path);
     if !source.is_dir() {
         link.status = "error".to_string();
         store.upsert_project_skill_link(&link)?;
+        for tool_key in &link.desired_tools {
+            upsert_project_assignment(
+                store,
+                &skill.id,
+                &project.id,
+                tool_key,
+                "hub",
+                "error",
+                Some("central skill path not found"),
+            )?;
+        }
         anyhow::bail!("central skill path not found: {}", skill.central_path);
     }
     let target_name = match validate_project_library_name(&skill.name) {
@@ -1016,6 +1863,13 @@ fn inject_project_skill_for_tools(
         tool_keys.sort();
         tool_keys.dedup();
         let target = resolve_project_skills_dir(project, &relative_dir)?.join(&target_name);
+        let overwrite_conflicts = match &conflict_policy {
+            ProjectConflictPolicy::Preserve => false,
+            ProjectConflictPolicy::ReplaceAll => true,
+            ProjectConflictPolicy::ReplaceTools(tools) => {
+                tool_keys.iter().all(|tool| tools.contains(tool))
+            }
+        };
         let target_exists = std::fs::symlink_metadata(&target).is_ok();
         if target_exists {
             let hash_path = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
@@ -1023,36 +1877,72 @@ fn inject_project_skill_for_tools(
                 .map(|hash| hash == expected_hash)
                 .unwrap_or(false);
             if !same_content {
-                summary.failed += tool_keys.len();
-                had_conflict = true;
+                if !overwrite_conflicts {
+                    for tool_key in &tool_keys {
+                        upsert_project_assignment(
+                            store,
+                            &skill.id,
+                            &project.id,
+                            tool_key,
+                            "native",
+                            "error",
+                            Some("same name has different content"),
+                        )?;
+                    }
+                    summary.failed += tool_keys.len();
+                    had_conflict = true;
+                    continue;
+                }
+            } else {
+                let managed = existing_targets.iter().any(|existing| {
+                    existing.skill_id == skill.id
+                        && existing.target_path == target.to_string_lossy()
+                });
+                if managed {
+                    for tool_key in &tool_keys {
+                        store.upsert_skill_target(&SkillTargetRecord {
+                            id: Uuid::new_v4().to_string(),
+                            skill_id: skill.id.clone(),
+                            tool: tool_key.clone(),
+                            scope: "project".to_string(),
+                            project_path: Some(project.root_path.clone()),
+                            target_path: target.to_string_lossy().to_string(),
+                            mode: "existing".to_string(),
+                            status: "ok".to_string(),
+                            last_error: None,
+                            synced_at: Some(now_ms()),
+                        })?;
+                        upsert_project_assignment(
+                            store,
+                            &skill.id,
+                            &project.id,
+                            tool_key,
+                            "hub",
+                            "active",
+                            None,
+                        )?;
+                    }
+                    summary.injected += tool_keys.len();
+                } else {
+                    for tool_key in &tool_keys {
+                        upsert_project_assignment(
+                            store,
+                            &skill.id,
+                            &project.id,
+                            tool_key,
+                            "native",
+                            "active",
+                            None,
+                        )?;
+                    }
+                    summary.matched += tool_keys.len();
+                }
                 continue;
             }
-            let managed = existing_targets.iter().any(|existing| {
-                existing.skill_id == skill.id && existing.target_path == target.to_string_lossy()
-            });
-            if managed {
-                for tool_key in &tool_keys {
-                    store.upsert_skill_target(&SkillTargetRecord {
-                        id: Uuid::new_v4().to_string(),
-                        skill_id: skill.id.clone(),
-                        tool: tool_key.clone(),
-                        scope: "project".to_string(),
-                        project_path: Some(project.root_path.clone()),
-                        target_path: target.to_string_lossy().to_string(),
-                        mode: "existing".to_string(),
-                        status: "ok".to_string(),
-                        last_error: None,
-                        synced_at: Some(now_ms()),
-                    })?;
-                }
-                summary.injected += tool_keys.len();
-            } else {
-                summary.matched += tool_keys.len();
-            }
-            continue;
         }
 
-        match sync_dir_for_tool_with_overwrite(&tool_keys[0], &source, &target, false) {
+        match sync_dir_for_tool_with_overwrite(&tool_keys[0], &source, &target, overwrite_conflicts)
+        {
             Ok(outcome) => {
                 let mode = sync_mode_name(&outcome.mode_used);
                 for tool_key in &tool_keys {
@@ -1068,6 +1958,15 @@ fn inject_project_skill_for_tools(
                         last_error: None,
                         synced_at: Some(now_ms()),
                     })?;
+                    upsert_project_assignment(
+                        store,
+                        &skill.id,
+                        &project.id,
+                        tool_key,
+                        "hub",
+                        "active",
+                        None,
+                    )?;
                 }
                 summary.injected += tool_keys.len();
             }
@@ -1086,6 +1985,15 @@ fn inject_project_skill_for_tools(
                         last_error: Some(message.clone()),
                         synced_at: None,
                     })?;
+                    upsert_project_assignment(
+                        store,
+                        &skill.id,
+                        &project.id,
+                        tool_key,
+                        "hub",
+                        "error",
+                        Some(&message),
+                    )?;
                 }
                 summary.failed += tool_keys.len();
             }
@@ -1117,10 +2025,19 @@ fn git_exclude_state(
         .collect::<Vec<_>>();
     let repository = match git2::Repository::discover(&project.root_path) {
         Ok(repository) => repository,
-        Err(_) if project.local_git_exclude_enabled && !active_targets.is_empty() => {
-            return Ok(GitExcludeState::Unavailable)
+        Err(_) if !project.local_git_exclude_enabled || active_targets.is_empty() => {
+            return Ok(GitExcludeState::Clean)
         }
-        Err(_) => return Ok(GitExcludeState::Clean),
+        Err(err) => {
+            let can_initialize = !has_git_marker(Path::new(&project.root_path));
+            if !can_initialize {
+                log::warn!(
+                    "failed to discover Git repository for {}: {err:#}",
+                    project.root_path
+                );
+            }
+            return Ok(GitExcludeState::Unavailable { can_initialize });
+        }
     };
     let exclude_path = repository.path().join("info/exclude");
     let current = read_optional_string(&exclude_path)?;
@@ -1131,6 +2048,19 @@ fn git_exclude_state(
     } else {
         Ok(GitExcludeState::Drift(exclude_path))
     }
+}
+
+fn has_git_marker(path: &Path) -> bool {
+    path.ancestors().any(|ancestor| {
+        let marker = ancestor.join(".git");
+        match std::fs::symlink_metadata(&marker) {
+            Ok(_) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                ancestor.join("HEAD").is_file() && ancestor.join("objects").is_dir()
+            }
+            Err(_) => true,
+        }
+    })
 }
 
 fn expected_git_exclude_patterns(
@@ -1222,6 +2152,38 @@ fn require_project(store: &SkillStore, project_id: &str) -> Result<ProjectRecord
         .with_context(|| format!("project not found: {project_id}"))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn upsert_project_assignment(
+    store: &SkillStore,
+    skill_id: &str,
+    project_id: &str,
+    tool: &str,
+    ownership: &str,
+    state: &str,
+    last_error: Option<&str>,
+) -> Result<()> {
+    let now = now_ms();
+    let existing = store.get_skill_assignment(skill_id, tool, "project", Some(project_id))?;
+    store.upsert_skill_assignment(&SkillAssignmentRecord {
+        id: existing
+            .as_ref()
+            .map(|assignment| assignment.id.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        skill_id: skill_id.to_string(),
+        tool: tool.to_string(),
+        scope: "project".to_string(),
+        project_id: Some(project_id.to_string()),
+        ownership: ownership.to_string(),
+        state: state.to_string(),
+        last_error: last_error.map(str::to_string),
+        created_at: existing
+            .as_ref()
+            .map(|assignment| assignment.created_at)
+            .unwrap_or(now),
+        updated_at: now,
+    })
+}
+
 fn normalized_keys(keys: &[String]) -> Vec<String> {
     let mut keys = keys
         .iter()
@@ -1242,6 +2204,31 @@ fn group_library_by_name(skills: &[SkillRecord]) -> HashMap<String, Vec<&SkillRe
             .push(skill);
     }
     grouped
+}
+
+fn current_project_skill_hash(item: &ProjectDiscoveredSkillRecord) -> Option<String> {
+    if item.status == "invalid_missing_skill_md" {
+        return None;
+    }
+    let path = PathBuf::from(&item.absolute_path);
+    let hash_path = std::fs::canonicalize(&path).unwrap_or(path);
+    hash_dir(&hash_path).ok()
+}
+
+fn project_issue_action(
+    kind: &str,
+    value: Option<String>,
+    label: Option<String>,
+    confirmation_required: bool,
+    destructive: bool,
+) -> ProjectIssueAction {
+    ProjectIssueAction {
+        kind: kind.to_string(),
+        value,
+        label,
+        confirmation_required,
+        destructive,
+    }
 }
 
 fn validate_project_skills_dir(value: &str) -> Result<()> {
@@ -1436,7 +2423,7 @@ fn now_ms() -> i64 {
 enum GitExcludeState {
     Clean,
     Drift(PathBuf),
-    Unavailable,
+    Unavailable { can_initialize: bool },
 }
 
 #[cfg(test)]
