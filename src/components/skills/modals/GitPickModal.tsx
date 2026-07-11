@@ -8,6 +8,7 @@ type GitPickModalProps = {
   loading: boolean
   gitCandidates: GitSkillCandidate[]
   gitCandidateSelected: Record<string, boolean>
+  customName: string
   reimporting?: boolean
   onRequestClose: () => void
   onCancel: () => void
@@ -21,6 +22,7 @@ const GitPickModal = ({
   loading,
   gitCandidates,
   gitCandidateSelected,
+  customName,
   reimporting,
   onRequestClose,
   onCancel,
@@ -39,6 +41,9 @@ const GitPickModal = ({
     )
   }, [gitCandidates, normalizedQuery])
   const selectedCount = filteredCandidates.filter(
+    (c) => gitCandidateSelected[c.subpath],
+  ).length
+  const totalSelectedCount = gitCandidates.filter(
     (c) => gitCandidateSelected[c.subpath],
   ).length
   const allVisibleSelected =
@@ -67,6 +72,13 @@ const GitPickModal = ({
         </div>
         <div className="modal-body">
           <p className="label">{t('gitPickBody')}</p>
+          {!reimporting && customName.trim() ? (
+            <div className="git-pick-name-hint">
+              {totalSelectedCount === 1
+                ? t('gitPickCustomNameSingle', { name: customName.trim() })
+                : t('gitPickCustomNameMultiple', { name: customName.trim() })}
+            </div>
+          ) : null}
           <div className="pick-search">
             <Search size={16} className="search-icon-abs" />
             <input

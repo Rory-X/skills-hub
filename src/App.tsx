@@ -38,7 +38,11 @@ import {
   getDiscoveredImportDecision,
   type DiscoveredHubResolution,
 } from './components/skills/discoveredImportResolution'
-import { assignmentDraftForSkill } from './components/skills/assignmentDraft'
+import { getGitImportCustomName } from './components/skills/gitImportName'
+import {
+  assignmentDraftForSkill,
+  assignmentDraftReplacingProjectTools,
+} from './components/skills/assignmentDraft'
 import type {
   AutoUpdateConfigDto,
   AssignmentApplyResultDto,
@@ -78,6 +82,11 @@ type ActiveView =
   | 'detail'
   | 'settings'
   | 'manage'
+
+type ProjectAssignmentBatch = {
+  mode: 'library-add' | 'current-tools'
+  skillIds: string[]
+}
 type ManagementTab = 'tags' | 'tools' | 'updates'
 
 function App() {
@@ -163,6 +172,8 @@ function App() {
   const [skillScopeState, setSkillScopeState] = useState<SkillScopeState>({})
   const [bulkMode, setBulkMode] = useState(false)
   const [bulkSelectedIds, setBulkSelectedIds] = useState<string[]>([])
+  const [projectAssignmentBatch, setProjectAssignmentBatch] =
+    useState<ProjectAssignmentBatch | null>(null)
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false)
   const [showBulkTagsModal, setShowBulkTagsModal] = useState(false)
 
@@ -1102,6 +1113,73 @@ function App() {
     [runProjectDetailCommand, selectedProjectDetail, t],
   )
 
+  const getAvailableProjectTools = useCallback(() => {
+    if (!selectedProjectDetail) return []
+    return selectedProjectDetail.project.enabled_tool_keys.filter((toolKey) =>
+      selectedProjectDetail.tools.some(
+        (tool) => tool.key === toolKey && tool.enabled,
+      ),
+    )
+  }, [selectedProjectDetail])
+
+  const handleAddProjectLibrarySkill = useCallback(
+    (skillId: string) => {
+      if (!selectedProjectDetail) return
+      if (getAvailableProjectTools().length === 0) {
+        setError(t('projects.noEnabledAgents'))
+        return
+      }
+      void runProjectDetailCommand(
+        'inject_project_skill',
+        {
+          projectId: selectedProjectDetail.project.id,
+          skillId,
+        },
+        t('projects.skillAdded'),
+      ).then((detail) => {
+        if (detail) void loadManagedSkills()
+      })
+    },
+    [
+      getAvailableProjectTools,
+      loadManagedSkills,
+      runProjectDetailCommand,
+      selectedProjectDetail,
+      t,
+    ],
+  )
+
+  const handleAddProjectLibrarySkills = useCallback(
+    (skillIds: string[]) => {
+      if (!selectedProjectDetail || skillIds.length === 0) return
+      if (skillIds.length === 1) {
+        handleAddProjectLibrarySkill(skillIds[0])
+        return
+      }
+      const availableTools = getAvailableProjectTools()
+      if (availableTools.length === 0) {
+        setError(t('projects.noEnabledAgents'))
+        return
+      }
+      setAssignmentInitialDraft({
+        global_tools: [],
+        projects: [
+          {
+            project_id: selectedProjectDetail.project.id,
+            tool_keys: availableTools,
+          },
+        ],
+      })
+      setProjectAssignmentBatch({ mode: 'library-add', skillIds })
+    },
+    [
+      getAvailableProjectTools,
+      handleAddProjectLibrarySkill,
+      selectedProjectDetail,
+      t,
+    ],
+  )
+
   const handleInjectProjectSkill = useCallback(
     (skillId: string) => {
       if (!selectedProjectDetail) return
@@ -1110,12 +1188,7 @@ function App() {
         setError(t('errors.skillNotFound'))
         return
       }
-      const availableTools = selectedProjectDetail.project.enabled_tool_keys.filter(
-        (toolKey) =>
-          selectedProjectDetail.tools.some(
-            (tool) => tool.key === toolKey && tool.enabled,
-          ),
-      )
+      const availableTools = getAvailableProjectTools()
       setAssignmentInitialDraft(
         assignmentDraftForSkill(
           skill,
@@ -1125,7 +1198,29 @@ function App() {
       )
       setScopeModalSkill(skill)
     },
-    [managedSkills, selectedProjectDetail, t],
+    [getAvailableProjectTools, managedSkills, selectedProjectDetail, t],
+  )
+
+  const handleAssignCurrentProjectSkills = useCallback(
+    (skillIds: string[]) => {
+      if (!selectedProjectDetail || skillIds.length === 0) return
+      const availableTools = getAvailableProjectTools()
+      if (availableTools.length === 0) {
+        setError(t('projects.noEnabledAgents'))
+        return
+      }
+      setAssignmentInitialDraft({
+        global_tools: [],
+        projects: [
+          {
+            project_id: selectedProjectDetail.project.id,
+            tool_keys: availableTools,
+          },
+        ],
+      })
+      setProjectAssignmentBatch({ mode: 'current-tools', skillIds })
+    },
+    [getAvailableProjectTools, selectedProjectDetail, t],
   )
 
   const handleRemoveProjectSkill = useCallback(
@@ -1142,6 +1237,69 @@ function App() {
       setScopeModalSkill(skill)
     },
     [managedSkills, selectedProjectDetail, t],
+  )
+
+  const handleRemoveProjectSkills = useCallback(
+    async (skillIds: string[]) => {
+      if (!selectedProjectDetail || skillIds.length === 0) return
+      setLoading(true)
+      setLoadingStartAt(Date.now())
+      setError(null)
+      const collectedErrors: { title: string; message: string }[] = []
+      let latestDetail: ProjectDetailDto | null = null
+      try {
+        for (let index = 0; index < skillIds.length; index++) {
+          const skillId = skillIds[index]
+          const skill = managedSkills.find((item) => item.id === skillId)
+          setActionMessage(
+            t('projects.bulkRemoveProgress', {
+              current: index + 1,
+              total: skillIds.length,
+              name: skill?.name ?? skillId,
+            }),
+          )
+          try {
+            latestDetail = await invokeTauri<ProjectDetailDto>(
+              'remove_project_skill',
+              {
+                projectId: selectedProjectDetail.project.id,
+                skillId,
+              },
+            )
+          } catch (err) {
+            collectedErrors.push({
+              title: t('projects.bulkRemoveFailed', {
+                name: skill?.name ?? skillId,
+              }),
+              message: err instanceof Error ? err.message : String(err),
+            })
+          }
+        }
+        if (latestDetail) setSelectedProjectDetail(latestDetail)
+        await loadManagedSkills()
+        await loadProjects()
+        if (collectedErrors.length > 0) {
+          showActionErrors(collectedErrors)
+        } else {
+          setSuccessToastMessage(
+            t('projects.bulkRemoved', { count: skillIds.length }),
+          )
+        }
+      } finally {
+        setActionMessage(null)
+        setLoading(false)
+        setLoadingStartAt(null)
+      }
+    },
+    [
+      invokeTauri,
+      loadManagedSkills,
+      loadProjects,
+      managedSkills,
+      selectedProjectDetail,
+      showActionErrors,
+      t,
+    ],
   )
 
   const handleRepairProjectIssue = useCallback(
@@ -2561,10 +2719,7 @@ function App() {
       setError(t('errors.skillAlreadyExists', { name: duplicated.name }))
       return
     }
-    if (selected.length > 1 && gitName.trim()) {
-      setError(t('errors.multiSelectNoCustomName'))
-      return
-    }
+    const customName = getGitImportCustomName(selected.length, gitName)
 
     setLoading(true)
     setLoadingStartAt(Date.now())
@@ -2584,9 +2739,9 @@ function App() {
           const created = await invokeTauri<InstallResultDto>(
             'install_git_selection',
             {
-            repoUrl: gitCandidatesRepoUrl,
-            subpath: candidate.subpath,
-            name: gitName.trim() || undefined,
+              repoUrl: gitCandidatesRepoUrl,
+              subpath: candidate.subpath,
+              name: customName,
             },
           )
           await applySelectedAddModalTags(created.skill_id, created.name)
@@ -2687,12 +2842,36 @@ function App() {
     }
   }, [loading])
 
+  const handleCloseProjectAssignmentBatch = useCallback(() => {
+    if (!loading) {
+      setProjectAssignmentBatch(null)
+      setAssignmentInitialDraft(null)
+    }
+  }, [loading])
+
   const assignmentModalSkills = useMemo(() => {
+    if (projectAssignmentBatch) {
+      const selectedIds = new Set(projectAssignmentBatch.skillIds)
+      return managedSkills.filter((skill) => selectedIds.has(skill.id))
+    }
     if (showBatchAssignmentModal) return bulkSelectedSkills
     if (!scopeModalSkill) return []
     const current = managedSkills.find((skill) => skill.id === scopeModalSkill.id)
     return [current ?? scopeModalSkill]
-  }, [bulkSelectedSkills, managedSkills, scopeModalSkill, showBatchAssignmentModal])
+  }, [
+    bulkSelectedSkills,
+    managedSkills,
+    projectAssignmentBatch,
+    scopeModalSkill,
+    showBatchAssignmentModal,
+  ])
+
+  const projectBatchAddsLibrarySkills =
+    projectAssignmentBatch?.mode === 'library-add'
+  const projectBatchReplacesCurrentTools =
+    projectAssignmentBatch?.mode === 'current-tools'
+  const assignmentModalAdditive =
+    showBatchAssignmentModal || projectBatchAddsLibrarySkills
 
   const handlePreviewAssignments = useCallback(
     async (draft: AssignmentDraftDto): Promise<AssignmentPreviewDto | null> => {
@@ -2701,10 +2880,35 @@ function App() {
       setLoadingStartAt(Date.now())
       setError(null)
       try {
+        if (
+          projectBatchReplacesCurrentTools && selectedProjectDetail
+        ) {
+          const projectId = selectedProjectDetail.project.id
+          const projectToolKeys =
+            draft.projects.find((project) => project.project_id === projectId)
+              ?.tool_keys ?? []
+          const items: AssignmentPreviewDto['items'] = []
+          for (const skill of assignmentModalSkills) {
+            const preview = await invokeTauri<AssignmentPreviewDto>(
+              'preview_skill_assignments',
+              {
+                skillIds: [skill.id],
+                draft: assignmentDraftReplacingProjectTools(
+                  skill,
+                  projectId,
+                  projectToolKeys,
+                ),
+                additive: false,
+              },
+            )
+            items.push(...preview.items)
+          }
+          return { items }
+        }
         return await invokeTauri<AssignmentPreviewDto>('preview_skill_assignments', {
           skillIds: assignmentModalSkills.map((skill) => skill.id),
           draft,
-          additive: showBatchAssignmentModal,
+          additive: assignmentModalAdditive,
         })
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err))
@@ -2714,7 +2918,13 @@ function App() {
         setLoadingStartAt(null)
       }
     },
-    [assignmentModalSkills, invokeTauri, showBatchAssignmentModal],
+    [
+      assignmentModalAdditive,
+      assignmentModalSkills,
+      invokeTauri,
+      projectBatchReplacesCurrentTools,
+      selectedProjectDetail,
+    ],
   )
 
   const handleApplyAssignments = useCallback(
@@ -2728,15 +2938,48 @@ function App() {
       setError(null)
       setActionMessage(t('assignment.applying'))
       try {
-        const result = await invokeTauri<AssignmentApplyResultDto>(
-          'apply_skill_assignments',
-          {
-            skillIds: assignmentModalSkills.map((skill) => skill.id),
-            draft,
-            replaceConflictKeys,
-            additive: showBatchAssignmentModal,
-          },
-        )
+        let result: AssignmentApplyResultDto
+        if (
+          projectBatchReplacesCurrentTools && selectedProjectDetail
+        ) {
+          const projectId = selectedProjectDetail.project.id
+          const projectToolKeys =
+            draft.projects.find((project) => project.project_id === projectId)
+              ?.tool_keys ?? []
+          const results: AssignmentApplyResultDto['skills'] = []
+          for (const skill of assignmentModalSkills) {
+            const applied = await invokeTauri<AssignmentApplyResultDto>(
+              'apply_skill_assignments',
+              {
+                skillIds: [skill.id],
+                draft: assignmentDraftReplacingProjectTools(
+                  skill,
+                  projectId,
+                  projectToolKeys,
+                ),
+                replaceConflictKeys,
+                additive: false,
+              },
+            )
+            results.push(...applied.skills)
+          }
+          result = {
+            succeeded: results.reduce((sum, item) => sum + item.succeeded, 0),
+            failed: results.reduce((sum, item) => sum + item.failed, 0),
+            skipped: results.reduce((sum, item) => sum + item.skipped, 0),
+            skills: results,
+          }
+        } else {
+          result = await invokeTauri<AssignmentApplyResultDto>(
+            'apply_skill_assignments',
+            {
+              skillIds: assignmentModalSkills.map((skill) => skill.id),
+              draft,
+              replaceConflictKeys,
+              additive: assignmentModalAdditive,
+            },
+          )
+        }
         await loadManagedSkills()
         if (selectedProjectDetail) {
           const detail = await invokeTauri<ProjectDetailDto>('scan_project', {
@@ -2747,6 +2990,7 @@ function App() {
         await loadProjects()
         setScopeModalSkill(null)
         setShowBatchAssignmentModal(false)
+        setProjectAssignmentBatch(null)
         setAssignmentInitialDraft(null)
         if (showBatchAssignmentModal) {
           setBulkSelectedIds([])
@@ -2781,9 +3025,11 @@ function App() {
     },
     [
       assignmentModalSkills,
+      assignmentModalAdditive,
       invokeTauri,
       loadManagedSkills,
       loadProjects,
+      projectBatchReplacesCurrentTools,
       selectedProjectDetail,
       showActionErrors,
       showBatchAssignmentModal,
@@ -2890,6 +3136,11 @@ function App() {
     setPendingDeleteId(skill.id)
   }, [])
 
+  const assignmentContextProjectId =
+    activeView === 'projectDetail'
+      ? selectedProjectDetail?.project.id
+      : undefined
+
   return (
     <div className="skills-app">
       <Toaster
@@ -2918,14 +3169,19 @@ function App() {
       <main className="skills-main">
         {activeView === 'projectDetail' && selectedProjectDetail ? (
           <ProjectDetailPage
+            key={selectedProjectDetail.project.id}
             detail={selectedProjectDetail}
             loading={loading}
             onBack={handleBackToProjects}
             onRefresh={handleRefreshProject}
             onToolsChange={handleProjectToolsChange}
             onGitExcludeChange={handleProjectGitExcludeChange}
-            onInjectSkill={handleInjectProjectSkill}
+            onAddLibrarySkill={handleAddProjectLibrarySkill}
+            onAddLibrarySkills={handleAddProjectLibrarySkills}
+            onHandleLibraryConflict={handleInjectProjectSkill}
+            onAssignSkills={handleAssignCurrentProjectSkills}
             onRemoveSkill={handleRemoveProjectSkill}
+            onRemoveSkills={(skillIds) => void handleRemoveProjectSkills(skillIds)}
             onCollectSkill={(discoveredSkillId, name) =>
               void handleCollectProjectSkill(discoveredSkillId, name)
             }
@@ -3249,18 +3505,27 @@ function App() {
       <AssignmentModal
         key={
           assignmentModalSkills.length > 0
-            ? `${assignmentModalSkills.map((skill) => skill.id).join('-')}-${assignmentInitialDraft?.global_tools.join('-') ?? 'current'}`
+            ? `${assignmentModalSkills.map((skill) => skill.id).join('-')}-${assignmentInitialDraft?.global_tools.join('-') ?? 'current'}-${assignmentContextProjectId ?? 'all'}-${projectAssignmentBatch?.mode ?? 'standard'}`
             : 'assignment-modal'
         }
-        open={Boolean(scopeModalSkill || showBatchAssignmentModal)}
+        open={Boolean(
+          scopeModalSkill || showBatchAssignmentModal || projectAssignmentBatch,
+        )}
         loading={loading}
         skills={assignmentModalSkills}
         tools={toolStatus?.tools ?? []}
         projects={projects}
-        additive={showBatchAssignmentModal}
+        contextProjectId={assignmentContextProjectId}
+        additive={assignmentModalAdditive}
+        projectBatchReplace={projectBatchReplacesCurrentTools}
+        requireProjectTools={Boolean(projectAssignmentBatch)}
         initialDraft={assignmentInitialDraft}
         onRequestClose={
-          showBatchAssignmentModal ? handleCloseBatchAssignment : handleCloseScope
+          projectAssignmentBatch
+            ? handleCloseProjectAssignmentBatch
+            : showBatchAssignmentModal
+              ? handleCloseBatchAssignment
+              : handleCloseScope
         }
         onPreview={handlePreviewAssignments}
         onApply={handleApplyAssignments}
@@ -3358,6 +3623,7 @@ function App() {
           loading={loading}
           gitCandidates={gitCandidates}
           gitCandidateSelected={gitCandidateSelected}
+          customName={gitName}
           reimporting={Boolean(reimportSkill)}
           onRequestClose={handleCloseGitPick}
           onCancel={handleCancelGitPick}

@@ -23,6 +23,10 @@ import type {
   ProjectSummaryDto,
   ToolInfoDto,
 } from '../types'
+import {
+  getExpandedProjectsAfterToggle,
+  getVisibleAssignmentProjects,
+} from '../assignmentModalState'
 
 type AssignmentModalProps = {
   open: boolean
@@ -30,7 +34,10 @@ type AssignmentModalProps = {
   skills: ManagedSkill[]
   tools: ToolInfoDto[]
   projects: ProjectSummaryDto[]
+  contextProjectId?: string
   additive: boolean
+  projectBatchReplace?: boolean
+  requireProjectTools?: boolean
   initialDraft?: AssignmentDraftDto | null
   onRequestClose: () => void
   onPreview: (draft: AssignmentDraftDto) => Promise<AssignmentPreviewDto | null>
@@ -86,7 +93,10 @@ const AssignmentModal = ({
   skills,
   tools,
   projects,
+  contextProjectId,
   additive,
+  projectBatchReplace = false,
+  requireProjectTools = false,
   initialDraft,
   onRequestClose,
   onPreview,
@@ -118,6 +128,10 @@ const AssignmentModal = ({
   const projectCapableTools = useMemo(
     () => tools.filter((tool) => tool.supports_project_scope),
     [tools],
+  )
+  const visibleProjects = useMemo(
+    () => getVisibleAssignmentProjects(projects, contextProjectId),
+    [contextProjectId, projects],
   )
   const conflicts = useMemo(
     () => preview?.items.filter((item) => item.outcome === 'conflict') ?? [],
@@ -159,6 +173,9 @@ const AssignmentModal = ({
     }),
     [globalTools, projectTools],
   )
+  const selectedContextProjectTools = contextProjectId
+    ? projectTools[contextProjectId] ?? []
+    : []
 
   if (!open) return null
 
@@ -184,9 +201,7 @@ const AssignmentModal = ({
       return { ...current, [project.id]: inherited }
     })
     setExpandedProjects((current) =>
-      checked
-        ? Array.from(new Set([...current, project.id]))
-        : current.filter((id) => id !== project.id),
+      getExpandedProjectsAfterToggle(current, project.id),
     )
   }
 
@@ -197,12 +212,15 @@ const AssignmentModal = ({
   ) => {
     setProjectTools((current) => {
       const selected = current[projectId] ?? []
-      return {
-        ...current,
-        [projectId]: checked
-          ? Array.from(new Set([...selected, toolKey]))
-          : selected.filter((key) => key !== toolKey),
+      const nextSelected = checked
+        ? Array.from(new Set([...selected, toolKey]))
+        : selected.filter((key) => key !== toolKey)
+      if (nextSelected.length === 0) {
+        const next = { ...current }
+        delete next[projectId]
+        return next
       }
+      return { ...current, [projectId]: nextSelected }
     })
   }
 
@@ -233,8 +251,14 @@ const AssignmentModal = ({
                 ? t('assignment.title', { name: skills[0]?.name ?? '' })
                 : t('assignment.batchTitle', { count: skills.length })}
             </div>
-            {additive ? (
-              <div className="assignment-mode-label">{t('assignment.additive')}</div>
+            {additive || projectBatchReplace ? (
+              <div className="assignment-mode-label">
+                {t(
+                  projectBatchReplace
+                    ? 'assignment.projectBatchReplace'
+                    : 'assignment.additive',
+                )}
+              </div>
             ) : null}
           </div>
           <button
@@ -462,36 +486,40 @@ const AssignmentModal = ({
                   </div>
                 </section>
               ) : null}
-              <section className="assignment-section">
-                <div className="assignment-section-title">
-                  <Globe2 size={17} />
-                  <span>{t('assignment.globalTitle')}</span>
-                  <span className="assignment-count">{globalTools.length}</span>
-                </div>
-                <div className="assignment-tool-grid">
-                  {tools.map((tool) => {
-                    const checked = globalTools.includes(tool.key)
-                    const available = tool.enabled && tool.installed
-                    return (
-                      <label
-                        className={`assignment-tool-option${checked ? ' selected' : ''}${!available ? ' unavailable' : ''}`}
-                        key={tool.key}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          disabled={loading || (!available && !checked)}
-                          onChange={(event) =>
-                            toggleGlobalTool(tool.key, event.target.checked)
-                          }
-                        />
-                        <span>{tool.label}</span>
-                        {!available ? <small>{t('assignment.unavailable')}</small> : null}
-                      </label>
-                    )
-                  })}
-                </div>
-              </section>
+              {!contextProjectId ? (
+                <section className="assignment-section">
+                  <div className="assignment-section-title">
+                    <Globe2 size={17} />
+                    <span>{t('assignment.globalTitle')}</span>
+                    <span className="assignment-count">{globalTools.length}</span>
+                  </div>
+                  <div className="assignment-tool-grid">
+                    {tools.map((tool) => {
+                      const checked = globalTools.includes(tool.key)
+                      const available = tool.enabled && tool.installed
+                      return (
+                        <label
+                          className={`assignment-tool-option${checked ? ' selected' : ''}${!available ? ' unavailable' : ''}`}
+                          key={tool.key}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            disabled={loading || (!available && !checked)}
+                            onChange={(event) =>
+                              toggleGlobalTool(tool.key, event.target.checked)
+                            }
+                          />
+                          <span>{tool.label}</span>
+                          {!available ? (
+                            <small>{t('assignment.unavailable')}</small>
+                          ) : null}
+                        </label>
+                      )
+                    })}
+                  </div>
+                </section>
+              ) : null}
 
               <section className="assignment-section project-assignment-section">
                 <div className="assignment-section-title">
@@ -501,11 +529,11 @@ const AssignmentModal = ({
                     {Object.values(projectTools).filter((keys) => keys.length > 0).length}
                   </span>
                 </div>
-                {projects.length === 0 ? (
+                {visibleProjects.length === 0 ? (
                   <div className="assignment-empty">{t('assignment.noProjects')}</div>
                 ) : (
                   <div className="assignment-project-list">
-                    {projects.map((project) => {
+                    {visibleProjects.map((project) => {
                       const selected = Object.hasOwn(projectTools, project.id)
                       const expanded = expandedProjects.includes(project.id)
                       const selectedTools = projectTools[project.id] ?? []
@@ -570,7 +598,6 @@ const AssignmentModal = ({
                                       checked={checked}
                                       disabled={
                                         loading ||
-                                        !selected ||
                                         (!available && !checked)
                                       }
                                       onChange={(event) =>
@@ -595,6 +622,11 @@ const AssignmentModal = ({
                     })}
                   </div>
                 )}
+                {requireProjectTools && selectedContextProjectTools.length === 0 ? (
+                  <div className="assignment-empty">
+                    {t('assignment.selectAtLeastOneProjectAgent')}
+                  </div>
+                ) : null}
               </section>
             </>
           )}
@@ -624,7 +656,11 @@ const AssignmentModal = ({
             className="btn btn-primary"
             type="button"
             onClick={() => void (preview ? handleApply() : handlePreview())}
-            disabled={loading || skills.length === 0}
+            disabled={
+              loading ||
+              skills.length === 0 ||
+              (requireProjectTools && selectedContextProjectTools.length === 0)
+            }
           >
             <Save size={16} />
             {preview ? t('assignment.confirmApply') : t('assignment.save')}

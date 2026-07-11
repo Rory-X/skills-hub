@@ -33,3 +33,24 @@ export const assignmentDraftForSkill = (
     })),
   }
 }
+
+export const assignmentDraftReplacingProjectTools = (
+  skill: ManagedSkill,
+  projectId: string,
+  projectToolKeys: string[],
+): AssignmentDraftDto => {
+  const draft = assignmentDraftForSkill(skill)
+  const replacement = Array.from(new Set(projectToolKeys))
+  let replaced = false
+  const projects = draft.projects.flatMap((project) => {
+    if (project.project_id !== projectId) return [project]
+    replaced = true
+    return replacement.length > 0
+      ? [{ project_id: projectId, tool_keys: replacement }]
+      : []
+  })
+  if (!replaced && replacement.length > 0) {
+    projects.push({ project_id: projectId, tool_keys: replacement })
+  }
+  return { global_tools: draft.global_tools, projects }
+}

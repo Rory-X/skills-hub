@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { assignmentDraftForSkill } from './assignmentDraft'
+import {
+  assignmentDraftForSkill,
+  assignmentDraftReplacingProjectTools,
+} from './assignmentDraft'
 import type { ManagedSkill } from './types'
 
 const skill: ManagedSkill = {
@@ -63,6 +66,18 @@ describe('assignmentDraftForSkill', () => {
     expect(assignmentDraftForSkill(skill, 'project-1', null)).toEqual({
       global_tools: ['codex'],
       projects: [{ project_id: 'project-2', tool_keys: ['claude_code'] }],
+    })
+  })
+
+  it('replaces one project Agent set while preserving other assignments', () => {
+    expect(
+      assignmentDraftReplacingProjectTools(skill, 'project-1', ['codex']),
+    ).toEqual({
+      global_tools: ['codex'],
+      projects: [
+        { project_id: 'project-1', tool_keys: ['codex'] },
+        { project_id: 'project-2', tool_keys: ['claude_code'] },
+      ],
     })
   })
 })

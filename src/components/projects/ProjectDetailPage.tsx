@@ -9,6 +9,7 @@ import {
   FolderGit2,
   EyeOff,
   Library,
+  ListChecks,
   Plus,
   RefreshCw,
   Search,
@@ -24,6 +25,10 @@ import type {
   ProjectSkillDto,
 } from '../skills/types'
 import { getDirectProjectIssueAction } from './projectIssueResolution'
+import {
+  getManageableProjectSkillIds,
+  getProjectLibraryAddAction,
+} from './projectBulkActions'
 
 type ProjectTab = 'current' | 'library' | 'attention'
 
@@ -34,8 +39,12 @@ type ProjectDetailPageProps = {
   onRefresh: () => void
   onToolsChange: (toolKeys: string[]) => void
   onGitExcludeChange: (enabled: boolean) => void
-  onInjectSkill: (skillId: string) => void
+  onAddLibrarySkill: (skillId: string) => void
+  onAddLibrarySkills: (skillIds: string[]) => void
+  onHandleLibraryConflict: (skillId: string) => void
+  onAssignSkills: (skillIds: string[]) => void
   onRemoveSkill: (skillId: string) => void
+  onRemoveSkills: (skillIds: string[]) => void
   onCollectSkill: (discoveredSkillId: string, name: string) => void
   onResolveIssue: (
     issueId: string,
@@ -53,8 +62,12 @@ const ProjectDetailPage = ({
   onRefresh,
   onToolsChange,
   onGitExcludeChange,
-  onInjectSkill,
+  onAddLibrarySkill,
+  onAddLibrarySkills,
+  onHandleLibraryConflict,
+  onAssignSkills,
   onRemoveSkill,
+  onRemoveSkills,
   onCollectSkill,
   onResolveIssue,
   onIgnoreIssue,
@@ -63,6 +76,10 @@ const ProjectDetailPage = ({
 }: ProjectDetailPageProps) => {
   const [activeTab, setActiveTab] = useState<ProjectTab>('current')
   const [librarySearch, setLibrarySearch] = useState('')
+  const [librarySkillSelection, setSelectedLibrarySkillIds] = useState<string[]>([])
+  const [currentBulkMode, setCurrentBulkMode] = useState(false)
+  const [currentSkillSelection, setSelectedCurrentSkillIds] = useState<string[]>([])
+  const [pendingBulkRemoveIds, setPendingBulkRemoveIds] = useState<string[]>([])
   const [expandedSkills, setExpandedSkills] = useState<Record<string, boolean>>({})
   const [resolutionIssue, setResolutionIssue] = useState<ProjectIssueDto | null>(null)
   const [selectedActionIndex, setSelectedActionIndex] = useState(0)
@@ -85,12 +102,109 @@ const ProjectDetailPage = ({
         skill.description?.toLowerCase().includes(query),
     )
   }, [detail.library_skills, librarySearch])
+  const visibleAddableLibraryIds = useMemo(
+    () =>
+      filteredLibrary
+        .filter((skill) => skill.availability === 'addable')
+        .map((skill) => skill.skill_id),
+    [filteredLibrary],
+  )
+  const manageableCurrentSkillIds = useMemo(
+    () => getManageableProjectSkillIds(detail.current_skills),
+    [detail.current_skills],
+  )
+  const selectedLibrarySkillIds = useMemo(() => {
+    const addableIds = new Set(
+      detail.library_skills
+        .filter((skill) => skill.availability === 'addable')
+        .map((skill) => skill.skill_id),
+    )
+    return librarySkillSelection.filter((skillId) => addableIds.has(skillId))
+  }, [detail.library_skills, librarySkillSelection])
+  const selectedCurrentSkillIds = useMemo(() => {
+    const manageableIds = new Set(manageableCurrentSkillIds)
+    return currentSkillSelection.filter((skillId) => manageableIds.has(skillId))
+  }, [currentSkillSelection, manageableCurrentSkillIds])
+  const hasEnabledProjectAgents = detail.project.enabled_tool_keys.some(
+    (toolKey) =>
+      detail.tools.some((tool) => tool.key === toolKey && tool.enabled),
+  )
+  const selectedCurrentSkillNames = useMemo(() => {
+    const selectedIds = new Set(selectedCurrentSkillIds)
+    return detail.current_skills
+      .filter(
+        (skill) =>
+          skill.linked_skill_id && selectedIds.has(skill.linked_skill_id),
+      )
+      .map((skill) => skill.name)
+  }, [detail.current_skills, selectedCurrentSkillIds])
 
   const toggleTool = (toolKey: string, enabled: boolean) => {
     const next = new Set(detail.project.enabled_tool_keys)
     if (enabled) next.add(toolKey)
     else next.delete(toolKey)
     onToolsChange([...next])
+  }
+
+  const toggleLibrarySkill = (skillId: string, checked: boolean) => {
+    setSelectedLibrarySkillIds((current) =>
+      checked
+        ? Array.from(new Set([...current, skillId]))
+        : current.filter((id) => id !== skillId),
+    )
+  }
+
+  const toggleVisibleLibrarySkills = () => {
+    const visibleIds = new Set(visibleAddableLibraryIds)
+    const allVisibleSelected = visibleAddableLibraryIds.every((skillId) =>
+      selectedLibrarySkillIds.includes(skillId),
+    )
+    setSelectedLibrarySkillIds((current) =>
+      allVisibleSelected
+        ? current.filter((skillId) => !visibleIds.has(skillId))
+        : Array.from(new Set([...current, ...visibleAddableLibraryIds])),
+    )
+  }
+
+  const addSelectedLibrarySkills = () => {
+    const action = getProjectLibraryAddAction(selectedLibrarySkillIds)
+    if (action.kind === 'none') return
+    setSelectedLibrarySkillIds([])
+    if (action.kind === 'direct') {
+      onAddLibrarySkill(action.skillId)
+    } else {
+      onAddLibrarySkills(action.skillIds)
+    }
+  }
+
+  const toggleCurrentSkill = (skillId: string, checked: boolean) => {
+    setSelectedCurrentSkillIds((current) =>
+      checked
+        ? Array.from(new Set([...current, skillId]))
+        : current.filter((id) => id !== skillId),
+    )
+  }
+
+  const toggleAllCurrentSkills = () => {
+    const allSelected = manageableCurrentSkillIds.every((skillId) =>
+      selectedCurrentSkillIds.includes(skillId),
+    )
+    setSelectedCurrentSkillIds(
+      allSelected ? [] : Array.from(manageableCurrentSkillIds),
+    )
+  }
+
+  const closeCurrentBulkMode = () => {
+    setCurrentBulkMode(false)
+    setSelectedCurrentSkillIds([])
+  }
+
+  const confirmBulkRemove = () => {
+    if (pendingBulkRemoveIds.length === 0) return
+    const skillIds = pendingBulkRemoveIds
+    setPendingBulkRemoveIds([])
+    closeCurrentBulkMode()
+    onRemoveSkills(skillIds)
   }
 
   const openIssueResolution = (issue: ProjectIssueDto) => {
@@ -120,11 +234,40 @@ const ProjectDetailPage = ({
 
   const renderSkillRow = (skill: ProjectSkillDto) => {
     const expanded = Boolean(expandedSkills[skill.name])
+    const manageableSkillId =
+      skill.source === 'library' ? skill.linked_skill_id ?? null : null
+    const bulkSelected = Boolean(
+      manageableSkillId && selectedCurrentSkillIds.includes(manageableSkillId),
+    )
     const collectiblePath = skill.paths.find(
       (path) => path.status !== 'invalid_missing_skill_md',
     )
     return (
-      <div className="project-skill-row" key={skill.name}>
+      <div
+        className={`project-skill-row${currentBulkMode ? ' bulk-mode' : ''}${bulkSelected ? ' bulk-selected' : ''}`}
+        key={skill.name}
+      >
+        {currentBulkMode ? (
+          <label
+            className={`project-row-checkbox${manageableSkillId ? '' : ' unavailable'}`}
+            title={
+              manageableSkillId
+                ? t('projects.selectSkill')
+                : t('projects.onlyLibrarySkillsBatch')
+            }
+          >
+            <input
+              type="checkbox"
+              checked={bulkSelected}
+              disabled={loading || !manageableSkillId}
+              onChange={(event) =>
+                manageableSkillId
+                  ? toggleCurrentSkill(manageableSkillId, event.target.checked)
+                  : undefined
+              }
+            />
+          </label>
+        ) : null}
         <button
           className="project-skill-expand"
           type="button"
@@ -369,29 +512,175 @@ const ProjectDetailPage = ({
           detail.current_skills.length === 0 ? (
             <div className="project-section-empty">{t('projects.currentEmpty')}</div>
           ) : (
-            <div className="project-skills-list">
-              {detail.current_skills.map(renderSkillRow)}
-            </div>
+            <>
+              <div className="project-bulk-toolbar">
+                {currentBulkMode ? (
+                  <>
+                    <span>
+                      {t('projects.selectedSkills', {
+                        count: selectedCurrentSkillIds.length,
+                      })}
+                    </span>
+                    <div>
+                      <button
+                        className="btn btn-secondary"
+                        type="button"
+                        onClick={toggleAllCurrentSkills}
+                        disabled={loading || manageableCurrentSkillIds.length === 0}
+                      >
+                        {manageableCurrentSkillIds.length > 0 &&
+                        manageableCurrentSkillIds.every((skillId) =>
+                          selectedCurrentSkillIds.includes(skillId),
+                        )
+                          ? t('projects.clearSelection')
+                          : t('projects.selectAll')}
+                      </button>
+                      <button
+                        className="btn btn-secondary"
+                        type="button"
+                        onClick={() => {
+                          onAssignSkills(selectedCurrentSkillIds)
+                          closeCurrentBulkMode()
+                        }}
+                        disabled={
+                          loading ||
+                          selectedCurrentSkillIds.length === 0 ||
+                          !hasEnabledProjectAgents
+                        }
+                        title={
+                          hasEnabledProjectAgents
+                            ? undefined
+                            : t('projects.noEnabledAgents')
+                        }
+                      >
+                        {t('projects.setAgents')}
+                      </button>
+                      <button
+                        className="btn btn-danger"
+                        type="button"
+                        onClick={() =>
+                          setPendingBulkRemoveIds(selectedCurrentSkillIds)
+                        }
+                        disabled={loading || selectedCurrentSkillIds.length === 0}
+                      >
+                        {t('projects.removeSelected')}
+                      </button>
+                      <button
+                        className="btn btn-secondary"
+                        type="button"
+                        onClick={closeCurrentBulkMode}
+                        disabled={loading}
+                      >
+                        {t('cancel')}
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <span>{t('projects.currentBatchHint')}</span>
+                    <button
+                      className="btn btn-secondary"
+                      type="button"
+                      onClick={() => setCurrentBulkMode(true)}
+                      disabled={loading || manageableCurrentSkillIds.length === 0}
+                    >
+                      <ListChecks size={15} />
+                      {t('projects.bulkManage')}
+                    </button>
+                  </>
+                )}
+              </div>
+              <div className="project-skills-list">
+                {detail.current_skills.map(renderSkillRow)}
+              </div>
+            </>
           )
         ) : activeTab === 'library' ? (
           <div className="project-library-view">
-            <label className="project-library-search">
-              <Search size={16} />
-              <input
-                value={librarySearch}
-                onChange={(event) => setLibrarySearch(event.target.value)}
-                placeholder={t('projects.searchLibrary')}
-              />
-            </label>
+            <div className="project-library-toolbar">
+              <label className="project-library-search">
+                <Search size={16} />
+                <input
+                  value={librarySearch}
+                  onChange={(event) => setLibrarySearch(event.target.value)}
+                  placeholder={t('projects.searchLibrary')}
+                />
+              </label>
+              <div className="project-library-bulk-actions">
+                <span>
+                  {t('projects.selectedSkills', {
+                    count: selectedLibrarySkillIds.length,
+                  })}
+                </span>
+                <button
+                  className="btn btn-secondary"
+                  type="button"
+                  onClick={toggleVisibleLibrarySkills}
+                  disabled={loading || visibleAddableLibraryIds.length === 0}
+                >
+                  {visibleAddableLibraryIds.length > 0 &&
+                  visibleAddableLibraryIds.every((skillId) =>
+                    selectedLibrarySkillIds.includes(skillId),
+                  )
+                    ? t('projects.clearVisible')
+                    : t('projects.selectVisible')}
+                </button>
+                <button
+                  className="btn btn-primary"
+                  type="button"
+                  onClick={addSelectedLibrarySkills}
+                  disabled={
+                    loading ||
+                    selectedLibrarySkillIds.length === 0 ||
+                    !hasEnabledProjectAgents
+                  }
+                  title={
+                    hasEnabledProjectAgents
+                      ? undefined
+                      : t('projects.noEnabledAgents')
+                  }
+                >
+                  <Plus size={15} />
+                  {t('projects.addSelected', {
+                    count: selectedLibrarySkillIds.length,
+                  })}
+                </button>
+              </div>
+            </div>
             {filteredLibrary.length === 0 ? (
               <div className="project-section-empty">{t('projects.libraryEmpty')}</div>
             ) : (
               <div className="project-library-list">
                 {filteredLibrary.map((skill) => (
-                  <div className="project-library-row" key={skill.skill_id}>
-                    <div>
-                      <strong>{skill.name}</strong>
-                      {skill.description ? <p>{skill.description}</p> : null}
+                  <div
+                    className={`project-library-row${selectedLibrarySkillIds.includes(skill.skill_id) ? ' bulk-selected' : ''}`}
+                    key={skill.skill_id}
+                  >
+                    <div className="project-library-row-main">
+                      {skill.availability === 'addable' ? (
+                        <label
+                          className="project-row-checkbox"
+                          title={t('projects.selectSkill')}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={selectedLibrarySkillIds.includes(
+                              skill.skill_id,
+                            )}
+                            disabled={loading}
+                            onChange={(event) =>
+                              toggleLibrarySkill(
+                                skill.skill_id,
+                                event.target.checked,
+                              )
+                            }
+                          />
+                        </label>
+                      ) : null}
+                      <div>
+                        <strong>{skill.name}</strong>
+                        {skill.description ? <p>{skill.description}</p> : null}
+                      </div>
                     </div>
                     <span className={`project-availability ${skill.availability}`}>
                       {t(`projects.availability.${skill.availability}`)}
@@ -400,8 +689,13 @@ const ProjectDetailPage = ({
                       <button
                         className="btn btn-primary"
                         type="button"
-                        onClick={() => onInjectSkill(skill.skill_id)}
-                        disabled={loading}
+                        onClick={() => onAddLibrarySkill(skill.skill_id)}
+                        disabled={loading || !hasEnabledProjectAgents}
+                        title={
+                          hasEnabledProjectAgents
+                            ? undefined
+                            : t('projects.noEnabledAgents')
+                        }
                       >
                         <Plus size={15} />
                         {t('projects.add')}
@@ -421,7 +715,7 @@ const ProjectDetailPage = ({
                         type="button"
                         onClick={() => {
                           setActiveTab('attention')
-                          onInjectSkill(skill.skill_id)
+                          onHandleLibraryConflict(skill.skill_id)
                         }}
                         disabled={loading}
                       >
@@ -460,6 +754,66 @@ const ProjectDetailPage = ({
           </>
         )}
       </div>
+
+      {pendingBulkRemoveIds.length > 0 ? (
+        <div
+          className="modal-backdrop"
+          onClick={() => (loading ? null : setPendingBulkRemoveIds([]))}
+        >
+          <div
+            className="modal modal-delete project-bulk-remove-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="project-bulk-remove-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div className="modal-title" id="project-bulk-remove-title">
+                {t('projects.bulkRemoveTitle', {
+                  count: pendingBulkRemoveIds.length,
+                })}
+              </div>
+              <button
+                className="modal-close"
+                type="button"
+                onClick={() => setPendingBulkRemoveIds([])}
+                disabled={loading}
+                aria-label={t('close')}
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <div className="modal-body">
+              <p>{t('projects.bulkRemoveBody')}</p>
+              <div className="project-bulk-remove-list">
+                {selectedCurrentSkillNames.map((name) => (
+                  <span key={name}>{name}</span>
+                ))}
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button
+                className="btn btn-secondary"
+                type="button"
+                onClick={() => setPendingBulkRemoveIds([])}
+                disabled={loading}
+              >
+                {t('cancel')}
+              </button>
+              <button
+                className="btn btn-danger"
+                type="button"
+                onClick={confirmBulkRemove}
+                disabled={loading}
+              >
+                {t('projects.bulkRemoveConfirm', {
+                  count: pendingBulkRemoveIds.length,
+                })}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {resolutionIssue ? (
         <div className="modal-backdrop" onClick={closeIssueResolution}>
