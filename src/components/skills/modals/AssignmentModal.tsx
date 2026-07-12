@@ -27,6 +27,7 @@ import type {
 } from '../types'
 import {
   getExpandedProjectsAfterToggle,
+  getProjectToolsAfterToggle,
   getVisibleAssignmentProjects,
 } from '../assignmentModalState'
 import {
@@ -259,21 +260,9 @@ const AssignmentModal = ({
   }
 
   const toggleProject = (project: ProjectSummaryDto, checked: boolean) => {
-    setProjectTools((current) => {
-      if (!checked) {
-        const next = { ...current }
-        delete next[project.id]
-        return next
-      }
-      const inherited = project.enabled_tool_keys.filter((toolKey) => {
-        const tool = toolsByKey[toolKey]
-        return Boolean(
-          tool?.supports_project_scope &&
-            isProjectToolAvailable(tool, project.enabled_tool_keys),
-        )
-      })
-      return { ...current, [project.id]: inherited }
-    })
+    setProjectTools((current) =>
+      getProjectToolsAfterToggle(current, project.id, checked),
+    )
     setExpandedProjects((current) =>
       getExpandedProjectsAfterToggle(current, project.id),
     )

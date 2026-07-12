@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   assignmentDraftForSkill,
   assignmentDraftReplacingProjectTools,
+  emptyProjectAssignmentDraft,
 } from './assignmentDraft'
 import type { ManagedSkill } from './types'
 
@@ -52,6 +53,13 @@ const skill: ManagedSkill = {
 }
 
 describe('assignmentDraftForSkill', () => {
+  it('starts a project batch with no Agents selected', () => {
+    expect(emptyProjectAssignmentDraft('project-1')).toEqual({
+      global_tools: [],
+      projects: [{ project_id: 'project-1', tool_keys: [] }],
+    })
+  })
+
   it('adds tools to one project without replacing other assignments', () => {
     expect(assignmentDraftForSkill(skill, 'project-1', ['codex'])).toEqual({
       global_tools: ['codex'],

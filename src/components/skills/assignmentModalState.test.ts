@@ -2,10 +2,17 @@ import { describe, expect, it } from 'vitest'
 
 import {
   getExpandedProjectsAfterToggle,
+  getProjectToolsAfterToggle,
   getVisibleAssignmentProjects,
 } from './assignmentModalState'
 
 describe('assignment modal project context', () => {
+  it('does not select every Agent when a project is selected', () => {
+    expect(getProjectToolsAfterToggle({}, 'project-1', true)).toEqual({
+      'project-1': [],
+    })
+  })
+
   it('keeps the current project expanded after clearing all agents', () => {
     expect(getExpandedProjectsAfterToggle(['project-1'], 'project-1')).toEqual([
       'project-1',

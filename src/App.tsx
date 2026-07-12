@@ -42,6 +42,7 @@ import { getGitImportCustomName } from './components/skills/gitImportName'
 import {
   assignmentDraftForSkill,
   assignmentDraftReplacingProjectTools,
+  emptyProjectAssignmentDraft,
 } from './components/skills/assignmentDraft'
 import { getAvailableProjectToolKeys } from './components/skills/toolAvailability'
 import { selectEntireLibrary } from './components/skills/bulkAssignmentWorkflow'
@@ -145,7 +146,6 @@ function App() {
   const [searchQuery, setSearchQuery] = useState('')
   const [sortBy, setSortBy] = useState<'updated' | 'name'>('updated')
   const [scopeFilter, setScopeFilter] = useState<'all' | 'global' | 'project'>('all')
-  const [skillListMode, setSkillListMode] = useState<'all' | 'pending'>('all')
   const [activeView, setActiveView] = useState<ActiveView>('projects')
   const [managementTab, setManagementTab] = useState<ManagementTab>('tags')
   const [detailSkill, setDetailSkill] = useState<ManagedSkill | null>(null)
@@ -610,7 +610,6 @@ function App() {
     const selectedTagSet = new Set(selectedTagIds)
     const hasTagFilter = selectedTagIds.length > 0 || includeUntagged
     const filtered = managedSkills.filter((skill) => {
-      if (skillListMode === 'pending' && !skill.pending_assignment) return false
       if (scopeFilter !== 'all' && getSkillScope(skill) !== scopeFilter) return false
       if (hasTagFilter) {
         const matchesSelectedTag = skill.tags.some((tag) => selectedTagSet.has(tag.id))
@@ -636,16 +635,11 @@ function App() {
     getSkillScope,
     includeUntagged,
     managedSkills,
-    skillListMode,
     scopeFilter,
     searchQuery,
     selectedTagIds,
     sortBy,
   ])
-  const pendingAssignmentCount = useMemo(
-    () => managedSkills.filter((skill) => skill.pending_assignment).length,
-    [managedSkills],
-  )
   const untaggedCount = useMemo(
     () => managedSkills.filter((skill) => skill.tags.length === 0).length,
     [managedSkills],
@@ -1238,15 +1232,9 @@ function App() {
         setError(t('projects.noEnabledAgents'))
         return
       }
-      setAssignmentInitialDraft({
-        global_tools: [],
-        projects: [
-          {
-            project_id: selectedProjectDetail.project.id,
-            tool_keys: availableTools,
-          },
-        ],
-      })
+      setAssignmentInitialDraft(
+        emptyProjectAssignmentDraft(selectedProjectDetail.project.id),
+      )
       setProjectAssignmentBatch({ mode: 'library-add', skillIds })
     },
     [
@@ -1286,15 +1274,9 @@ function App() {
         setError(t('projects.noEnabledAgents'))
         return
       }
-      setAssignmentInitialDraft({
-        global_tools: [],
-        projects: [
-          {
-            project_id: selectedProjectDetail.project.id,
-            tool_keys: availableTools,
-          },
-        ],
-      })
+      setAssignmentInitialDraft(
+        emptyProjectAssignmentDraft(selectedProjectDetail.project.id),
+      )
       setProjectAssignmentBatch({ mode: 'current-tools', skillIds })
     },
     [getAvailableProjectTools, selectedProjectDetail, t],
@@ -2378,7 +2360,6 @@ function App() {
           : t('status.localSkillCreated')
         setActionMessage(successMessage)
         setSuccessToastMessage(successMessage)
-        if (!reimportSkill) setSkillListMode('pending')
         setActionMessage(null)
         setShowAddModal(false)
         setReimportSkill(null)
@@ -2593,7 +2574,6 @@ function App() {
         : t('status.gitSkillCreated')
       setActionMessage(successMessage)
       setSuccessToastMessage(successMessage)
-      if (!reimportSkill) setSkillListMode('pending')
       setActionMessage(null)
       setShowAddModal(false)
       setReimportSkill(null)
@@ -2747,7 +2727,6 @@ function App() {
       setLocalName('')
       setActionMessage(t('status.selectedSkillsInstalled'))
       setSuccessToastMessage(t('status.selectedSkillsInstalled'))
-      setSkillListMode('pending')
       setActionMessage(null)
       setShowAddModal(false)
       await loadManagedSkills()
@@ -2850,7 +2829,6 @@ function App() {
       setGitName('')
       setActionMessage(t('status.selectedSkillsInstalled'))
       setSuccessToastMessage(t('status.selectedSkillsInstalled'))
-      setSkillListMode('pending')
       setActionMessage(null)
       setShowGitPickModal(false)
       setGitCandidates([])
@@ -3324,9 +3302,6 @@ function App() {
         ) : activeView === 'myskills' ? (
           <div className="dashboard-stack">
             <FilterBar
-              listMode={skillListMode}
-              allCount={managedSkills.length}
-              pendingCount={pendingAssignmentCount}
               sortBy={sortBy}
               searchQuery={searchQuery}
               scopeFilter={scopeFilter}
@@ -3337,7 +3312,6 @@ function App() {
               bulkMode={bulkMode}
               bulkSelectedCount={bulkSelectedIds.length}
               onSortChange={handleSortChange}
-              onListModeChange={setSkillListMode}
               onSearchChange={handleSearchChange}
               onScopeFilterChange={handleScopeFilterChange}
               onToggleTag={handleToggleTagFilter}

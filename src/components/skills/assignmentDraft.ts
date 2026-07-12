@@ -1,5 +1,12 @@
 import type { AssignmentDraftDto, ManagedSkill } from './types'
 
+export const emptyProjectAssignmentDraft = (
+  projectId: string,
+): AssignmentDraftDto => ({
+  global_tools: [],
+  projects: [{ project_id: projectId, tool_keys: [] }],
+})
+
 export const assignmentDraftForSkill = (
   skill: ManagedSkill,
   projectId?: string,

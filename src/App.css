@@ -151,6 +151,7 @@
   align-items: center;
   gap: 12px;
   min-width: 0;
+  margin-left: auto;
 }
 
 .filter-actions .btn {
@@ -5406,64 +5407,6 @@
   border-top: 1px solid var(--border-subtle);
 }
 
-.skill-list-tabs {
-  display: inline-flex;
-  align-items: center;
-  min-height: 36px;
-  padding: 3px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 7px;
-  background: var(--bg-element);
-}
-
-.skill-list-tabs button {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  min-height: 28px;
-  padding: 0 10px;
-  border: 0;
-  border-radius: 5px;
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 13px;
-  font-weight: 600;
-  white-space: nowrap;
-  cursor: pointer;
-}
-
-.skill-list-tabs button.active {
-  background: var(--bg-panel);
-  color: var(--text-primary);
-  box-shadow: var(--shadow-sm);
-}
-
-.skill-list-tabs button:focus-visible {
-  outline: 2px solid var(--accent-primary);
-  outline-offset: 1px;
-}
-
-.skill-list-tabs button span {
-  min-width: 18px;
-  padding: 1px 5px;
-  border-radius: 9px;
-  background: color-mix(in srgb, currentColor 12%, transparent);
-  font-size: 11px;
-  text-align: center;
-}
-
-.skill-pending-badge,
-.skill-attention-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  min-height: 20px;
-  padding: 2px 7px;
-  border-radius: 4px;
-  font-size: 11px;
-  font-weight: 650;
-}
-
 .skill-card.newly-added {
   border-color: #4b9085;
   box-shadow: 0 0 0 2px color-mix(in srgb, #4b9085 15%, transparent);
@@ -5477,24 +5420,6 @@
   to {
     background: var(--surface);
   }
-}
-
-.skill-pending-badge {
-  background: color-mix(in srgb, #d08a12 14%, transparent);
-  color: #9a5b00;
-}
-
-.skill-attention-badge {
-  background: color-mix(in srgb, #c74747 12%, transparent);
-  color: #a82f2f;
-}
-
-[data-theme='dark'] .skill-pending-badge {
-  color: #f3b94f;
-}
-
-[data-theme='dark'] .skill-attention-badge {
-  color: #f08a8a;
 }
 
 .card-btn.assignment-action {
@@ -6154,10 +6079,6 @@
 @media (max-width: 760px) {
   .filter-bar {
     align-items: stretch;
-  }
-
-  .skill-list-tabs {
-    align-self: flex-start;
   }
 
   .assignment-tool-grid,

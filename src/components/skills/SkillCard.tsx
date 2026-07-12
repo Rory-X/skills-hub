@@ -1,6 +1,5 @@
 import { memo, useState } from 'react'
 import {
-  AlertTriangle,
   Box,
   Copy,
   Folder,
@@ -173,17 +172,6 @@ const SkillCard = ({
           ) : null}
           {!skillEnabled ? (
             <span className="skill-disabled-badge">{t('disabled')}</span>
-          ) : null}
-          {skill.pending_assignment ? (
-            <span className="skill-pending-badge">{t('assignment.pendingBadge')}</span>
-          ) : null}
-          {skill.assignment_issue_count > 0 ? (
-            <span className="skill-attention-badge">
-              <AlertTriangle size={12} />
-              {t('assignment.needsAttention', {
-                count: skill.assignment_issue_count,
-              })}
-            </span>
           ) : null}
         </div>
         {skill.description ? (
