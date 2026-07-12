@@ -44,6 +44,7 @@ import {
   assignmentDraftReplacingProjectTools,
 } from './components/skills/assignmentDraft'
 import { getAvailableProjectToolKeys } from './components/skills/toolAvailability'
+import { selectEntireLibrary } from './components/skills/bulkAssignmentWorkflow'
 import type {
   AutoUpdateConfigDto,
   AssignmentApplyResultDto,
@@ -669,6 +670,11 @@ function App() {
     const selectedSet = new Set(bulkSelectedIds)
     return visibleSkills.every((skill) => selectedSet.has(skill.id))
   }, [bulkSelectedIds, visibleSkills])
+  const allLibraryBulkSelected = useMemo(() => {
+    if (managedSkills.length === 0) return false
+    const selectedSet = new Set(bulkSelectedIds)
+    return managedSkills.every((skill) => selectedSet.has(skill.id))
+  }, [bulkSelectedIds, managedSkills])
 
   useEffect(() => {
     const existingIds = new Set(managedSkills.map((skill) => skill.id))
@@ -973,6 +979,77 @@ function App() {
       setAutoUpdateTriggering(false)
     }
   }, [autoUpdateTriggering, invokeTauri, isTauri, loadManagedSkills, t])
+  const handleRetryAutoUpdateSkills = useCallback(
+    async (skillIds: string[]) => {
+      if (!isTauri || autoUpdateTriggering || skillIds.length === 0) return
+      const selected = managedSkills.filter((skill) => skillIds.includes(skill.id))
+      const failed: { skill_id: string; name: string; reason: string }[] = []
+      const succeeded: { skill_id: string; name: string; reason: null }[] = []
+      setAutoUpdateTriggering(true)
+      setError(null)
+      try {
+        for (const skill of selected) {
+          setActionMessage(t('actions.updating', { name: skill.name }))
+          try {
+            await invokeTauri<UpdateResultDto>('update_managed_skill', {
+              skillId: skill.id,
+            })
+            succeeded.push({ skill_id: skill.id, name: skill.name, reason: null })
+          } catch (err) {
+            failed.push({
+              skill_id: skill.id,
+              name: skill.name,
+              reason: err instanceof Error ? err.message : String(err),
+            })
+          }
+        }
+        setAutoUpdateConfig((current) =>
+          current
+            ? {
+                ...current,
+                last_failed: failed.length,
+                last_updated: current.last_updated + succeeded.length,
+                last_status: failed.length > 0 ? 'error' : 'ok',
+                progress: {
+                  ...current.progress,
+                  succeeded: [
+                    ...current.progress.succeeded.filter(
+                      (item) => !skillIds.includes(item.skill_id),
+                    ),
+                    ...succeeded,
+                  ],
+                  failed,
+                  running: null,
+                  pending: [],
+                },
+              }
+            : current,
+        )
+        await loadManagedSkills()
+        if (failed.length > 0) {
+          showActionErrors(
+            failed.map((item) => ({ title: item.name, message: item.reason })),
+          )
+        } else {
+          setSuccessToastMessage(
+            t('autoUpdateRetrySuccess', { count: succeeded.length }),
+          )
+        }
+      } finally {
+        setAutoUpdateTriggering(false)
+        setActionMessage(null)
+      }
+    },
+    [
+      autoUpdateTriggering,
+      invokeTauri,
+      isTauri,
+      loadManagedSkills,
+      managedSkills,
+      showActionErrors,
+      t,
+    ],
+  )
   const handleClearGitCacheNow = useCallback(async () => {
     if (!isTauri) {
       setError(t('errors.notTauri'))
@@ -1657,6 +1734,16 @@ function App() {
       return Array.from(new Set([...current, ...visibleIds]))
     })
   }, [visibleSkills])
+
+  const handleSelectEntireLibrary = useCallback(() => {
+    setBulkMode(true)
+    setBulkSelectedIds((current) =>
+      selectEntireLibrary(
+        current,
+        managedSkills.map((skill) => skill.id),
+      ),
+    )
+  }, [managedSkills])
 
   const handleOpenBulkDelete = useCallback(() => {
     if (bulkSelectedIds.length === 0) return
@@ -2842,6 +2929,14 @@ function App() {
     }
   }, [loading])
 
+  const handleFinishBatchAssignment = useCallback(() => {
+    if (loading) return
+    setShowBatchAssignmentModal(false)
+    setAssignmentInitialDraft(null)
+    setBulkSelectedIds([])
+    setBulkMode(false)
+  }, [loading])
+
   const handleCloseProjectAssignmentBatch = useCallback(() => {
     if (!loading) {
       setProjectAssignmentBatch(null)
@@ -2874,8 +2969,15 @@ function App() {
     showBatchAssignmentModal || projectBatchAddsLibrarySkills
 
   const handlePreviewAssignments = useCallback(
-    async (draft: AssignmentDraftDto): Promise<AssignmentPreviewDto | null> => {
-      if (assignmentModalSkills.length === 0) return null
+    async (
+      draft: AssignmentDraftDto,
+      additiveOverride?: boolean,
+      skillIds?: string[],
+    ): Promise<AssignmentPreviewDto | null> => {
+      const selectedSkills = skillIds
+        ? managedSkills.filter((skill) => skillIds.includes(skill.id))
+        : assignmentModalSkills
+      if (selectedSkills.length === 0) return null
       setLoading(true)
       setLoadingStartAt(Date.now())
       setError(null)
@@ -2888,7 +2990,7 @@ function App() {
             draft.projects.find((project) => project.project_id === projectId)
               ?.tool_keys ?? []
           const items: AssignmentPreviewDto['items'] = []
-          for (const skill of assignmentModalSkills) {
+          for (const skill of selectedSkills) {
             const preview = await invokeTauri<AssignmentPreviewDto>(
               'preview_skill_assignments',
               {
@@ -2906,9 +3008,9 @@ function App() {
           return { items }
         }
         return await invokeTauri<AssignmentPreviewDto>('preview_skill_assignments', {
-          skillIds: assignmentModalSkills.map((skill) => skill.id),
+          skillIds: selectedSkills.map((skill) => skill.id),
           draft,
-          additive: assignmentModalAdditive,
+          additive: additiveOverride ?? assignmentModalAdditive,
         })
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err))
@@ -2922,6 +3024,7 @@ function App() {
       assignmentModalAdditive,
       assignmentModalSkills,
       invokeTauri,
+      managedSkills,
       projectBatchReplacesCurrentTools,
       selectedProjectDetail,
     ],
@@ -2931,8 +3034,13 @@ function App() {
     async (
       draft: AssignmentDraftDto,
       replaceConflictKeys: string[],
+      additiveOverride?: boolean,
+      skillIds?: string[],
     ): Promise<AssignmentApplyResultDto | null> => {
-      if (assignmentModalSkills.length === 0) return null
+      const selectedSkills = skillIds
+        ? managedSkills.filter((skill) => skillIds.includes(skill.id))
+        : assignmentModalSkills
+      if (selectedSkills.length === 0) return null
       setLoading(true)
       setLoadingStartAt(Date.now())
       setError(null)
@@ -2947,7 +3055,7 @@ function App() {
             draft.projects.find((project) => project.project_id === projectId)
               ?.tool_keys ?? []
           const results: AssignmentApplyResultDto['skills'] = []
-          for (const skill of assignmentModalSkills) {
+          for (const skill of selectedSkills) {
             const applied = await invokeTauri<AssignmentApplyResultDto>(
               'apply_skill_assignments',
               {
@@ -2971,12 +3079,12 @@ function App() {
           }
         } else {
           result = await invokeTauri<AssignmentApplyResultDto>(
-            'apply_skill_assignments',
-            {
-              skillIds: assignmentModalSkills.map((skill) => skill.id),
+              'apply_skill_assignments',
+              {
+              skillIds: selectedSkills.map((skill) => skill.id),
               draft,
               replaceConflictKeys,
-              additive: assignmentModalAdditive,
+              additive: additiveOverride ?? assignmentModalAdditive,
             },
           )
         }
@@ -2989,12 +3097,13 @@ function App() {
         }
         await loadProjects()
         setScopeModalSkill(null)
-        setShowBatchAssignmentModal(false)
-        setProjectAssignmentBatch(null)
-        setAssignmentInitialDraft(null)
+        if (!showBatchAssignmentModal) {
+          setShowBatchAssignmentModal(false)
+          setProjectAssignmentBatch(null)
+          setAssignmentInitialDraft(null)
+        }
         if (showBatchAssignmentModal) {
-          setBulkSelectedIds([])
-          setBulkMode(false)
+          return result
         }
         if (result.failed > 0) {
           showActionErrors(
@@ -3029,6 +3138,7 @@ function App() {
       invokeTauri,
       loadManagedSkills,
       loadProjects,
+      managedSkills,
       projectBatchReplacesCurrentTools,
       selectedProjectDetail,
       showActionErrors,
@@ -3264,7 +3374,13 @@ function App() {
               <div className="bulk-action-bar">
                 <div className="bulk-action-copy">
                   <strong>{t('bulk.selected', { count: bulkSelectedIds.length })}</strong>
-                  <span>{t('bulk.helper')}</span>
+                  <span>
+                    {allLibraryBulkSelected
+                      ? t('bulk.entireLibrarySelected', {
+                          count: managedSkills.length,
+                        })
+                      : t('bulk.helper')}
+                  </span>
                 </div>
                 <div className="bulk-action-buttons">
                   <button
@@ -3277,6 +3393,18 @@ function App() {
                       ? t('bulk.unselectVisible')
                       : t('bulk.selectVisible')}
                   </button>
+                  {allVisibleBulkSelected && !allLibraryBulkSelected ? (
+                    <button
+                      className="btn btn-secondary"
+                      type="button"
+                      onClick={handleSelectEntireLibrary}
+                      disabled={loading || managedSkills.length === 0}
+                    >
+                      {t('bulk.selectEntireLibrary', {
+                        count: managedSkills.length,
+                      })}
+                    </button>
+                  ) : null}
                   <button
                     className="btn btn-secondary"
                     type="button"
@@ -3379,6 +3507,8 @@ function App() {
                   onAutoUpdateConfigChange={handleAutoUpdateConfigChange}
                   onRunAutoUpdateNow={handleTriggerAutoUpdateTaskNow}
                   autoUpdateTriggering={autoUpdateTriggering}
+                  skills={managedSkills}
+                  onRetrySkills={handleRetryAutoUpdateSkills}
                   t={t}
                 />
               )}
@@ -3517,6 +3647,7 @@ function App() {
         projects={projects}
         contextProjectId={assignmentContextProjectId}
         additive={assignmentModalAdditive}
+        libraryBatch={showBatchAssignmentModal}
         projectBatchReplace={projectBatchReplacesCurrentTools}
         requireProjectTools={Boolean(projectAssignmentBatch)}
         initialDraft={assignmentInitialDraft}
@@ -3529,6 +3660,7 @@ function App() {
         }
         onPreview={handlePreviewAssignments}
         onApply={handleApplyAssignments}
+        onBatchFinished={handleFinishBatchAssignment}
         onIgnoreIssue={handleIgnoreAssignmentIssue}
         onIgnoreAllIssues={handleIgnoreAllAssignmentIssues}
         onRepairSkill={handleUpdateManaged}

@@ -116,6 +116,7 @@ export type AssignmentPreviewItemDto = {
     | 'conflict'
     | 'unavailable'
     | 'remove'
+    | 'unsafe'
     | string
   blocking: boolean
 }

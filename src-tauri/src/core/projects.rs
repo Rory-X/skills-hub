@@ -1417,21 +1417,20 @@ pub fn assign_project_skill_tools_and_scan(
         .into_iter()
         .filter(|target| target.skill_id == skill_id)
         .collect::<Vec<_>>();
-    let mut removed_paths = HashSet::new();
-    for target in targets
-        .iter()
-        .filter(|target| !desired.contains(target.tool.as_str()))
-    {
-        let path_still_desired = targets.iter().any(|other| {
-            other.target_path == target.target_path && desired.contains(other.tool.as_str())
-        });
-        if !path_still_desired && removed_paths.insert(target.target_path.clone()) {
-            remove_target_if_still_owned(store, target)?;
-        }
-        store.delete_skill_target(skill_id, &target.tool, "project", Some(&project.root_path))?;
-    }
 
     if desired_tools.is_empty() {
+        let mut removed_paths = HashSet::new();
+        for target in &targets {
+            if removed_paths.insert(target.target_path.clone()) {
+                remove_target_if_still_owned(store, target)?;
+            }
+            store.delete_skill_target(
+                skill_id,
+                &target.tool,
+                "project",
+                Some(&project.root_path),
+            )?;
+        }
         if let Some(mut link) = store.get_project_skill_link(&project.id, skill_id)? {
             link.enabled = false;
             link.desired_tools.clear();
@@ -1444,7 +1443,8 @@ pub fn assign_project_skill_tools_and_scan(
         return Ok(ProjectInjectionSummary::default());
     }
 
-    let summary = inject_project_skill_for_tools(
+    let existing_link = store.get_project_skill_link(&project.id, skill_id)?;
+    let summary = match inject_project_skill_for_tools(
         store,
         &project,
         &skill,
@@ -1452,7 +1452,33 @@ pub fn assign_project_skill_tools_and_scan(
         Some(&desired_tools),
         None,
         ProjectConflictPolicy::ReplaceTools(overwrite_conflict_tools),
-    )?;
+    ) {
+        Ok(summary) => summary,
+        Err(err) => {
+            if let Some(link) = existing_link {
+                store.upsert_project_skill_link(&link)?;
+            }
+            return Err(err);
+        }
+    };
+    let current_targets = store
+        .list_project_skill_targets(&project.root_path)?
+        .into_iter()
+        .filter(|target| target.skill_id == skill_id)
+        .collect::<Vec<_>>();
+    let mut removed_paths = HashSet::new();
+    for target in targets
+        .iter()
+        .filter(|target| !desired.contains(target.tool.as_str()))
+    {
+        let path_still_desired = current_targets.iter().any(|other| {
+            other.target_path == target.target_path && desired.contains(other.tool.as_str())
+        });
+        if !path_still_desired && removed_paths.insert(target.target_path.clone()) {
+            remove_target_if_still_owned(store, target)?;
+        }
+        store.delete_skill_target(skill_id, &target.tool, "project", Some(&project.root_path))?;
+    }
     scan_project(store, &project, tool_specs)?;
     rebuild_project_git_exclude(store, &project)?;
     Ok(summary)

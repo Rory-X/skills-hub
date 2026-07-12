@@ -1498,8 +1498,8 @@ pub async fn apply_skill_assignments(
         )?
         .into_iter()
         .map(|outcome| SkillAssignmentApplyResultDto {
-            skill_id: outcome.skill.id,
-            skill_name: outcome.skill.name,
+            skill_id: outcome.skill_id,
+            skill_name: outcome.skill_name,
             succeeded: outcome.summary.succeeded,
             failed: outcome.summary.failed,
             skipped: outcome.summary.skipped,

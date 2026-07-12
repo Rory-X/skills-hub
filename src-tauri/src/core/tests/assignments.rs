@@ -4,10 +4,38 @@ use std::path::Path;
 use crate::core::skill_store::{ProjectRecord, SkillAssignmentRecord, SkillRecord, SkillStore};
 
 use super::{
-    apply_skill_assignment, ignore_assignment_issue, managed_skill_projections,
-    preview_skill_assignment, project_skill_assignments, AssignmentConflictKey, AssignmentDraft,
-    AssignmentToolSpec, ProjectAssignmentDraft,
+    apply_skill_assignment, apply_skill_assignments, ignore_assignment_issue,
+    managed_skill_projections, preview_skill_assignment, project_skill_assignments,
+    AssignmentConflictKey, AssignmentDraft, AssignmentToolSpec, ProjectAssignmentDraft,
 };
+
+#[test]
+fn batch_assignment_reports_a_missing_skill_without_hiding_prior_successes() {
+    let (_db, store) = make_store();
+    let central = tempfile::tempdir().expect("central");
+    write_skill(central.path(), "library");
+    let skill = add_skill(&store, central.path());
+    let global = tempfile::tempdir().expect("global");
+    let tools = [tool(global.path())];
+    let outcomes = apply_skill_assignments(
+        &store,
+        &[skill.id.clone(), "missing-skill".to_string()],
+        &AssignmentDraft {
+            global_tools: vec!["codex".to_string()],
+            projects: Vec::new(),
+        },
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("batch result");
+
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(outcomes[0].summary.succeeded, 1);
+    assert_eq!(outcomes[1].skill_id, "missing-skill");
+    assert_eq!(outcomes[1].summary.failed, 1);
+    assert!(global.path().join("review").exists());
+}
 
 fn make_store() -> (tempfile::TempDir, SkillStore) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -95,6 +123,437 @@ fn conflict_can_keep_the_existing_target_or_replace_it_explicitly() {
     assert_eq!(
         std::fs::read_to_string(existing.join("SKILL.md")).unwrap(),
         "library"
+    );
+}
+
+#[test]
+fn replacement_conflict_keeps_the_skills_existing_assignments_unchanged() {
+    let (_db, store) = make_store();
+    let central = tempfile::tempdir().expect("central");
+    write_skill(central.path(), "library");
+    let skill = add_skill(&store, central.path());
+    let codex_global = tempfile::tempdir().expect("codex global");
+    let cursor_global = tempfile::tempdir().expect("cursor global");
+    let codex = tool(codex_global.path());
+    let mut cursor = tool(cursor_global.path());
+    cursor.key = "cursor".to_string();
+    cursor.label = "Cursor".to_string();
+    let tools = [codex, cursor];
+
+    let initial = AssignmentDraft {
+        global_tools: vec!["codex".to_string()],
+        projects: Vec::new(),
+    };
+    apply_skill_assignment(&store, &skill.id, &initial, &tools, &HashSet::new(), false)
+        .expect("apply initial assignment");
+    write_skill(&cursor_global.path().join("review"), "unmanaged conflict");
+
+    let replacement = AssignmentDraft {
+        global_tools: vec!["cursor".to_string()],
+        projects: Vec::new(),
+    };
+    let result = apply_skill_assignment(
+        &store,
+        &skill.id,
+        &replacement,
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("skip conflicting replacement");
+
+    assert_eq!(result.skipped, 1);
+    let assignments = store.list_skill_assignments(&skill.id).unwrap();
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0].tool, "codex");
+    assert_eq!(assignments[0].scope, "global");
+    assert!(codex_global.path().join("review").exists());
+    assert_eq!(
+        std::fs::read_to_string(cursor_global.path().join("review/SKILL.md")).unwrap(),
+        "unmanaged conflict"
+    );
+}
+
+#[test]
+fn unavailable_replacement_keeps_the_skills_existing_assignments_unchanged() {
+    let (_db, store) = make_store();
+    let central = tempfile::tempdir().expect("central");
+    write_skill(central.path(), "library");
+    let skill = add_skill(&store, central.path());
+    let codex_global = tempfile::tempdir().expect("codex global");
+    let cursor_global = tempfile::tempdir().expect("cursor global");
+    let codex = tool(codex_global.path());
+    let mut cursor = tool(cursor_global.path());
+    cursor.key = "cursor".to_string();
+    cursor.label = "Cursor".to_string();
+    cursor.global_available = false;
+    let tools = [codex, cursor];
+
+    apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft {
+            global_tools: vec!["codex".to_string()],
+            projects: Vec::new(),
+        },
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("apply initial assignment");
+
+    let result = apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft {
+            global_tools: vec!["cursor".to_string()],
+            projects: Vec::new(),
+        },
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("reject unavailable replacement");
+
+    assert_eq!(result.failed, 1);
+    let assignments = store.list_skill_assignments(&skill.id).unwrap();
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0].tool, "codex");
+    assert!(codex_global.path().join("review").exists());
+}
+
+#[test]
+fn failed_replacement_keeps_the_skills_existing_assignments_unchanged() {
+    let (_db, store) = make_store();
+    let central = tempfile::tempdir().expect("central");
+    write_skill(central.path(), "library");
+    let skill = add_skill(&store, central.path());
+    let codex_global = tempfile::tempdir().expect("codex global");
+    let invalid_parent = tempfile::tempdir().expect("invalid parent");
+    let invalid_global = invalid_parent.path().join("not-a-directory");
+    std::fs::write(&invalid_global, "file").expect("write blocking file");
+    let codex = tool(codex_global.path());
+    let mut cursor = tool(&invalid_global);
+    cursor.key = "cursor".to_string();
+    cursor.label = "Cursor".to_string();
+    let tools = [codex, cursor];
+
+    apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft {
+            global_tools: vec!["codex".to_string()],
+            projects: Vec::new(),
+        },
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("apply initial assignment");
+
+    let result = apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft {
+            global_tools: vec!["cursor".to_string()],
+            projects: Vec::new(),
+        },
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("report failed replacement");
+
+    assert_eq!(result.failed, 1);
+    let assignments = store.list_skill_assignments(&skill.id).unwrap();
+    assert!(assignments
+        .iter()
+        .any(|assignment| assignment.tool == "codex"));
+    assert!(codex_global.path().join("review").exists());
+}
+
+#[test]
+fn failed_project_replacement_keeps_the_existing_project_assignment() {
+    let (_db, store) = make_store();
+    let central = tempfile::tempdir().expect("central");
+    write_skill(central.path(), "library");
+    let skill = add_skill(&store, central.path());
+    let project_dir = tempfile::tempdir().expect("project");
+    let project = ProjectRecord {
+        id: "project-1".to_string(),
+        name: "Project".to_string(),
+        root_path: project_dir.path().to_string_lossy().to_string(),
+        enabled_tool_keys: vec!["codex".to_string(), "cursor".to_string()],
+        local_git_exclude_enabled: false,
+        created_at: 1,
+        updated_at: 1,
+        last_scanned_at: None,
+    };
+    store.insert_project(&project).expect("insert project");
+    let global = tempfile::tempdir().expect("global");
+    let codex = tool(global.path());
+    let mut cursor = tool(global.path());
+    cursor.key = "cursor".to_string();
+    cursor.label = "Cursor".to_string();
+    cursor.project_skills_dir = ".cursor/skills".to_string();
+    let tools = [codex, cursor];
+
+    apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft {
+            global_tools: Vec::new(),
+            projects: vec![ProjectAssignmentDraft {
+                project_id: project.id.clone(),
+                tool_keys: vec!["codex".to_string()],
+            }],
+        },
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("apply initial project assignment");
+    std::fs::write(project_dir.path().join(".cursor"), "blocking file")
+        .expect("write blocking file");
+
+    let result = apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft {
+            global_tools: Vec::new(),
+            projects: vec![ProjectAssignmentDraft {
+                project_id: project.id.clone(),
+                tool_keys: vec!["cursor".to_string()],
+            }],
+        },
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("report failed project replacement");
+
+    assert_eq!(result.failed, 1);
+    let assignments = store.list_skill_assignments(&skill.id).unwrap();
+    assert_eq!(assignments.len(), 1);
+    assert!(assignments
+        .iter()
+        .any(|assignment| { assignment.scope == "project" && assignment.tool == "codex" }));
+    assert!(project_dir.path().join(".agents/skills/review").exists());
+}
+
+#[test]
+fn later_project_failure_restores_an_earlier_project_replacement() {
+    let (_db, store) = make_store();
+    let central = tempfile::tempdir().expect("central");
+    write_skill(central.path(), "library");
+    let skill = add_skill(&store, central.path());
+    let project_one_dir = tempfile::tempdir().expect("project one");
+    let project_two_dir = tempfile::tempdir().expect("project two");
+    for (id, root) in [
+        ("project-1", project_one_dir.path()),
+        ("project-2", project_two_dir.path()),
+    ] {
+        store
+            .insert_project(&ProjectRecord {
+                id: id.to_string(),
+                name: id.to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                enabled_tool_keys: vec!["codex".to_string(), "cursor".to_string()],
+                local_git_exclude_enabled: false,
+                created_at: 1,
+                updated_at: 1,
+                last_scanned_at: None,
+            })
+            .expect("insert project");
+    }
+    let global = tempfile::tempdir().expect("global");
+    let codex = tool(global.path());
+    let mut cursor = tool(global.path());
+    cursor.key = "cursor".to_string();
+    cursor.label = "Cursor".to_string();
+    cursor.project_skills_dir = ".cursor/skills".to_string();
+    let tools = [codex, cursor];
+    let initial = AssignmentDraft {
+        global_tools: Vec::new(),
+        projects: vec![
+            ProjectAssignmentDraft {
+                project_id: "project-1".to_string(),
+                tool_keys: vec!["codex".to_string()],
+            },
+            ProjectAssignmentDraft {
+                project_id: "project-2".to_string(),
+                tool_keys: vec!["codex".to_string()],
+            },
+        ],
+    };
+    apply_skill_assignment(&store, &skill.id, &initial, &tools, &HashSet::new(), false)
+        .expect("apply initial assignments");
+    std::fs::write(project_two_dir.path().join(".cursor"), "blocking file")
+        .expect("write blocking file");
+    let mut replacement_tools = tools.clone();
+    replacement_tools[0].global_available = false;
+
+    let result = apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft {
+            global_tools: Vec::new(),
+            projects: vec![
+                ProjectAssignmentDraft {
+                    project_id: "project-1".to_string(),
+                    tool_keys: vec!["cursor".to_string()],
+                },
+                ProjectAssignmentDraft {
+                    project_id: "project-2".to_string(),
+                    tool_keys: vec!["cursor".to_string()],
+                },
+            ],
+        },
+        &replacement_tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("report later project failure");
+
+    assert_eq!(result.failed, 1);
+    assert!(project_one_dir
+        .path()
+        .join(".agents/skills/review")
+        .exists());
+    assert!(!project_one_dir
+        .path()
+        .join(".cursor/skills/review")
+        .exists());
+    let assignments = store.list_skill_assignments(&skill.id).unwrap();
+    assert_eq!(
+        assignments
+            .iter()
+            .filter(|assignment| assignment.scope == "project")
+            .map(|assignment| assignment.tool.as_str())
+            .collect::<Vec<_>>(),
+        vec!["codex", "codex"]
+    );
+}
+
+#[test]
+fn clearing_assignments_reports_and_removes_owned_targets() {
+    let (_db, store) = make_store();
+    let central = tempfile::tempdir().expect("central");
+    write_skill(central.path(), "library");
+    let skill = add_skill(&store, central.path());
+    let global = tempfile::tempdir().expect("global");
+    let tools = [tool(global.path())];
+    apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft {
+            global_tools: vec!["codex".to_string()],
+            projects: Vec::new(),
+        },
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("apply initial assignment");
+
+    let cleared = apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft::default(),
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("clear assignments");
+
+    assert_eq!(cleared.succeeded, 1);
+    assert!(store.list_skill_assignments(&skill.id).unwrap().is_empty());
+    assert!(!global.path().join("review").exists());
+}
+
+#[test]
+fn disabled_skill_saves_replacement_as_suspended_without_creating_a_target() {
+    let (_db, store) = make_store();
+    let central = tempfile::tempdir().expect("central");
+    write_skill(central.path(), "library");
+    let skill = add_skill(&store, central.path());
+    store
+        .set_skill_enabled(&skill.id, false)
+        .expect("disable skill");
+    let global = tempfile::tempdir().expect("global");
+    let tools = [tool(global.path())];
+
+    let result = apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft {
+            global_tools: vec!["codex".to_string()],
+            projects: Vec::new(),
+        },
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("save suspended assignment");
+
+    assert_eq!(result.succeeded, 1);
+    let assignments = store.list_skill_assignments(&skill.id).unwrap();
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0].state, "suspended");
+    assert!(!global.path().join("review").exists());
+}
+
+#[test]
+fn clearing_refuses_to_delete_a_target_the_user_modified() {
+    let (_db, store) = make_store();
+    let central = tempfile::tempdir().expect("central");
+    write_skill(central.path(), "library");
+    let skill = add_skill(&store, central.path());
+    let global = tempfile::tempdir().expect("global");
+    let tools = [tool(global.path())];
+    apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft {
+            global_tools: vec!["codex".to_string()],
+            projects: Vec::new(),
+        },
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("apply initial assignment");
+    let target = global.path().join("review");
+    if std::fs::symlink_metadata(&target)
+        .expect("target metadata")
+        .file_type()
+        .is_symlink()
+    {
+        std::fs::remove_file(&target).expect("remove managed link");
+        write_skill(&target, "user replacement");
+    } else {
+        std::fs::write(target.join("SKILL.md"), "user replacement").expect("modify managed copy");
+    }
+
+    let preview =
+        preview_skill_assignment(&store, &skill.id, &AssignmentDraft::default(), &tools, true)
+            .expect("preview unsafe clear");
+    assert_eq!(preview[0].outcome, "unsafe");
+
+    let result = apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft::default(),
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("reject unsafe clear");
+    assert_eq!(result.failed, 1);
+    assert_eq!(store.list_skill_assignments(&skill.id).unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(target.join("SKILL.md")).unwrap(),
+        "user replacement"
     );
 }
 

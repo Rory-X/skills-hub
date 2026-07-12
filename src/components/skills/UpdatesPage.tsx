@@ -5,7 +5,7 @@ import {
   RefreshCw,
 } from 'lucide-react'
 import type { TFunction } from 'i18next'
-import type { AutoUpdateConfigDto } from './types'
+import type { AutoUpdateConfigDto, ManagedSkill } from './types'
 import {
   getAutoUpdateTaskStatusKey,
   isAutoUpdatePossiblyStalled,
@@ -30,6 +30,8 @@ type UpdatesPageProps = {
   ) => void
   onRunAutoUpdateNow: () => void
   autoUpdateTriggering: boolean
+  skills: ManagedSkill[]
+  onRetrySkills: (skillIds: string[]) => void
   t: TFunction
 }
 
@@ -38,9 +40,12 @@ const UpdatesPage = ({
   onAutoUpdateConfigChange,
   onRunAutoUpdateNow,
   autoUpdateTriggering,
+  skills,
+  onRetrySkills,
   t,
 }: UpdatesPageProps) => {
   const [currentTime, setCurrentTime] = useState(0)
+  const [confirmUpdateOpen, setConfirmUpdateOpen] = useState(false)
 
   const autoUpdateEnabled = autoUpdateConfig?.enabled ?? false
   const autoUpdateInterval = autoUpdateConfig?.interval_hours ?? 24
@@ -59,6 +64,16 @@ const UpdatesPage = ({
   const autoUpdateHasProtectedLocalSkills =
     (autoUpdateConfig?.protected_local_skill_count ?? 0) > 0
   const autoUpdateRunning = autoUpdateConfig?.last_status === 'running'
+  const updateableSkills = skills.filter(
+    (skill) => skill.source_type === 'git' || skill.source_type === 'local',
+  )
+  const gitSkillCount = updateableSkills.filter(
+    (skill) => skill.source_type === 'git',
+  ).length
+  const localSkillCount = updateableSkills.length - gitSkillCount
+  const disabledSkillCount = updateableSkills.filter(
+    (skill) => skill.enabled === false,
+  ).length
 
   useEffect(() => {
     if (!autoUpdateRunning) return undefined
@@ -281,15 +296,15 @@ const UpdatesPage = ({
               <button
                 className="btn btn-primary updates-run-btn"
                 type="button"
-                disabled={autoUpdateButtonBusy}
-                onClick={onRunAutoUpdateNow}
+                disabled={autoUpdateButtonBusy || updateableSkills.length === 0}
+                onClick={() => setConfirmUpdateOpen(true)}
               >
                 <RefreshCw size={15} />
                 {autoUpdateButtonBusy
                   ? t('autoUpdateRunningButton')
                   : autoUpdateStalled
                     ? t('autoUpdateRetryUpdate')
-                    : t('autoUpdateRunNow')}
+                    : t('autoUpdateRunAll', { count: updateableSkills.length })}
               </button>
             </div>
             <div className="updates-schedule-hint">{autoUpdateScheduleHint}</div>
@@ -379,6 +394,19 @@ const UpdatesPage = ({
                 {t('copyDetails')}
               </button>
             ) : null}
+            <button
+              className="btn btn-secondary btn-sm"
+              type="button"
+              disabled={autoUpdateButtonBusy}
+              onClick={() =>
+                onRetrySkills(
+                  autoUpdateProgressForDisplay.failed.map((item) => item.skill_id),
+                )
+              }
+            >
+              <RefreshCw size={14} />
+              {t('autoUpdateRetryFailed')}
+            </button>
           </div>
         ) : null}
         {autoUpdateHasLocalSkills ? (
@@ -391,6 +419,56 @@ const UpdatesPage = ({
           </div>
         ) : null}
       </div>
+      {confirmUpdateOpen ? (
+        <div
+          className="modal-backdrop"
+          onClick={() => setConfirmUpdateOpen(false)}
+        >
+          <div
+            className="modal auto-update-confirm-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="auto-update-confirm-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div className="modal-title" id="auto-update-confirm-title">
+                {t('autoUpdateConfirmTitle', { count: updateableSkills.length })}
+              </div>
+            </div>
+            <div className="modal-body">
+              <p>{t('autoUpdateConfirmBody')}</p>
+              <div className="auto-update-confirm-stats">
+                <div><span>Git</span><strong>{gitSkillCount}</strong></div>
+                <div><span>{t('autoUpdateLocalSource')}</span><strong>{localSkillCount}</strong></div>
+                <div><span>{t('autoUpdateDisabledSource')}</span><strong>{disabledSkillCount}</strong></div>
+                <div><span>{t('autoUpdateProtectedSource')}</span><strong>{autoUpdateConfig?.protected_local_skill_count ?? 0}</strong></div>
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button
+                className="btn btn-secondary"
+                type="button"
+                onClick={() => setConfirmUpdateOpen(false)}
+              >
+                {t('cancel')}
+              </button>
+              <button
+                className="btn btn-primary"
+                type="button"
+                disabled={updateableSkills.length === 0}
+                onClick={() => {
+                  setConfirmUpdateOpen(false)
+                  onRunAutoUpdateNow()
+                }}
+              >
+                <RefreshCw size={15} />
+                {t('autoUpdateConfirmAction', { count: updateableSkills.length })}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }

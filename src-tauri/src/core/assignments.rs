@@ -117,7 +117,8 @@ pub struct SkillAssignmentPreview {
 
 #[derive(Clone, Debug)]
 pub struct SkillAssignmentApplyOutcome {
-    pub skill: SkillRecord,
+    pub skill_id: String,
+    pub skill_name: String,
     pub summary: AssignmentApplySummary,
 }
 
@@ -225,6 +226,10 @@ pub fn preview_skill_assignment(
             let target_path = store
                 .get_skill_target(skill_id, &assignment.tool, &assignment.scope, project_path)?
                 .map(|target| target.target_path);
+            let outcome = match target_path.as_deref() {
+                Some(path) if !target_is_owned_or_missing(&skill, Path::new(path))? => "unsafe",
+                _ => "remove",
+            };
             items.push(AssignmentPreviewItem {
                 key,
                 tool: assignment.tool,
@@ -232,7 +237,7 @@ pub fn preview_skill_assignment(
                 project_id: assignment.project_id,
                 project_name: project.map(|project| project.name),
                 target_path,
-                outcome: "remove".to_string(),
+                outcome: outcome.to_string(),
                 blocking: true,
             });
         }
@@ -477,15 +482,40 @@ pub fn apply_skill_assignments(
 ) -> Result<Vec<SkillAssignmentApplyOutcome>> {
     let mut outcomes = Vec::with_capacity(skill_ids.len());
     for skill_id in skill_ids {
-        let skill = require_skill(store, skill_id)?;
+        let skill = match require_skill(store, skill_id) {
+            Ok(skill) => skill,
+            Err(err) => {
+                outcomes.push(SkillAssignmentApplyOutcome {
+                    skill_id: skill_id.clone(),
+                    skill_name: skill_id.clone(),
+                    summary: AssignmentApplySummary {
+                        failed: 1,
+                        errors: vec![format!("{err:#}")],
+                        ..AssignmentApplySummary::default()
+                    },
+                });
+                continue;
+            }
+        };
         let replacements = replace_conflict_keys
             .iter()
             .filter(|key| key.skill_id == skill.id)
             .map(|key| key.target_key.clone())
             .collect::<HashSet<_>>();
         let summary =
-            apply_skill_assignment(store, &skill.id, draft, tools, &replacements, additive)?;
-        outcomes.push(SkillAssignmentApplyOutcome { skill, summary });
+            match apply_skill_assignment(store, &skill.id, draft, tools, &replacements, additive) {
+                Ok(summary) => summary,
+                Err(err) => AssignmentApplySummary {
+                    failed: 1,
+                    errors: vec![format!("{err:#}")],
+                    ..AssignmentApplySummary::default()
+                },
+            };
+        outcomes.push(SkillAssignmentApplyOutcome {
+            skill_id: skill.id,
+            skill_name: skill.name,
+            summary,
+        });
     }
     Ok(outcomes)
 }
@@ -505,7 +535,35 @@ pub fn apply_skill_assignment(
         merge_existing_assignments(store, skill_id, &mut normalized)?;
     }
 
-    let preview = preview_skill_assignment(store, skill_id, &normalized, tools, false)?;
+    let preview = preview_skill_assignment(store, skill_id, &normalized, tools, !additive)?;
+    let unavailable_replacements = preview
+        .iter()
+        .filter(|item| item.blocking && item.outcome == "unavailable")
+        .collect::<Vec<_>>();
+    if !additive && !unavailable_replacements.is_empty() {
+        return Ok(AssignmentApplySummary {
+            failed: unavailable_replacements.len(),
+            errors: unavailable_replacements
+                .iter()
+                .map(|item| format!("{}: target is unavailable", item.tool))
+                .collect(),
+            ..AssignmentApplySummary::default()
+        });
+    }
+    let unsafe_removals = preview
+        .iter()
+        .filter(|item| item.blocking && item.outcome == "unsafe")
+        .collect::<Vec<_>>();
+    if !additive && !unsafe_removals.is_empty() {
+        return Ok(AssignmentApplySummary {
+            failed: unsafe_removals.len(),
+            errors: unsafe_removals
+                .iter()
+                .map(|item| format!("{}: target ownership could not be verified", item.tool))
+                .collect(),
+            ..AssignmentApplySummary::default()
+        });
+    }
     let skipped_conflicts = preview
         .iter()
         .filter(|item| {
@@ -515,15 +573,34 @@ pub fn apply_skill_assignment(
         })
         .map(|item| item.key.clone())
         .collect::<HashSet<_>>();
+    if !additive && !skipped_conflicts.is_empty() {
+        return Ok(AssignmentApplySummary {
+            skipped: skipped_conflicts.len(),
+            ..AssignmentApplySummary::default()
+        });
+    }
     remove_targets_from_draft(&mut normalized, &skipped_conflicts);
 
     let desired_keys = draft_target_keys(&normalized);
     let existing = store.list_skill_assignments(skill_id)?;
+    let removed_count = if additive {
+        0
+    } else {
+        existing
+            .iter()
+            .filter(|assignment| {
+                !desired_keys.contains(&target_key(
+                    &assignment.scope,
+                    assignment.project_id.as_deref(),
+                    &assignment.tool,
+                ))
+            })
+            .count()
+    };
     let tools_by_key = tools
         .iter()
         .map(|tool| (tool.key.as_str(), tool))
         .collect::<HashMap<_, _>>();
-    remove_obsolete_global_assignments(store, &skill, &existing, &desired_keys, &tools_by_key)?;
 
     let mut summary = AssignmentApplySummary {
         skipped: skipped_conflicts.len(),
@@ -632,7 +709,19 @@ pub fn apply_skill_assignment(
         additive.then_some(&requested_keys),
         &mut summary,
     )?;
+    if !additive && summary.failed > 0 {
+        rollback_new_assignments(store, &skill, &existing)?;
+        if let Err(err) = restore_existing_assignments(store, &skill, &existing, tools) {
+            summary
+                .errors
+                .push(format!("restore previous assignments: {err:#}"));
+        }
+        summary.succeeded = 0;
+        return Ok(summary);
+    }
+    remove_obsolete_global_assignments(store, &skill, &existing, &desired_keys, &tools_by_key)?;
     remove_obsolete_assignment_records(store, skill_id, &desired_keys)?;
+    summary.succeeded += removed_count;
     Ok(summary)
 }
 
@@ -1542,11 +1631,168 @@ fn remove_obsolete_global_assignments(
     }) {
         if let Some(target) = store.get_skill_target(&skill.id, &assignment.tool, "global", None)? {
             let path = PathBuf::from(&target.target_path);
-            if !desired_paths.contains(&path) && removed_paths.insert(path.clone()) {
-                remove_global_target_if_owned(skill, &path)?;
+            if !desired_paths.contains(&path)
+                && removed_paths.insert(path.clone())
+                && !remove_global_target_if_owned(skill, &path)?
+            {
+                anyhow::bail!("target ownership could not be verified: {:?}", path);
             }
             store.delete_skill_target(&skill.id, &assignment.tool, "global", None)?;
         }
+    }
+    Ok(())
+}
+
+fn rollback_new_assignments(
+    store: &SkillStore,
+    skill: &SkillRecord,
+    existing: &[SkillAssignmentRecord],
+) -> Result<()> {
+    let existing_tools = existing
+        .iter()
+        .filter(|assignment| assignment.scope == "global")
+        .map(|assignment| assignment.tool.as_str())
+        .collect::<HashSet<_>>();
+    let mut existing_paths = HashSet::new();
+    for assignment in existing
+        .iter()
+        .filter(|assignment| assignment.scope == "global")
+    {
+        if let Some(target) = store.get_skill_target(&skill.id, &assignment.tool, "global", None)? {
+            existing_paths.insert(PathBuf::from(target.target_path));
+        }
+    }
+    for assignment in store
+        .list_skill_assignments(&skill.id)?
+        .into_iter()
+        .filter(|assignment| assignment.scope == "global")
+        .filter(|assignment| !existing_tools.contains(assignment.tool.as_str()))
+    {
+        if let Some(target) = store.get_skill_target(&skill.id, &assignment.tool, "global", None)? {
+            let path = PathBuf::from(&target.target_path);
+            if !existing_paths.contains(&path) && !remove_global_target_if_owned(skill, &path)? {
+                anyhow::bail!("target ownership could not be verified: {:?}", path);
+            }
+            store.delete_skill_target(&skill.id, &assignment.tool, "global", None)?;
+        }
+        store.delete_skill_assignment(&skill.id, &assignment.tool, "global", None)?;
+    }
+    let existing_project_keys = existing
+        .iter()
+        .filter(|assignment| assignment.scope == "project")
+        .map(|assignment| {
+            target_key(
+                "project",
+                assignment.project_id.as_deref(),
+                &assignment.tool,
+            )
+        })
+        .collect::<HashSet<_>>();
+    for assignment in store
+        .list_skill_assignments(&skill.id)?
+        .into_iter()
+        .filter(|assignment| assignment.scope == "project")
+        .filter(|assignment| {
+            !existing_project_keys.contains(&target_key(
+                "project",
+                assignment.project_id.as_deref(),
+                &assignment.tool,
+            ))
+        })
+    {
+        if let Some(project_id) = assignment.project_id.as_deref() {
+            if let Some(project) = store.get_project(project_id)? {
+                if let Some(target) = store.get_skill_target(
+                    &skill.id,
+                    &assignment.tool,
+                    "project",
+                    Some(&project.root_path),
+                )? {
+                    if !remove_global_target_if_owned(skill, Path::new(&target.target_path))? {
+                        anyhow::bail!(
+                            "target ownership could not be verified: {}",
+                            target.target_path
+                        );
+                    }
+                    store.delete_skill_target(
+                        &skill.id,
+                        &assignment.tool,
+                        "project",
+                        Some(&project.root_path),
+                    )?;
+                }
+            }
+        }
+        store.delete_skill_assignment(
+            &skill.id,
+            &assignment.tool,
+            "project",
+            assignment.project_id.as_deref(),
+        )?;
+    }
+    Ok(())
+}
+
+fn restore_existing_assignments(
+    store: &SkillStore,
+    skill: &SkillRecord,
+    existing: &[SkillAssignmentRecord],
+    tools: &[AssignmentToolSpec],
+) -> Result<()> {
+    let draft = assignment_draft_from_records(existing);
+    let tools_by_key = tools
+        .iter()
+        .map(|tool| (tool.key.as_str(), tool))
+        .collect::<HashMap<_, _>>();
+    for tool_key in &draft.global_tools {
+        if !skill.enabled {
+            upsert_assignment(
+                store,
+                &skill.id,
+                tool_key,
+                "global",
+                None,
+                "hub",
+                "suspended",
+                None,
+            )?;
+            continue;
+        }
+        let tool = tools_by_key
+            .get(tool_key.as_str())
+            .with_context(|| format!("restore unavailable Agent: {tool_key}"))?;
+        sync_global_target(store, skill, tool, true)?;
+        upsert_assignment(
+            store, &skill.id, tool_key, "global", None, "hub", "active", None,
+        )?;
+    }
+
+    let tool_specs = tools
+        .iter()
+        .filter(|tool| tool.supports_project_scope && !tool.project_skills_dir.is_empty())
+        .map(|tool| ProjectToolSpec::new(&tool.key, &tool.project_skills_dir).with_available(true))
+        .collect::<Vec<_>>();
+    for project in &draft.projects {
+        if !skill.enabled {
+            save_suspended_project_assignment(
+                store,
+                skill,
+                &project.project_id,
+                &project.tool_keys,
+            )?;
+            continue;
+        }
+        assign_project_skill_tools_and_scan(
+            store,
+            &project.project_id,
+            &skill.id,
+            &project.tool_keys,
+            &tool_specs,
+            &project.tool_keys.iter().cloned().collect(),
+        )?;
+    }
+    for assignment in existing {
+        store.upsert_skill_assignment(assignment)?;
     }
     Ok(())
 }
@@ -1623,25 +1869,31 @@ fn sync_global_target(
     })
 }
 
-fn remove_global_target_if_owned(skill: &SkillRecord, target: &Path) -> Result<()> {
+fn target_is_owned_or_missing(skill: &SkillRecord, target: &Path) -> Result<bool> {
     let Ok(metadata) = std::fs::symlink_metadata(target) else {
-        return Ok(());
+        return Ok(true);
     };
     let source = Path::new(&skill.central_path);
-    let owned = if metadata.file_type().is_symlink() {
+    Ok(if metadata.file_type().is_symlink() {
         std::fs::canonicalize(target).ok() == std::fs::canonicalize(source).ok()
     } else {
         target_has_same_content(source, target)
-    };
-    if !owned {
-        return Ok(());
+    })
+}
+
+fn remove_global_target_if_owned(skill: &SkillRecord, target: &Path) -> Result<bool> {
+    if !target_is_owned_or_missing(skill, target)? {
+        return Ok(false);
     }
+    let Ok(metadata) = std::fs::symlink_metadata(target) else {
+        return Ok(true);
+    };
     if metadata.file_type().is_symlink() || metadata.is_file() {
         std::fs::remove_file(target)?;
     } else {
         std::fs::remove_dir_all(target)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 fn persist_assignment_error(
