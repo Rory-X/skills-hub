@@ -54,6 +54,7 @@ import { getAvailableProjectToolKeys } from './components/skills/toolAvailabilit
 import { selectEntireLibrary } from './components/skills/bulkAssignmentWorkflow'
 import type {
   AutoUpdateConfigDto,
+  AutoUpdateRetryResultDto,
   AssignmentApplyResultDto,
   AssignmentDraftDto,
   AssignmentPreviewDto,
@@ -991,59 +992,31 @@ function App() {
   const handleRetryAutoUpdateSkills = useCallback(
     async (skillIds: string[]) => {
       if (!isTauri || autoUpdateTriggering || skillIds.length === 0) return
-      const selected = managedSkills.filter((skill) => skillIds.includes(skill.id))
-      const failed: { skill_id: string; name: string; reason: string }[] = []
-      const succeeded: { skill_id: string; name: string; reason: null }[] = []
       setAutoUpdateTriggering(true)
       setError(null)
       try {
-        for (const skill of selected) {
-          setActionMessage(t('actions.updating', { name: skill.name }))
-          try {
-            await invokeTauri<UpdateResultDto>('update_managed_skill', {
-              skillId: skill.id,
-            })
-            succeeded.push({ skill_id: skill.id, name: skill.name, reason: null })
-          } catch (err) {
-            failed.push({
-              skill_id: skill.id,
-              name: skill.name,
-              reason: err instanceof Error ? err.message : String(err),
-            })
-          }
-        }
-        setAutoUpdateConfig((current) =>
-          current
-            ? {
-                ...current,
-                last_failed: failed.length,
-                last_updated: current.last_updated + succeeded.length,
-                last_status: failed.length > 0 ? 'error' : 'ok',
-                progress: {
-                  ...current.progress,
-                  succeeded: [
-                    ...current.progress.succeeded.filter(
-                      (item) => !skillIds.includes(item.skill_id),
-                    ),
-                    ...succeeded,
-                  ],
-                  failed,
-                  running: null,
-                  pending: [],
-                },
-              }
-            : current,
+        setActionMessage(t('autoUpdateRunningButton'))
+        const result = await invokeTauri<AutoUpdateRetryResultDto>(
+          'retry_auto_update_skills',
+          { skillIds },
         )
+        setAutoUpdateConfig(result.config)
         await loadManagedSkills()
-        if (failed.length > 0) {
-          showActionErrors(
-            failed.map((item) => ({ title: item.name, message: item.reason })),
-          )
-        } else {
+        if (result.updated > 0) {
           setSuccessToastMessage(
-            t('autoUpdateRetrySuccess', { count: succeeded.length }),
+            t('autoUpdateRetrySuccess', { count: result.updated }),
           )
         }
+        if (result.failed.length > 0) {
+          showActionErrors(
+            result.failed.map((item) => ({
+              title: item.name,
+              message: item.reason ?? '',
+            })),
+          )
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
       } finally {
         setAutoUpdateTriggering(false)
         setActionMessage(null)
@@ -1054,7 +1027,6 @@ function App() {
       invokeTauri,
       isTauri,
       loadManagedSkills,
-      managedSkills,
       showActionErrors,
       t,
     ],

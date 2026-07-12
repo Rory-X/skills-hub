@@ -16,10 +16,11 @@ use crate::core::assignments::{
 };
 use crate::core::auto_update::{
     get_auto_update_config as get_auto_update_config_core, record_auto_update_triggered,
+    retry_auto_update_skills as retry_auto_update_skills_core,
     run_auto_update_now as run_auto_update_now_core,
     set_auto_update_config as set_auto_update_config_core, AutoUpdateConfig,
-    AutoUpdateIntervalUnit, AutoUpdateProgressSnapshot, AutoUpdateRunResult, AutoUpdateSchedule,
-    AutoUpdateScheduleType,
+    AutoUpdateIntervalUnit, AutoUpdateProgressSnapshot, AutoUpdateRetryResult, AutoUpdateRunResult,
+    AutoUpdateSchedule, AutoUpdateScheduleType, AutoUpdateSkillProgress,
 };
 use crate::core::cache_cleanup::{
     cleanup_git_cache_dirs, get_git_cache_cleanup_days as get_git_cache_cleanup_days_core,
@@ -444,6 +445,13 @@ pub struct AutoUpdateRunResultDto {
 }
 
 #[derive(Debug, Serialize)]
+pub struct AutoUpdateRetryResultDto {
+    pub updated: usize,
+    pub failed: Vec<AutoUpdateSkillProgress>,
+    pub config: AutoUpdateConfigDto,
+}
+
+#[derive(Debug, Serialize)]
 pub struct GithubProxyConfigDto {
     pub enabled: bool,
     pub port: u16,
@@ -575,6 +583,22 @@ pub async fn run_auto_update_now(
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         run_auto_update_now_core(&app, &store).map(to_auto_update_run_result_dto)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn retry_auto_update_skills(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    skillIds: Vec<String>,
+) -> Result<AutoUpdateRetryResultDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        retry_auto_update_skills_core(&app, &store, &skillIds).map(to_auto_update_retry_result_dto)
     })
     .await
     .map_err(|err| err.to_string())?
@@ -2137,6 +2161,14 @@ fn to_auto_update_run_result_dto(result: AutoUpdateRunResult) -> AutoUpdateRunRe
         failed: result.failed,
         errors: result.errors,
         progress: result.progress,
+    }
+}
+
+fn to_auto_update_retry_result_dto(result: AutoUpdateRetryResult) -> AutoUpdateRetryResultDto {
+    AutoUpdateRetryResultDto {
+        updated: result.updated,
+        failed: result.failed,
+        config: to_auto_update_config_dto(result.config),
     }
 }
 

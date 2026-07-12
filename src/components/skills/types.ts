@@ -228,6 +228,12 @@ export type AutoUpdateRunResultDto = {
   progress: AutoUpdateProgressSnapshotDto
 }
 
+export type AutoUpdateRetryResultDto = {
+  updated: number
+  failed: AutoUpdateSkillProgressDto[]
+  config: AutoUpdateConfigDto
+}
+
 export type GithubProxyConfigDto = {
   enabled: boolean
   port: number

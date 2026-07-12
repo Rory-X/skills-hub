@@ -140,6 +140,7 @@ pub fn run() {
             commands::get_auto_update_config,
             commands::set_auto_update_config,
             commands::run_auto_update_now,
+            commands::retry_auto_update_skills,
             commands::trigger_auto_update_task_now_cmd,
             commands::get_onboarding_plan,
             commands::install_local,

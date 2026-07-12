@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::installer::update_managed_skill_from_source;
@@ -83,6 +83,13 @@ pub struct AutoUpdateRunResult {
     pub failed: usize,
     pub errors: Vec<String>,
     pub progress: AutoUpdateProgressSnapshot,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AutoUpdateRetryResult {
+    pub updated: usize,
+    pub failed: Vec<AutoUpdateSkillProgress>,
+    pub config: AutoUpdateConfig,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -265,6 +272,83 @@ pub fn run_auto_update_now<R: tauri::Runtime>(
 
     record_auto_update_result(store, &result)?;
     Ok(result)
+}
+
+pub fn retry_auto_update_skills<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    store: &SkillStore,
+    skill_ids: &[String],
+) -> Result<AutoUpdateRetryResult> {
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
+
+    for skill_id in skill_ids {
+        let name = store
+            .get_skill_by_id(skill_id)
+            .with_context(|| format!("load Skill {skill_id} before auto-update retry"))?
+            .map(|skill| skill.name)
+            .unwrap_or_else(|| skill_id.clone());
+        match update_managed_skill_from_source(app, store, skill_id) {
+            Ok(update) => succeeded.push(AutoUpdateSkillProgress {
+                skill_id: skill_id.clone(),
+                name: update.name,
+                reason: None,
+            }),
+            Err(err) => failed.push(AutoUpdateSkillProgress {
+                skill_id: skill_id.clone(),
+                name,
+                reason: Some(format!("{:#}", err)),
+            }),
+        }
+    }
+
+    let updated = succeeded.len();
+    let config = record_auto_update_retry_result(store, skill_ids, succeeded, failed.clone())
+        .context("persist auto-update retry result")?;
+    Ok(AutoUpdateRetryResult {
+        updated,
+        failed,
+        config,
+    })
+}
+
+fn record_auto_update_retry_result(
+    store: &SkillStore,
+    skill_ids: &[String],
+    succeeded: Vec<AutoUpdateSkillProgress>,
+    failed: Vec<AutoUpdateSkillProgress>,
+) -> Result<AutoUpdateConfig> {
+    let current = get_auto_update_config(store)?;
+    let mut progress = current.progress;
+    let was_retried = |item: &AutoUpdateSkillProgress| skill_ids.contains(&item.skill_id);
+    progress.succeeded.retain(|item| !was_retried(item));
+    progress.failed.retain(|item| !was_retried(item));
+    progress.pending.retain(|item| !was_retried(item));
+    if progress.running.as_ref().is_some_and(was_retried) {
+        progress.running = None;
+    }
+    progress.succeeded.extend(succeeded);
+    progress.failed.extend(failed);
+
+    let result = AutoUpdateRunResult {
+        checked: progress.total,
+        updated: progress.succeeded.len(),
+        failed: progress.failed.len(),
+        errors: progress
+            .failed
+            .iter()
+            .map(|item| {
+                format!(
+                    "{}: {}",
+                    item.skill_id,
+                    item.reason.as_deref().unwrap_or_default()
+                )
+            })
+            .collect(),
+        progress,
+    };
+    record_auto_update_result(store, &result)?;
+    get_auto_update_config(store).context("reload auto-update config after retry")
 }
 
 pub fn record_auto_update_triggered(store: &SkillStore) -> Result<()> {
