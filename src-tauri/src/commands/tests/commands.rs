@@ -96,6 +96,37 @@ fn saving_custom_tool_config_creates_enabled_skills_dir() {
 }
 
 #[test]
+fn project_runtime_mapping_exposes_installation_and_defaults_to_installed_tools() {
+    let tools = vec![
+        RuntimeTool {
+            key: "codex".to_string(),
+            label: "Codex".to_string(),
+            installed: true,
+            enabled: true,
+            is_custom: false,
+            skills_dir: "/tmp/codex".into(),
+            project_skills_dir: ".agents/skills".to_string(),
+            supports_project_scope: true,
+        },
+        RuntimeTool {
+            key: "cursor".to_string(),
+            label: "Cursor".to_string(),
+            installed: false,
+            enabled: true,
+            is_custom: false,
+            skills_dir: "/tmp/cursor".into(),
+            project_skills_dir: ".cursor/skills".to_string(),
+            supports_project_scope: true,
+        },
+    ];
+
+    assert_eq!(default_project_tool_keys(&tools), vec!["codex"]);
+    let specs = project_specs_from_runtime(&tools);
+    assert!(specs[0].available);
+    assert!(!specs[1].available);
+}
+
+#[test]
 fn recent_projects_are_deduped_ordered_and_limited() {
     let (_dir, store) = make_store();
     let project_root = tempfile::tempdir().unwrap();

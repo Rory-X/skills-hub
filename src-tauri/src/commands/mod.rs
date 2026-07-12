@@ -638,6 +638,7 @@ pub struct ProjectToolDto {
     pub label: String,
     pub project_skills_dir: String,
     pub enabled: bool,
+    pub installed: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -727,10 +728,7 @@ pub async fn import_project(
     tauri::async_runtime::spawn_blocking(move || {
         let root = expand_home_path(&projectPath)?;
         let runtime_tools = runtime_project_tools(&store)?;
-        let default_tools = runtime_tools
-            .iter()
-            .map(|tool| tool.key.clone())
-            .collect::<Vec<_>>();
+        let default_tools = default_project_tool_keys(&runtime_tools);
         let specs = project_specs_from_runtime(&runtime_tools);
         let project = import_project_and_scan(&store, &root, &default_tools, &specs)?;
         build_project_detail(&store, &project, &runtime_tools)
@@ -771,6 +769,7 @@ pub async fn update_project_settings(
         let runtime_tools = runtime_project_tools(&store)?;
         let available = runtime_tools
             .iter()
+            .filter(|tool| tool.installed)
             .map(|tool| tool.key.clone())
             .collect::<Vec<_>>();
         let specs = project_specs_from_runtime(&runtime_tools);
@@ -897,7 +896,17 @@ fn runtime_project_tool_specs(store: &SkillStore) -> anyhow::Result<Vec<ProjectT
 fn project_specs_from_runtime(tools: &[RuntimeTool]) -> Vec<ProjectToolSpec> {
     tools
         .iter()
-        .map(|tool| ProjectToolSpec::new(&tool.key, &tool.project_skills_dir))
+        .map(|tool| {
+            ProjectToolSpec::new(&tool.key, &tool.project_skills_dir).with_available(tool.installed)
+        })
+        .collect()
+}
+
+fn default_project_tool_keys(tools: &[RuntimeTool]) -> Vec<String> {
+    tools
+        .iter()
+        .filter(|tool| tool.installed)
+        .map(|tool| tool.key.clone())
         .collect()
 }
 
@@ -938,6 +947,7 @@ fn build_project_detail(
             label: tool.label.clone(),
             project_skills_dir: tool.project_skills_dir.clone(),
             enabled: project.enabled_tool_keys.contains(&tool.key),
+            installed: tool.installed,
         })
         .collect::<Vec<_>>();
     Ok(ProjectDetailDto {

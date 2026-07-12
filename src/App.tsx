@@ -43,6 +43,7 @@ import {
   assignmentDraftForSkill,
   assignmentDraftReplacingProjectTools,
 } from './components/skills/assignmentDraft'
+import { getAvailableProjectToolKeys } from './components/skills/toolAvailability'
 import type {
   AutoUpdateConfigDto,
   AssignmentApplyResultDto,
@@ -1115,10 +1116,9 @@ function App() {
 
   const getAvailableProjectTools = useCallback(() => {
     if (!selectedProjectDetail) return []
-    return selectedProjectDetail.project.enabled_tool_keys.filter((toolKey) =>
-      selectedProjectDetail.tools.some(
-        (tool) => tool.key === toolKey && tool.enabled,
-      ),
+    return getAvailableProjectToolKeys(
+      selectedProjectDetail.tools,
+      selectedProjectDetail.project.enabled_tool_keys,
     )
   }, [selectedProjectDetail])
 

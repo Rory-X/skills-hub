@@ -8,7 +8,8 @@ use crate::core::projects::{
     update_project_configuration, visible_project_issue_projections, ProjectIssue, ProjectToolSpec,
 };
 use crate::core::skill_store::{
-    IgnoredIssueRecord, SkillAssignmentRecord, SkillRecord, SkillStore, SkillTargetRecord,
+    IgnoredIssueRecord, ProjectSkillLinkRecord, SkillAssignmentRecord, SkillRecord, SkillStore,
+    SkillTargetRecord,
 };
 
 fn make_store() -> (tempfile::TempDir, SkillStore) {
@@ -256,6 +257,51 @@ fn diagnostics_use_live_project_content_after_a_library_update() {
         .expect("diagnose without rescan")
         .iter()
         .all(|issue| issue.kind != "same_name_content_conflict"));
+}
+
+#[test]
+fn injection_skips_unavailable_legacy_tools_without_deleting_their_selection() {
+    let (_db_dir, store) = make_store();
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let central_dir = tempfile::tempdir().expect("central tempdir");
+    write_skill(central_dir.path(), "library content");
+    let hash = crate::core::content_hash::hash_dir(central_dir.path()).expect("hash skill");
+    let skill = make_skill("library-review", "review", central_dir.path(), &hash);
+    store.upsert_skill(&skill).expect("insert library skill");
+    let project = create_or_get_project(
+        &store,
+        project_dir.path(),
+        &["codex".to_string(), "cursor".to_string()],
+    )
+    .expect("create legacy project");
+    store
+        .upsert_project_skill_link(&ProjectSkillLinkRecord {
+            project_id: project.id.clone(),
+            skill_id: skill.id.clone(),
+            enabled: true,
+            desired_tools: vec!["codex".to_string(), "cursor".to_string()],
+            status: "pending".to_string(),
+            created_at: 1,
+            updated_at: 1,
+        })
+        .expect("insert legacy link");
+    let tools = [
+        ProjectToolSpec::new("codex", ".agents/skills"),
+        ProjectToolSpec::new("cursor", ".cursor/skills").with_available(false),
+    ];
+
+    inject_project_skill(&store, &project, &skill, &tools).expect("inject available targets");
+
+    assert!(project_dir.path().join(".agents/skills/review").exists());
+    assert!(!project_dir.path().join(".cursor/skills/review").exists());
+    assert_eq!(
+        store
+            .get_project_skill_link(&project.id, &skill.id)
+            .expect("get link")
+            .expect("link exists")
+            .desired_tools,
+        vec!["codex", "cursor"]
+    );
 }
 
 #[test]

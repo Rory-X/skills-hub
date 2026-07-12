@@ -186,6 +186,7 @@ pub fn preview_skill_assignment(
                 continue;
             };
             let available = tool.enabled
+                && tool.global_available
                 && tool.supports_project_scope
                 && project.enabled_tool_keys.contains(tool_key);
             let target = Path::new(&project.root_path)
@@ -665,7 +666,10 @@ fn apply_project_assignments(
     let tool_specs = tools
         .iter()
         .filter(|tool| tool.supports_project_scope && !tool.project_skills_dir.is_empty())
-        .map(|tool| ProjectToolSpec::new(&tool.key, &tool.project_skills_dir))
+        .map(|tool| {
+            ProjectToolSpec::new(&tool.key, &tool.project_skills_dir)
+                .with_available(tool.global_available)
+        })
         .collect::<Vec<_>>();
 
     for project_id in project_ids {
@@ -715,7 +719,10 @@ fn apply_project_assignments(
             .filter(|key| {
                 project.enabled_tool_keys.contains(*key)
                     && tools.iter().any(|tool| {
-                        tool.key == **key && tool.enabled && tool.supports_project_scope
+                        tool.key == **key
+                            && tool.enabled
+                            && tool.global_available
+                            && tool.supports_project_scope
                     })
             })
             .cloned()
@@ -1051,7 +1058,8 @@ fn evaluate_assignment(
                     Some(project.root_path),
                 ));
             }
-            if !tool.supports_project_scope
+            if !tool.global_available
+                || !tool.supports_project_scope
                 || tool.project_skills_dir.trim().is_empty()
                 || !project.enabled_tool_keys.contains(&assignment.tool)
             {

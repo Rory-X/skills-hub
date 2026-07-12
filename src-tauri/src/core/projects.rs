@@ -28,6 +28,7 @@ enum ProjectConflictPolicy<'a> {
 pub struct ProjectToolSpec {
     pub key: String,
     pub relative_skills_dir: String,
+    pub available: bool,
 }
 
 impl ProjectToolSpec {
@@ -35,7 +36,13 @@ impl ProjectToolSpec {
         Self {
             key: key.into(),
             relative_skills_dir: relative_skills_dir.into(),
+            available: true,
         }
+    }
+
+    pub fn with_available(mut self, available: bool) -> Self {
+        self.available = available;
+        self
     }
 }
 
@@ -200,7 +207,11 @@ pub fn update_project_and_scan(
     available_tool_keys: &[String],
     tool_specs: &[ProjectToolSpec],
 ) -> Result<ProjectRecord> {
-    let available = available_tool_keys.iter().collect::<HashSet<_>>();
+    let current_project = require_project(store, project_id)?;
+    let available = available_tool_keys
+        .iter()
+        .chain(current_project.enabled_tool_keys.iter())
+        .collect::<HashSet<_>>();
     if let Some(unknown) = enabled_tool_keys
         .iter()
         .find(|key| !available.contains(key))
@@ -391,7 +402,10 @@ pub fn scan_project(
         .collect::<HashSet<_>>();
     let mut dirs: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for spec in tool_specs {
-        if !enabled.contains(spec.key.as_str()) || spec.relative_skills_dir.trim().is_empty() {
+        if !spec.available
+            || !enabled.contains(spec.key.as_str())
+            || spec.relative_skills_dir.trim().is_empty()
+        {
             continue;
         }
         validate_project_skills_dir(&spec.relative_skills_dir)?;
@@ -739,7 +753,9 @@ pub fn diagnose_project(
             continue;
         }
         for tool_key in &link.desired_tools {
-            if !tools.contains_key(tool_key.as_str())
+            if !tools
+                .get(tool_key.as_str())
+                .is_some_and(|tool| tool.available)
                 || !enabled_project_tools.contains(tool_key.as_str())
             {
                 continue;
@@ -1836,7 +1852,7 @@ fn inject_project_skill_for_tools(
     let selected = only_tools.map(|items| items.iter().collect::<HashSet<_>>());
     let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for spec in tool_specs {
-        if !desired.contains(&spec.key) {
+        if !spec.available || !desired.contains(&spec.key) {
             continue;
         }
         if selected

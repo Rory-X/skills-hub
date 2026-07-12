@@ -287,6 +287,7 @@ export type ProjectToolDto = {
   label: string
   project_skills_dir: string
   enabled: boolean
+  installed: boolean
 }
 
 export type ProjectSkillPathDto = {

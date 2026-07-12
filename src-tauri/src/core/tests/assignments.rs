@@ -151,6 +151,46 @@ fn keeping_a_conflicting_project_skill_cancels_the_hub_assignment() {
 }
 
 #[test]
+fn uninstalled_agent_is_unavailable_for_project_preview_and_apply() {
+    let (_db, store) = make_store();
+    let central = tempfile::tempdir().expect("central");
+    write_skill(central.path(), "library");
+    let skill = add_skill(&store, central.path());
+    let project_dir = tempfile::tempdir().expect("project");
+    let project = ProjectRecord {
+        id: "project-1".to_string(),
+        name: "Project".to_string(),
+        root_path: project_dir.path().to_string_lossy().to_string(),
+        enabled_tool_keys: vec!["codex".to_string()],
+        local_git_exclude_enabled: false,
+        created_at: 1,
+        updated_at: 1,
+        last_scanned_at: None,
+    };
+    store.insert_project(&project).expect("insert project");
+    let global = tempfile::tempdir().expect("global");
+    let mut unavailable = tool(global.path());
+    unavailable.global_available = false;
+    let tools = [unavailable];
+    let draft = AssignmentDraft {
+        global_tools: Vec::new(),
+        projects: vec![ProjectAssignmentDraft {
+            project_id: project.id.clone(),
+            tool_keys: vec!["codex".to_string()],
+        }],
+    };
+
+    let preview = preview_skill_assignment(&store, &skill.id, &draft, &tools, false)
+        .expect("preview assignment");
+    assert_eq!(preview[0].outcome, "unavailable");
+
+    let applied = apply_skill_assignment(&store, &skill.id, &draft, &tools, &HashSet::new(), false)
+        .expect("apply assignment");
+    assert_eq!(applied.failed, 1);
+    assert!(!project_dir.path().join(".agents/skills/review").exists());
+}
+
+#[test]
 fn same_content_global_target_is_taken_over_without_rewriting_it() {
     let (_db, store) = make_store();
     let central = tempfile::tempdir().expect("central");

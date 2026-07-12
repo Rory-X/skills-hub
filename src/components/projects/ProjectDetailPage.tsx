@@ -24,6 +24,9 @@ import type {
   ProjectIssueDto,
   ProjectSkillDto,
 } from '../skills/types'
+import {
+  getAvailableProjectToolKeys,
+} from '../skills/toolAvailability'
 import { getDirectProjectIssueAction } from './projectIssueResolution'
 import {
   getManageableProjectSkillIds,
@@ -125,10 +128,11 @@ const ProjectDetailPage = ({
     const manageableIds = new Set(manageableCurrentSkillIds)
     return currentSkillSelection.filter((skillId) => manageableIds.has(skillId))
   }, [currentSkillSelection, manageableCurrentSkillIds])
-  const hasEnabledProjectAgents = detail.project.enabled_tool_keys.some(
-    (toolKey) =>
-      detail.tools.some((tool) => tool.key === toolKey && tool.enabled),
-  )
+  const hasEnabledProjectAgents =
+    getAvailableProjectToolKeys(
+      detail.tools,
+      detail.project.enabled_tool_keys,
+    ).length > 0
   const selectedCurrentSkillNames = useMemo(() => {
     const selectedIds = new Set(selectedCurrentSkillIds)
     return detail.current_skills
@@ -437,16 +441,25 @@ const ProjectDetailPage = ({
           </summary>
           <div className="project-tool-options">
             {detail.tools.map((tool) => (
-              <label key={tool.key} title={tool.project_skills_dir}>
-                <input
-                  type="checkbox"
-                  checked={tool.enabled}
-                  onChange={(event) => toggleTool(tool.key, event.target.checked)}
-                  disabled={loading}
-                />
-                <span>{toolLabels[tool.key] ?? tool.label}</span>
-                <code>{tool.project_skills_dir}</code>
-              </label>
+                <label
+                  className={tool.installed ? '' : 'unavailable'}
+                  key={tool.key}
+                  title={tool.project_skills_dir}
+                >
+                  <input
+                    type="checkbox"
+                    checked={tool.enabled}
+                    onChange={(event) =>
+                      toggleTool(tool.key, event.target.checked)
+                    }
+                    disabled={loading || (!tool.installed && !tool.enabled)}
+                  />
+                  <span>{toolLabels[tool.key] ?? tool.label}</span>
+                  <code>{tool.project_skills_dir}</code>
+                  {!tool.installed ? (
+                    <small>{t('assignment.unavailable')}</small>
+                  ) : null}
+                </label>
             ))}
           </div>
         </details>

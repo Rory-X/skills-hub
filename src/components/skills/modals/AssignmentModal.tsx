@@ -27,6 +27,10 @@ import {
   getExpandedProjectsAfterToggle,
   getVisibleAssignmentProjects,
 } from '../assignmentModalState'
+import {
+  isGlobalToolAvailable,
+  isProjectToolAvailable,
+} from '../toolAvailability'
 
 type AssignmentModalProps = {
   open: boolean
@@ -196,7 +200,10 @@ const AssignmentModal = ({
       }
       const inherited = project.enabled_tool_keys.filter((toolKey) => {
         const tool = toolsByKey[toolKey]
-        return Boolean(tool?.enabled && tool.supports_project_scope)
+        return Boolean(
+          tool?.supports_project_scope &&
+            isProjectToolAvailable(tool, project.enabled_tool_keys),
+        )
       })
       return { ...current, [project.id]: inherited }
     })
@@ -496,7 +503,7 @@ const AssignmentModal = ({
                   <div className="assignment-tool-grid">
                     {tools.map((tool) => {
                       const checked = globalTools.includes(tool.key)
-                      const available = tool.enabled && tool.installed
+                      const available = isGlobalToolAvailable(tool)
                       return (
                         <label
                           className={`assignment-tool-option${checked ? ' selected' : ''}${!available ? ' unavailable' : ''}`}
@@ -585,9 +592,10 @@ const AssignmentModal = ({
                             <div className="assignment-project-tools">
                               {projectCapableTools.map((tool) => {
                                 const checked = selectedTools.includes(tool.key)
-                                const available =
-                                  tool.enabled &&
-                                  project.enabled_tool_keys.includes(tool.key)
+                                const available = isProjectToolAvailable(
+                                  tool,
+                                  project.enabled_tool_keys,
+                                )
                                 return (
                                   <label
                                     className={`${checked ? 'selected' : ''}${!available ? ' unavailable' : ''}`}
