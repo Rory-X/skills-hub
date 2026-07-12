@@ -180,6 +180,8 @@ pub fn run() {
             commands::search_skills_online,
             commands::list_skill_files,
             commands::read_skill_file,
+            commands::list_skill_preview,
+            commands::read_skill_preview_file,
             commands::cancel_current_operation
         ])
         .on_window_event(|window, event| {

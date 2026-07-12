@@ -13,6 +13,7 @@ type GitPickModalProps = {
   onRequestClose: () => void
   onCancel: () => void
   onToggleCandidate: (subpath: string, checked: boolean) => void
+  onPreviewCandidate: (candidate: GitSkillCandidate) => void
   onInstall: () => void
   t: TFunction
 }
@@ -27,6 +28,7 @@ const GitPickModal = ({
   onRequestClose,
   onCancel,
   onToggleCandidate,
+  onPreviewCandidate,
   onInstall,
   t,
 }: GitPickModalProps) => {
@@ -122,7 +124,13 @@ const GitPickModal = ({
                   />
                 </label>
                 <div className="pick-item-main">
-                  <div className="pick-item-title">{c.name}</div>
+                  <button
+                    className="pick-item-title clickable"
+                    type="button"
+                    onClick={() => onPreviewCandidate(c)}
+                  >
+                    {c.name}
+                  </button>
                   {c.description ? (
                     <div className="pick-item-desc">{c.description}</div>
                   ) : null}

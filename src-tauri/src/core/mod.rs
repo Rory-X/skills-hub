@@ -14,6 +14,7 @@ pub mod network_proxy;
 pub mod onboarding;
 pub mod projects;
 pub mod skill_files;
+pub mod skill_preview;
 pub mod skill_store;
 pub mod skills_search;
 pub mod sync_engine;

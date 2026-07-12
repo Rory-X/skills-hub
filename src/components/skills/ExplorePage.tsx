@@ -13,6 +13,7 @@ type ExplorePageProps = {
   loading: boolean
   onExploreFilterChange: (value: string) => void
   onInstallSkill: (sourceUrl: string, skillName?: string) => void
+  onPreviewSkill: (sourceUrl: string, skillName: string, description?: string) => void
   onOpenManualAdd: () => void
   t: TFunction
 }
@@ -33,6 +34,7 @@ const ExplorePage = ({
   loading,
   onExploreFilterChange,
   onInstallSkill,
+  onPreviewSkill,
   onOpenManualAdd,
   t,
 }: ExplorePageProps) => {
@@ -121,7 +123,15 @@ const ExplorePage = ({
                     <div key={skill.slug} className="explore-card">
                       <div className="explore-card-top">
                         <div className="explore-card-info">
-                          <div className="explore-card-name">{skill.name}</div>
+                          <button
+                            className="explore-card-name clickable"
+                            type="button"
+                            onClick={() =>
+                              onPreviewSkill(skill.source_url, skill.name, skill.summary)
+                            }
+                          >
+                            {skill.name}
+                          </button>
                           <div className="explore-card-author">
                             {skill.source_url
                               .replace('https://github.com/', '')
@@ -174,7 +184,15 @@ const ExplorePage = ({
                         <div key={skill.source} className="explore-card">
                           <div className="explore-card-top">
                             <div className="explore-card-info">
-                              <div className="explore-card-name">{skill.name}</div>
+                              <button
+                                className="explore-card-name clickable"
+                                type="button"
+                                onClick={() =>
+                                  onPreviewSkill(skill.source_url, skill.name)
+                                }
+                              >
+                                {skill.name}
+                              </button>
                               <div className="explore-card-author">{skill.source}</div>
                             </div>
                             {installed ? (

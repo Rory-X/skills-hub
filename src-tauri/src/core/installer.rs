@@ -1493,6 +1493,17 @@ fn clone_to_cache<R: tauri::Runtime>(
     branch: Option<&str>,
     cancel: Option<&CancelToken>,
 ) -> Result<(PathBuf, String)> {
+    clone_to_cache_with_refresh(app, store, clone_url, branch, cancel, false)
+}
+
+fn clone_to_cache_with_refresh<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    store: &SkillStore,
+    clone_url: &str,
+    branch: Option<&str>,
+    cancel: Option<&CancelToken>,
+    force_refresh: bool,
+) -> Result<(PathBuf, String)> {
     let started = std::time::Instant::now();
     let cache_dir = app
         .path()
@@ -1513,7 +1524,10 @@ fn clone_to_cache<R: tauri::Runtime>(
             if let Ok(meta) = serde_json::from_str::<RepoCacheMeta>(&meta) {
                 if let Some(head) = meta.head {
                     let ttl_ms = get_git_cache_ttl_secs(store).saturating_mul(1000);
-                    if ttl_ms > 0 && now_ms().saturating_sub(meta.last_fetched_ms) < ttl_ms {
+                    if !force_refresh
+                        && ttl_ms > 0
+                        && now_ms().saturating_sub(meta.last_fetched_ms) < ttl_ms
+                    {
                         log::info!(
                             "[installer] git cache hit (fresh) {}s url={} branch={:?} repo_dir={:?}",
                             started.elapsed().as_secs_f32(),
@@ -1566,6 +1580,52 @@ fn clone_to_cache<R: tauri::Runtime>(
         rev
     );
     Ok((repo_dir, rev))
+}
+
+pub fn resolve_git_preview_root<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    store: &SkillStore,
+    repo_url: &str,
+    subpath: &str,
+    force_refresh: bool,
+) -> Result<(PathBuf, String)> {
+    let parsed = parse_github_url(repo_url);
+    let (repo_dir, revision) = clone_to_cache_with_refresh(
+        app,
+        store,
+        &parsed.clone_url,
+        parsed.branch.as_deref(),
+        None,
+        force_refresh,
+    )?;
+    let effective_subpath = if subpath.trim().is_empty() {
+        parsed.subpath.as_deref().unwrap_or(".")
+    } else {
+        subpath
+    };
+    let relative = std::path::Path::new(effective_subpath);
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        anyhow::bail!("invalid preview subpath");
+    }
+    let root = if effective_subpath == "." {
+        repo_dir
+    } else {
+        repo_dir.join(relative)
+    };
+    if !root.is_dir() {
+        anyhow::bail!(
+            "preview path not found in repository: {}",
+            effective_subpath
+        );
+    }
+    Ok((root, revision))
 }
 
 fn clone_to_cache_subpath<R: tauri::Runtime>(

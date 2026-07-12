@@ -16,7 +16,6 @@ type HeaderProps = {
     | 'projectDetail'
     | 'myskills'
     | 'explore'
-    | 'detail'
     | 'settings'
     | 'manage'
   onToggleLanguage: () => void
@@ -52,7 +51,7 @@ const Header = ({
             {t('navProjects')}
           </button>
           <button
-            className={`nav-tab${activeView === 'myskills' || activeView === 'detail' ? ' active' : ''}`}
+            className={`nav-tab${activeView === 'myskills' ? ' active' : ''}`}
             type="button"
             onClick={() => onViewChange('myskills')}
           >

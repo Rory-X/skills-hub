@@ -12,6 +12,7 @@ type LocalPickModalProps = {
   onRequestClose: () => void
   onCancel: () => void
   onToggleCandidate: (subpath: string, checked: boolean) => void
+  onPreviewCandidate: (candidate: LocalSkillCandidate) => void
   onInstall: () => void
   t: TFunction
 }
@@ -25,6 +26,7 @@ const LocalPickModal = ({
   onRequestClose,
   onCancel,
   onToggleCandidate,
+  onPreviewCandidate,
   onInstall,
   t,
 }: LocalPickModalProps) => {
@@ -125,7 +127,13 @@ const LocalPickModal = ({
                   />
                 </label>
                 <div className="pick-item-main">
-                  <div className="pick-item-title">{c.name}</div>
+                  <button
+                    className="pick-item-title clickable"
+                    type="button"
+                    onClick={() => onPreviewCandidate(c)}
+                  >
+                    {c.name}
+                  </button>
                   {c.description ? (
                     <div className="pick-item-desc">{c.description}</div>
                   ) : null}

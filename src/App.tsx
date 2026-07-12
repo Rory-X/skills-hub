@@ -10,7 +10,9 @@ import { useTranslation } from 'react-i18next'
 import { Toaster, toast } from 'sonner'
 import ExplorePage from './components/skills/ExplorePage'
 import FilterBar from './components/skills/FilterBar'
-import SkillDetailView from './components/skills/SkillDetailView'
+import SkillPreviewDrawer, {
+  type SkillPreviewRequest,
+} from './components/skills/SkillPreviewDrawer'
 import Header from './components/skills/Header'
 import LoadingOverlay from './components/skills/LoadingOverlay'
 import SkillsList from './components/skills/SkillsList'
@@ -25,6 +27,7 @@ import GitPickModal from './components/skills/modals/GitPickModal'
 import LocalPickModal from './components/skills/modals/LocalPickModal'
 import ImportModal from './components/skills/modals/ImportModal'
 import NewToolsModal from './components/skills/modals/NewToolsModal'
+import PreviewCandidateModal from './components/skills/modals/PreviewCandidateModal'
 import SettingsPage from './components/skills/SettingsPage'
 import ToolsPage from './components/skills/ToolsPage'
 import UpdatesPage from './components/skills/UpdatesPage'
@@ -75,6 +78,7 @@ import type {
   ToolStatusDto,
   UpdateResultDto,
 } from './components/skills/types'
+import { parseExplorePreviewTarget } from './components/skills/explorePreview'
 
 type SkillScopeState = Record<
   string,
@@ -89,7 +93,6 @@ type ActiveView =
   | 'projectDetail'
   | 'myskills'
   | 'explore'
-  | 'detail'
   | 'settings'
   | 'manage'
 
@@ -112,6 +115,7 @@ function App() {
     'system',
   )
   const [systemTheme, setSystemTheme] = useState<'light' | 'dark'>('light')
+  const resolvedTheme = themePreference === 'system' ? systemTheme : themePreference
   const [plan, setPlan] = useState<OnboardingPlan | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -156,7 +160,13 @@ function App() {
   const [skillListMode, setSkillListMode] = useState<SkillListMode>('all')
   const [activeView, setActiveView] = useState<ActiveView>('projects')
   const [managementTab, setManagementTab] = useState<ManagementTab>('tags')
-  const [detailSkill, setDetailSkill] = useState<ManagedSkill | null>(null)
+  const [previewRequest, setPreviewRequest] = useState<SkillPreviewRequest | null>(null)
+  const [previewCandidates, setPreviewCandidates] = useState<GitSkillCandidate[]>([])
+  const [previewCandidatesRepoUrl, setPreviewCandidatesRepoUrl] = useState('')
+  const [previewCandidateMeta, setPreviewCandidateMeta] = useState<{
+    title: string
+    description?: string
+  } | null>(null)
   const [tags, setTags] = useState<TagWithCountDto[]>([])
   const [selectedTagIds, setSelectedTagIds] = useState<number[]>([])
   const [includeUntagged, setIncludeUntagged] = useState(false)
@@ -1468,7 +1478,7 @@ function App() {
         setManagementTab('tags')
       }
       if (view === 'myskills') {
-        setDetailSkill(null)
+        setPreviewRequest(null)
       }
       if (view === 'projects') {
         setSelectedProjectDetail(null)
@@ -1481,14 +1491,98 @@ function App() {
   const handleOpenDetail = useCallback((skill: ManagedSkill) => {
     setBulkMode(false)
     setBulkSelectedIds([])
-    setDetailSkill(skill)
-    setActiveView('detail')
+    setPreviewRequest({
+      title: skill.name,
+      description: skill.description,
+      source: { kind: 'managed', skillId: skill.id },
+    })
   }, [])
 
-  const handleBackToList = useCallback(() => {
-    setDetailSkill(null)
-    setActiveView('myskills')
+  const handleClosePreview = useCallback(() => {
+    setPreviewRequest(null)
+    setPreviewCandidates([])
+    setPreviewCandidatesRepoUrl('')
+    setPreviewCandidateMeta(null)
   }, [])
+
+  const handlePreviewLocalCandidate = useCallback((candidate: LocalSkillCandidate) => {
+    setPreviewRequest({
+      title: candidate.name,
+      description: candidate.description,
+      source: {
+        kind: 'local',
+        basePath: localCandidatesBasePath,
+        subpath: candidate.subpath,
+      },
+    })
+  }, [localCandidatesBasePath])
+
+  const handlePreviewGitCandidate = useCallback((candidate: GitSkillCandidate) => {
+    setPreviewRequest({
+      title: candidate.name,
+      description: candidate.description,
+      source: {
+        kind: 'git',
+        repoUrl: gitCandidatesRepoUrl,
+        subpath: candidate.subpath,
+      },
+      refreshable: true,
+    })
+  }, [gitCandidatesRepoUrl])
+
+  const handlePreviewExploreSkill = useCallback(async (
+    sourceUrl: string,
+    title: string,
+    description?: string,
+  ) => {
+    const target = parseExplorePreviewTarget(sourceUrl)
+    if (target.subpath !== '.') {
+      setPreviewRequest({
+        title,
+        description,
+        source: { kind: 'git', repoUrl: target.repoUrl, subpath: target.subpath },
+        refreshable: true,
+      })
+      return
+    }
+    try {
+      const candidates = await invokeTauri<GitSkillCandidate[]>('list_git_skills_cmd', {
+        repoUrl: sourceUrl,
+      })
+      const exact = candidates.filter((candidate) => candidate.name.toLowerCase() === title.toLowerCase())
+      if (exact.length === 1) {
+        setPreviewRequest({
+          title,
+          description,
+          source: { kind: 'git', repoUrl: sourceUrl, subpath: exact[0].subpath },
+          refreshable: true,
+        })
+        return
+      }
+      if (candidates.length === 0) {
+        toast.error(t('errors.noSkillsFoundWithHint'))
+        return
+      }
+      setPreviewCandidates(candidates)
+      setPreviewCandidatesRepoUrl(sourceUrl)
+      setPreviewCandidateMeta({ title, description })
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err))
+    }
+  }, [invokeTauri, t])
+
+  const handleSelectPreviewCandidate = useCallback((candidate: GitSkillCandidate) => {
+    if (!previewCandidateMeta) return
+    setPreviewRequest({
+      title: candidate.name || previewCandidateMeta.title,
+      description: candidate.description ?? previewCandidateMeta.description,
+      source: { kind: 'git', repoUrl: previewCandidatesRepoUrl, subpath: candidate.subpath },
+      refreshable: true,
+    })
+    setPreviewCandidates([])
+    setPreviewCandidatesRepoUrl('')
+    setPreviewCandidateMeta(null)
+  }, [previewCandidateMeta, previewCandidatesRepoUrl])
 
   const handleExploreFilterChange = useCallback(
     (value: string) => {
@@ -3327,15 +3421,6 @@ function App() {
             formatRelative={formatRelative}
             t={t}
           />
-        ) : activeView === 'detail' && detailSkill ? (
-          <SkillDetailView
-            skill={detailSkill}
-            onBack={handleBackToList}
-            onOpenAssignment={handleOpenScope}
-            invokeTauri={invokeTauri}
-            formatRelative={formatRelative}
-            t={t}
-          />
         ) : activeView === 'myskills' ? (
           <div className="dashboard-stack">
             <FilterBar
@@ -3561,6 +3646,9 @@ function App() {
             loading={loading}
             onExploreFilterChange={handleExploreFilterChange}
             onInstallSkill={handleExploreInstall}
+            onPreviewSkill={(sourceUrl, name, description) =>
+              void handlePreviewExploreSkill(sourceUrl, name, description)
+            }
             onOpenManualAdd={handleOpenAdd}
             t={t}
           />
@@ -3759,6 +3847,7 @@ function App() {
           onRequestClose={handleCloseLocalPick}
           onCancel={handleCancelLocalPick}
           onToggleCandidate={handleToggleLocalCandidate}
+          onPreviewCandidate={handlePreviewLocalCandidate}
           onInstall={handleInstallSelectedLocalCandidates}
           t={t}
         />
@@ -3775,10 +3864,28 @@ function App() {
           onRequestClose={handleCloseGitPick}
           onCancel={handleCancelGitPick}
           onToggleCandidate={handleToggleGitCandidate}
+          onPreviewCandidate={handlePreviewGitCandidate}
           onInstall={handleInstallSelectedCandidates}
           t={t}
         />
       ) : null}
+
+      <PreviewCandidateModal
+        open={previewCandidates.length > 0}
+        candidates={previewCandidates}
+        onRequestClose={handleClosePreview}
+        onSelect={handleSelectPreviewCandidate}
+        t={t}
+      />
+
+      <SkillPreviewDrawer
+        open={Boolean(previewRequest)}
+        request={previewRequest}
+        isDark={resolvedTheme === 'dark'}
+        invokeTauri={invokeTauri}
+        onClose={handleClosePreview}
+        t={t}
+      />
 
       </div>
   )

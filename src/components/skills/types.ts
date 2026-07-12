@@ -276,6 +276,27 @@ export type SkillFileEntry = {
   size: number
 }
 
+export type SkillPreviewSource =
+  | { kind: 'managed'; skillId: string }
+  | { kind: 'local'; basePath: string; subpath: string }
+  | { kind: 'git'; repoUrl: string; subpath: string }
+
+export type SkillPreviewFile = SkillFileEntry
+
+export type SkillPreviewManifest = {
+  files: SkillPreviewFile[]
+  truncated: boolean
+  revision?: string | null
+}
+
+export type SkillPreviewContent = {
+  kind: 'text' | 'image' | 'unsupported'
+  content?: string | null
+  mediaType?: string | null
+  bytes?: number[] | null
+  reason?: string | null
+}
+
 export type ProjectSummaryDto = {
   id: string
   name: string

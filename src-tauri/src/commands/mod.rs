@@ -52,6 +52,10 @@ use crate::core::projects::{
     repair_project_issue_and_scan, update_project_and_scan, visible_project_issue_projections,
     ProjectIssue, ProjectIssueProjection, ProjectToolSpec,
 };
+use crate::core::skill_files::FileContent;
+use crate::core::skill_preview::{
+    list_preview_files, read_preview_file, resolve_preview_root, PreviewSource,
+};
 use crate::core::skill_store::{ProjectRecord, SkillStore};
 use crate::core::skills_search::{
     search_skills_online as search_skills_online_core, OnlineSkillResult,
@@ -2353,9 +2357,10 @@ pub struct SkillFileEntry {
 pub async fn list_skill_files(central_path: String) -> Result<Vec<SkillFileEntry>, String> {
     let path = std::path::PathBuf::from(&central_path);
     tauri::async_runtime::spawn_blocking(move || {
-        let entries = crate::core::skill_files::list_files(&path)?;
+        let manifest = crate::core::skill_files::list_files(&path)?;
         Ok::<_, anyhow::Error>(
-            entries
+            manifest
+                .entries
                 .into_iter()
                 .map(|e| SkillFileEntry {
                     path: e.path,
@@ -2373,7 +2378,144 @@ pub async fn list_skill_files(central_path: String) -> Result<Vec<SkillFileEntry
 pub async fn read_skill_file(central_path: String, file_path: String) -> Result<String, String> {
     let base = std::path::PathBuf::from(&central_path);
     tauri::async_runtime::spawn_blocking(move || {
-        crate::core::skill_files::read_file(&base, &file_path)
+        match crate::core::skill_files::read_file(&base, &file_path)? {
+            crate::core::skill_files::FileContent::Text(content) => Ok(content),
+            crate::core::skill_files::FileContent::Image { .. } => {
+                anyhow::bail!("Image files require the skill preview API")
+            }
+            crate::core::skill_files::FileContent::Unsupported(reason) => {
+                anyhow::bail!("File cannot be displayed: {reason}")
+            }
+        }
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SkillPreviewSourceDto {
+    Managed {
+        #[serde(rename = "skillId")]
+        skill_id: String,
+    },
+    Local {
+        #[serde(rename = "basePath")]
+        base_path: String,
+        subpath: String,
+    },
+    Git {
+        #[serde(rename = "repoUrl")]
+        repo_url: String,
+        subpath: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPreviewFileDto {
+    pub path: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPreviewManifestDto {
+    pub files: Vec<SkillPreviewFileDto>,
+    pub truncated: bool,
+    pub revision: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPreviewContentDto {
+    pub kind: String,
+    pub content: Option<String>,
+    pub media_type: Option<String>,
+    pub bytes: Option<Vec<u8>>,
+    pub reason: Option<String>,
+}
+
+fn to_preview_source(source: SkillPreviewSourceDto) -> Result<PreviewSource, anyhow::Error> {
+    Ok(match source {
+        SkillPreviewSourceDto::Managed { skill_id } => PreviewSource::Managed { skill_id },
+        SkillPreviewSourceDto::Local { base_path, subpath } => PreviewSource::Local {
+            base_path: expand_home_path(&base_path)?,
+            subpath,
+        },
+        SkillPreviewSourceDto::Git { repo_url, subpath } => {
+            PreviewSource::Git { repo_url, subpath }
+        }
+    })
+}
+
+#[tauri::command]
+pub async fn list_skill_preview(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    source: SkillPreviewSourceDto,
+    refresh: Option<bool>,
+) -> Result<SkillPreviewManifestDto, String> {
+    let store = store.inner().clone();
+    let source = to_preview_source(source).map_err(format_anyhow_error)?;
+    let refresh = refresh.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = resolve_preview_root(&app, &store, &source, refresh)?;
+        let manifest = list_preview_files(&root)?;
+        Ok::<_, anyhow::Error>(SkillPreviewManifestDto {
+            files: manifest
+                .entries
+                .into_iter()
+                .map(|entry| SkillPreviewFileDto {
+                    path: entry.path,
+                    size: entry.size,
+                })
+                .collect(),
+            truncated: manifest.truncated,
+            revision: root.revision,
+        })
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub async fn read_skill_preview_file(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    source: SkillPreviewSourceDto,
+    file_path: String,
+) -> Result<SkillPreviewContentDto, String> {
+    let store = store.inner().clone();
+    let source = to_preview_source(source).map_err(format_anyhow_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = resolve_preview_root(&app, &store, &source, false)?;
+        let content = read_preview_file(&root, &file_path)?;
+        Ok::<_, anyhow::Error>(match content {
+            FileContent::Text(content) => SkillPreviewContentDto {
+                kind: "text".to_string(),
+                content: Some(content),
+                media_type: None,
+                bytes: None,
+                reason: None,
+            },
+            FileContent::Image { media_type, bytes } => SkillPreviewContentDto {
+                kind: "image".to_string(),
+                content: None,
+                media_type: Some(media_type),
+                bytes: Some(bytes),
+                reason: None,
+            },
+            FileContent::Unsupported(reason) => SkillPreviewContentDto {
+                kind: "unsupported".to_string(),
+                content: None,
+                media_type: None,
+                bytes: None,
+                reason: Some(reason),
+            },
+        })
     })
     .await
     .map_err(|err| err.to_string())?
