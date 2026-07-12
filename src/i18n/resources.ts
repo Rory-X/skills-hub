@@ -215,10 +215,22 @@ export const resources = {
         unavailableRemovalGroup: 'Unavailable historical assignments',
         sourceBlocked:
           '{{count}} Skills have missing or invalid sources. They will be skipped without changing their assignments.',
+        clearPreviewTitle: 'Clear assignments for {{count}} Skills',
+        clearPreviewDescription:
+          '{{count}} Agent assignment links will be removed. Skills, source files, and library content will not be deleted.',
+        conflictSummary: '{{count}} conflicts found',
+        conflictSummaryHint:
+          'Existing content is kept by default, or you can use the library version for all conflicts.',
+        blockingDetailsTitle: '{{count}} blocked changes need attention',
+        blockingDetailsHint:
+          'These changes will not be applied unless their conflicts or unsafe targets are resolved.',
         keepAllConflicts: 'Keep all and skip affected Skills',
         replaceAllConflicts: 'Use library version for all conflicts',
-        clearAcknowledgement:
-          'I understand that all assignments for {{count}} Skills will be cleared.',
+        showChangeDetails: 'View {{count}} change details',
+        hideChangeDetails: 'Hide {{count}} change details',
+        changeDetailsHint:
+          'Expand a Skill only when you need to inspect paths or Agent-level changes.',
+        confirmClearApply: 'Confirm clearing assignments for {{count}} Skills',
         confirmDestructiveApply: 'Remove {{remove}} and add {{add}} assignments',
         reviewChanges: 'Review changes',
         resultTitle: 'Batch assignment finished',
@@ -1112,9 +1124,19 @@ export const resources = {
         unavailableRemovalGroup: '历史不可用分配',
         sourceBlocked:
           '{{count}} 个 Skills 的来源缺失或无效，将跳过且保留原分配。',
+        clearPreviewTitle: '即将清空 {{count}} 个 Skills 的分配',
+        clearPreviewDescription:
+          '将移除 {{count}} 项 Agent 分配关系；不会删除 Skill、源文件或库中内容。',
+        conflictSummary: '发现 {{count}} 项冲突',
+        conflictSummaryHint: '默认保留现有内容，也可以统一使用库版本。',
+        blockingDetailsTitle: '{{count}} 项阻塞变更需要处理',
+        blockingDetailsHint: '这些变更不会执行，请先处理冲突或无法确认归属的目标。',
         keepAllConflicts: '全部保留并跳过受影响 Skills',
         replaceAllConflicts: '全部使用库版本替换',
-        clearAcknowledgement: '我已了解将清空 {{count}} 个 Skills 的全部分配。',
+        showChangeDetails: '查看 {{count}} 项变更明细',
+        hideChangeDetails: '收起 {{count}} 项变更明细',
+        changeDetailsHint: '仅在需要核对路径或 Agent 级变更时展开具体 Skill。',
+        confirmClearApply: '确认清空 {{count}} 个 Skills 的分配',
         confirmDestructiveApply: '删除 {{remove}} 项并新增 {{add}} 项分配',
         reviewChanges: '查看变更预览',
         resultTitle: '批量分配已完成',

@@ -25,15 +25,6 @@ export const getBulkAssignmentDraft = (
   draft: AssignmentDraftDto,
 ): AssignmentDraftDto => (mode === 'clear' ? EMPTY_ASSIGNMENT_DRAFT : draft)
 
-export const requiresBulkClearAcknowledgement = (
-  mode: BulkAssignmentMode,
-  draft: AssignmentDraftDto,
-) =>
-  mode === 'clear' ||
-  (mode === 'replace' &&
-    draft.global_tools.length === 0 &&
-    draft.projects.length === 0)
-
 export const selectEntireLibrary = (
   _currentSelectedIds: string[],
   managedSkillIds: string[],
@@ -75,6 +66,22 @@ export type BulkAssignmentPreviewSummary = {
   blockedCount: number
   affectedSkillCount: number
 }
+
+export type BulkAssignmentPreviewStat = {
+  key: 'affected' | 'remove' | 'add' | 'keep' | 'blocked'
+  count: number
+}
+
+export const getVisibleBulkAssignmentPreviewStats = (
+  summary: BulkAssignmentPreviewSummary,
+): BulkAssignmentPreviewStat[] =>
+  [
+    { key: 'affected' as const, count: summary.affectedSkillCount },
+    { key: 'remove' as const, count: summary.removeCount },
+    { key: 'add' as const, count: summary.addCount },
+    { key: 'keep' as const, count: summary.keepCount },
+    { key: 'blocked' as const, count: summary.blockedCount },
+  ].filter((stat) => stat.count > 0)
 
 export const buildBulkAssignmentPreviewSummary = (
   preview: AssignmentPreviewDto,

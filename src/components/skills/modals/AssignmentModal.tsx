@@ -39,12 +39,29 @@ import {
   buildBulkAssignmentPreviewSummary,
   EMPTY_ASSIGNMENT_DRAFT,
   getBulkAssignmentDraft,
+  getVisibleBulkAssignmentPreviewStats,
   mergeRetriedAssignmentResult,
-  requiresBulkClearAcknowledgement,
   withSourceBlockedSkills,
   type BulkAssignmentMode,
   type BulkAssignmentOrigin,
+  type BulkAssignmentPreviewStat,
 } from '../bulkAssignmentWorkflow'
+
+const PREVIEW_STAT_LABEL_KEYS: Record<
+  BulkAssignmentPreviewStat['key'],
+  string
+> = {
+  affected: 'assignment.previewAffected',
+  remove: 'assignment.previewRemove',
+  add: 'assignment.previewAdd',
+  keep: 'assignment.previewKeep',
+  blocked: 'assignment.previewBlocked',
+}
+
+const DANGER_PREVIEW_STAT_KEYS = new Set<BulkAssignmentPreviewStat['key']>([
+  'remove',
+  'blocked',
+])
 
 type AssignmentModalProps = {
   open: boolean
@@ -157,7 +174,8 @@ const AssignmentModal = ({
     libraryBatch ? 'mode' : 'configure',
   )
   const [bulkResult, setBulkResult] = useState<AssignmentApplyResultDto | null>(null)
-  const [acknowledgedClearKey, setAcknowledgedClearKey] = useState<string | null>(null)
+  const [showPreviewDetails, setShowPreviewDetails] = useState(false)
+  const [expandedPreviewSkillIds, setExpandedPreviewSkillIds] = useState<string[]>([])
 
   const toolsByKey = useMemo(
     () => Object.fromEntries(tools.map((tool) => [tool.key, tool])),
@@ -173,6 +191,13 @@ const AssignmentModal = ({
   )
   const conflicts = useMemo(
     () => preview?.items.filter((item) => item.outcome === 'conflict') ?? [],
+    [preview],
+  )
+  const blockingPreviewItems = useMemo(
+    () =>
+      preview?.items.filter(
+        (item) => item.blocking && item.outcome !== 'remove',
+      ) ?? [],
     [preview],
   )
   const assignmentIssues = useMemo(
@@ -212,11 +237,12 @@ const AssignmentModal = ({
     [globalTools, projectTools],
   )
   const effectiveDraft = getBulkAssignmentDraft(bulkMode ?? 'replace', draft)
-  const requiresClearAcknowledgement =
+  const clearsAllAssignments =
     libraryBatch &&
-    requiresBulkClearAcknowledgement(bulkMode ?? 'replace', effectiveDraft)
-  const clearAcknowledgementKey = JSON.stringify([bulkMode, effectiveDraft])
-  const clearAcknowledged = acknowledgedClearKey === clearAcknowledgementKey
+    (bulkMode === 'clear' ||
+      (bulkMode === 'replace' &&
+        effectiveDraft.global_tools.length === 0 &&
+        effectiveDraft.projects.length === 0))
   const effectiveAdditive = libraryBatch ? bulkMode === 'add' : additive
   const sourceBlockedSkills = useMemo(
     () =>
@@ -232,6 +258,9 @@ const AssignmentModal = ({
   const previewSummary = preview
     ? buildBulkAssignmentPreviewSummary(preview)
     : null
+  const previewStats = previewSummary
+    ? getVisibleBulkAssignmentPreviewStats(previewSummary)
+    : []
   const previewGroups = useMemo(() => {
     const groups = new Map<string, { skillName: string; items: AssignmentPreviewItemDto[] }>()
     for (const item of preview?.items ?? []) {
@@ -293,7 +322,17 @@ const AssignmentModal = ({
     if (!result) return
     setPreview(result)
     setReplaceConflictKeys([])
+    setShowPreviewDetails(false)
+    setExpandedPreviewSkillIds([])
     if (libraryBatch) setBulkStep('preview')
+  }
+
+  const togglePreviewSkill = (skillId: string) => {
+    setExpandedPreviewSkillIds((current) =>
+      current.includes(skillId)
+        ? current.filter((id) => id !== skillId)
+        : [...current, skillId],
+    )
   }
 
   const handleApply = async () => {
@@ -519,28 +558,38 @@ const AssignmentModal = ({
             </div>
           ) : preview ? (
             <div className="assignment-conflicts">
-              {libraryBatch && previewSummary ? (
+              {libraryBatch &&
+              previewSummary &&
+              clearsAllAssignments ? (
+                <div className="bulk-clear-preview-warning">
+                  <AlertTriangle size={19} />
+                  <div>
+                    <strong>
+                      {t('assignment.clearPreviewTitle', {
+                        count: eligibleSkills.length,
+                      })}
+                    </strong>
+                    <span>
+                      {t('assignment.clearPreviewDescription', {
+                        count: previewSummary.removeCount,
+                      })}
+                    </span>
+                  </div>
+                </div>
+              ) : null}
+              {libraryBatch && previewStats.length > 0 ? (
                 <div className="bulk-assignment-preview-summary">
-                  <div>
-                    <span>{t('assignment.previewAffected')}</span>
-                    <strong>{previewSummary.affectedSkillCount}</strong>
-                  </div>
-                  <div>
-                    <span>{t('assignment.previewRemove')}</span>
-                    <strong>{previewSummary.removeCount}</strong>
-                  </div>
-                  <div>
-                    <span>{t('assignment.previewAdd')}</span>
-                    <strong>{previewSummary.addCount}</strong>
-                  </div>
-                  <div>
-                    <span>{t('assignment.previewKeep')}</span>
-                    <strong>{previewSummary.keepCount}</strong>
-                  </div>
-                  <div className={previewSummary.blockedCount > 0 ? 'danger' : ''}>
-                    <span>{t('assignment.previewBlocked')}</span>
-                    <strong>{previewSummary.blockedCount}</strong>
-                  </div>
+                  {previewStats.map((stat) => (
+                    <div
+                      className={
+                        DANGER_PREVIEW_STAT_KEYS.has(stat.key) ? 'danger' : ''
+                      }
+                      key={stat.key}
+                    >
+                      <span>{t(PREVIEW_STAT_LABEL_KEYS[stat.key])}</span>
+                      <strong>{stat.count}</strong>
+                    </div>
+                  ))}
                 </div>
               ) : null}
               {libraryBatch && sourceBlockedSkills.length > 0 ? (
@@ -558,93 +607,173 @@ const AssignmentModal = ({
                   </div>
                 </div>
               ) : null}
-              <div className="assignment-section-title">
-                {conflicts.length > 0 ||
-                preview.items.some((item) => item.outcome === 'remove') ? (
-                  <AlertTriangle size={17} />
-                ) : (
-                  <Check size={17} />
-                )}
-                <span>
-                  {t('assignment.previewTitle', { count: preview.items.length })}
-                </span>
-              </div>
               {libraryBatch && conflicts.length > 0 ? (
-                <div className="bulk-conflict-actions">
-                  <button
-                    className="btn btn-secondary"
-                    type="button"
-                    onClick={() => setReplaceConflictKeys([])}
-                    disabled={loading}
-                  >
-                    {t('assignment.keepAllConflicts')}
-                  </button>
-                  <button
-                    className="btn btn-danger"
-                    type="button"
-                    onClick={() =>
-                      setReplaceConflictKeys(conflicts.map((item) => item.key))
-                    }
-                    disabled={loading}
-                  >
-                    {t('assignment.replaceAllConflicts')}
-                  </button>
+                <div className="bulk-preview-conflicts">
+                  <div>
+                    <AlertTriangle size={17} />
+                    <strong>
+                      {t('assignment.conflictSummary', {
+                        count: conflicts.length,
+                      })}
+                    </strong>
+                    <span>{t('assignment.conflictSummaryHint')}</span>
+                  </div>
+                  <div className="bulk-conflict-actions">
+                    <button
+                      className="btn btn-secondary"
+                      type="button"
+                      onClick={() => setReplaceConflictKeys([])}
+                      disabled={loading}
+                    >
+                      {t('assignment.keepAllConflicts')}
+                    </button>
+                    <button
+                      className="btn btn-danger"
+                      type="button"
+                      onClick={() =>
+                        setReplaceConflictKeys(conflicts.map((item) => item.key))
+                      }
+                      disabled={loading}
+                    >
+                      {t('assignment.replaceAllConflicts')}
+                    </button>
+                  </div>
                 </div>
               ) : null}
-              <div className="assignment-conflict-list">
-                {libraryBatch
-                  ? previewGroups.map((group) => (
-                      <details
-                        className="bulk-preview-skill-group"
-                        key={group.skillId}
-                        open
-                      >
-                        <summary>
-                          <strong>{group.skillName}</strong>
-                          <span>
-                            {t('assignment.changeCount', {
-                              count: group.items.length,
-                            })}
-                          </span>
-                        </summary>
-                        <div>
-                          {group.items.some(isHistoricalUnavailableRemoval) ? (
-                            <section className="historical-unavailable-group">
-                              <strong>{t('assignment.unavailableRemovalGroup')}</strong>
-                              {group.items
-                                .filter(isHistoricalUnavailableRemoval)
-                                .map(renderPreviewItem)}
-                            </section>
-                          ) : null}
-                          {group.items
-                            .filter((item) => !isHistoricalUnavailableRemoval(item))
-                            .map(renderPreviewItem)}
-                        </div>
-                      </details>
-                    ))
-                  : preview.items.map(renderPreviewItem)}
-                {preview.items.length === 0 ? (
-                  <div className="assignment-empty">{t('assignment.noChanges')}</div>
-                ) : null}
-              </div>
-              {requiresClearAcknowledgement ? (
-                <label className="bulk-clear-acknowledgement">
-                  <input
-                    type="checkbox"
-                    checked={clearAcknowledged}
-                    onChange={(event) =>
-                      setAcknowledgedClearKey(
-                        event.target.checked ? clearAcknowledgementKey : null,
-                      )
-                    }
-                  />
-                  <span>
-                    {t('assignment.clearAcknowledgement', {
-                      count: eligibleSkills.length,
-                    })}
-                  </span>
-                </label>
+              {libraryBatch && blockingPreviewItems.length > 0 ? (
+                <div className="bulk-preview-blocked-items">
+                  <div className="assignment-section-title">
+                    <AlertTriangle size={17} />
+                    <div>
+                      <strong>
+                        {t('assignment.blockingDetailsTitle', {
+                          count: blockingPreviewItems.length,
+                        })}
+                      </strong>
+                      <span>{t('assignment.blockingDetailsHint')}</span>
+                    </div>
+                  </div>
+                  <div className="assignment-conflict-list">
+                    {blockingPreviewItems.map(renderPreviewItem)}
+                  </div>
+                </div>
               ) : null}
+              {libraryBatch ? (
+                preview.items.length > 0 ? (
+                  <div className="bulk-preview-details">
+                    <button
+                      className="bulk-preview-details-toggle"
+                      type="button"
+                      aria-expanded={showPreviewDetails}
+                      onClick={() => setShowPreviewDetails((current) => !current)}
+                    >
+                      <div>
+                        <strong>
+                          {t(
+                            showPreviewDetails
+                              ? 'assignment.hideChangeDetails'
+                              : 'assignment.showChangeDetails',
+                            { count: preview.items.length },
+                          )}
+                        </strong>
+                        <span>{t('assignment.changeDetailsHint')}</span>
+                      </div>
+                      {showPreviewDetails ? (
+                        <ChevronDown size={18} />
+                      ) : (
+                        <ChevronRight size={18} />
+                      )}
+                    </button>
+                    {showPreviewDetails ? (
+                      <div className="assignment-conflict-list bulk-preview-skill-list">
+                        {previewGroups.map((group) => {
+                          const expanded = expandedPreviewSkillIds.includes(
+                            group.skillId,
+                          )
+                          return (
+                            <div
+                              className="bulk-preview-skill-group"
+                              key={group.skillId}
+                            >
+                              <button
+                                type="button"
+                                aria-expanded={expanded}
+                                onClick={() => togglePreviewSkill(group.skillId)}
+                              >
+                                <span className="bulk-preview-skill-name">
+                                  {expanded ? (
+                                    <ChevronDown size={16} />
+                                  ) : (
+                                    <ChevronRight size={16} />
+                                  )}
+                                  <strong>{group.skillName}</strong>
+                                </span>
+                                <span>
+                                  {t('assignment.changeCount', {
+                                    count: group.items.length,
+                                  })}
+                                </span>
+                              </button>
+                              {expanded ? (
+                                <div>
+                                  {group.items.some(
+                                    isHistoricalUnavailableRemoval,
+                                  ) ? (
+                                    <section className="historical-unavailable-group">
+                                      <strong>
+                                        {t(
+                                          'assignment.unavailableRemovalGroup',
+                                        )}
+                                      </strong>
+                                      {group.items
+                                        .filter(isHistoricalUnavailableRemoval)
+                                        .map(renderPreviewItem)}
+                                    </section>
+                                  ) : null}
+                                  {group.items
+                                    .filter(
+                                      (item) =>
+                                        !isHistoricalUnavailableRemoval(item),
+                                    )
+                                    .map(renderPreviewItem)}
+                                </div>
+                              ) : null}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : (
+                  <div className="assignment-empty">
+                    {t('assignment.noChanges')}
+                  </div>
+                )
+              ) : (
+                <>
+                  <div className="assignment-section-title">
+                    {conflicts.length > 0 ||
+                    preview.items.some((item) => item.outcome === 'remove') ? (
+                      <AlertTriangle size={17} />
+                    ) : (
+                      <Check size={17} />
+                    )}
+                    <span>
+                      {t('assignment.previewTitle', {
+                        count: preview.items.length,
+                      })}
+                    </span>
+                  </div>
+                  <div className="assignment-conflict-list">
+                    {preview.items.map(renderPreviewItem)}
+                    {preview.items.length === 0 ? (
+                      <div className="assignment-empty">
+                        {t('assignment.noChanges')}
+                      </div>
+                    ) : null}
+                  </div>
+                </>
+              )}
             </div>
           ) : (
             <>
@@ -1060,6 +1189,8 @@ const AssignmentModal = ({
                 onClick={() => {
                   if (preview) {
                     setPreview(null)
+                    setShowPreviewDetails(false)
+                    setExpandedPreviewSkillIds([])
                     if (libraryBatch) setBulkStep('configure')
                   } else if (libraryBatch) {
                     setBulkStep('mode')
@@ -1073,7 +1204,7 @@ const AssignmentModal = ({
                 {preview || libraryBatch ? t('back') : t('cancel')}
               </button>
               <button
-                className={`btn ${libraryBatch && previewSummary && previewSummary.removeCount > 0 ? 'btn-danger' : 'btn-primary'}`}
+                className={`btn ${libraryBatch && previewSummary && (clearsAllAssignments || previewSummary.removeCount > 0) ? 'btn-danger' : 'btn-primary'}`}
                 type="button"
                 onClick={() => void (preview ? handleApply() : handlePreview())}
                 disabled={
@@ -1081,18 +1212,19 @@ const AssignmentModal = ({
                   skills.length === 0 ||
                   eligibleSkills.length === 0 ||
                   (requireProjectTools && selectedContextProjectTools.length === 0) ||
-                  (libraryBatch && bulkMode === 'replace' && !bulkOrigin) ||
-                  (requiresClearAcknowledgement &&
-                    Boolean(preview) &&
-                    !clearAcknowledged)
+                  (libraryBatch && bulkMode === 'replace' && !bulkOrigin)
                 }
               >
                 <Save size={16} />
                 {libraryBatch && preview && previewSummary
-                  ? t('assignment.confirmDestructiveApply', {
-                      remove: previewSummary.removeCount,
-                      add: previewSummary.addCount,
-                    })
+                  ? clearsAllAssignments
+                    ? t('assignment.confirmClearApply', {
+                        count: eligibleSkills.length,
+                      })
+                    : t('assignment.confirmDestructiveApply', {
+                        remove: previewSummary.removeCount,
+                        add: previewSummary.addCount,
+                      })
                   : preview
                     ? t('assignment.confirmApply')
                     : t('assignment.reviewChanges')}

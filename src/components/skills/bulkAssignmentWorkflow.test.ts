@@ -3,7 +3,7 @@ import {
   assignmentDraftFromTemplate,
   buildBulkAssignmentPreviewSummary,
   getBulkAssignmentDraft,
-  requiresBulkClearAcknowledgement,
+  getVisibleBulkAssignmentPreviewStats,
   mergeRetriedAssignmentResult,
   withSourceBlockedSkills,
   selectEntireLibrary,
@@ -59,17 +59,28 @@ describe('bulk assignment workflow', () => {
     })
   })
 
-  it('requires the clear acknowledgement when replacement also resolves to an empty target', () => {
-    expect(requiresBulkClearAcknowledgement('replace', {
-      global_tools: [],
-      projects: [],
-    })).toBe(true)
-    expect(requiresBulkClearAcknowledgement('clear', draft)).toBe(true)
-    expect(requiresBulkClearAcknowledgement('replace', draft)).toBe(false)
-    expect(requiresBulkClearAcknowledgement('add', {
-      global_tools: [],
-      projects: [],
-    })).toBe(false)
+  it('keeps affected Skills visible and hides zero-value preview stats', () => {
+    expect(
+      getVisibleBulkAssignmentPreviewStats({
+        affectedSkillCount: 56,
+        removeCount: 468,
+        addCount: 0,
+        keepCount: 0,
+        blockedCount: 0,
+      }),
+    ).toEqual([
+      { key: 'affected', count: 56 },
+      { key: 'remove', count: 468 },
+    ])
+    expect(
+      getVisibleBulkAssignmentPreviewStats({
+        affectedSkillCount: 0,
+        removeCount: 0,
+        addCount: 0,
+        keepCount: 0,
+        blockedCount: 0,
+      }),
+    ).toEqual([])
   })
 
   it('selects the entire managed library independently of the visible filter result', () => {
