@@ -208,42 +208,58 @@ pub fn preview_skill_assignment(
 
     if include_removals {
         let desired_keys = draft_target_keys(&normalized);
-        for assignment in store.list_skill_assignments(skill_id)? {
-            let key = target_key(
-                &assignment.scope,
-                assignment.project_id.as_deref(),
-                &assignment.tool,
-            );
-            if desired_keys.contains(&key) {
-                continue;
-            }
-            let project = assignment
-                .project_id
-                .as_deref()
-                .and_then(|project_id| store.get_project(project_id).transpose())
-                .transpose()?;
-            let project_path = project.as_ref().map(|project| project.root_path.as_str());
-            let target_path = store
-                .get_skill_target(skill_id, &assignment.tool, &assignment.scope, project_path)?
-                .map(|target| target.target_path);
-            let outcome = match target_path.as_deref() {
-                Some(path) if !target_is_owned_or_missing(&skill, Path::new(path))? => "unsafe",
-                _ => "remove",
-            };
-            items.push(AssignmentPreviewItem {
-                key,
-                tool: assignment.tool,
-                scope: assignment.scope,
-                project_id: assignment.project_id,
-                project_name: project.map(|project| project.name),
-                target_path,
-                outcome: outcome.to_string(),
-                blocking: true,
-            });
-        }
+        items.extend(preview_assignment_removals(
+            store,
+            &skill,
+            store.list_skill_assignments(skill_id)?,
+            &desired_keys,
+        )?);
     }
 
     items.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(items)
+}
+
+fn preview_assignment_removals(
+    store: &SkillStore,
+    skill: &SkillRecord,
+    assignments: Vec<SkillAssignmentRecord>,
+    desired_keys: &HashSet<String>,
+) -> Result<Vec<AssignmentPreviewItem>> {
+    let mut items = Vec::new();
+    for assignment in assignments {
+        let key = target_key(
+            &assignment.scope,
+            assignment.project_id.as_deref(),
+            &assignment.tool,
+        );
+        if desired_keys.contains(&key) {
+            continue;
+        }
+        let project = assignment
+            .project_id
+            .as_deref()
+            .and_then(|project_id| store.get_project(project_id).transpose())
+            .transpose()?;
+        let project_path = project.as_ref().map(|project| project.root_path.as_str());
+        let target_path = store
+            .get_skill_target(&skill.id, &assignment.tool, &assignment.scope, project_path)?
+            .map(|target| target.target_path);
+        let outcome = match target_path.as_deref() {
+            Some(path) if !target_is_owned_or_missing(skill, Path::new(path))? => "unsafe",
+            _ => "remove",
+        };
+        items.push(AssignmentPreviewItem {
+            key,
+            tool: assignment.tool,
+            scope: assignment.scope,
+            project_id: assignment.project_id,
+            project_name: project.map(|project| project.name),
+            target_path,
+            outcome: outcome.to_string(),
+            blocking: true,
+        });
+    }
     Ok(items)
 }
 
@@ -472,6 +488,72 @@ pub fn preview_skill_assignments(
         .collect()
 }
 
+pub fn preview_project_skill_assignments(
+    store: &SkillStore,
+    skill_ids: &[String],
+    project_id: &str,
+    requested_tools: &[String],
+    tools: &[AssignmentToolSpec],
+    additive: bool,
+) -> Result<Vec<SkillAssignmentPreview>> {
+    skill_ids
+        .iter()
+        .map(|skill_id| {
+            let skill = require_skill(store, skill_id)?;
+            let items = preview_project_skill_assignment(
+                store,
+                &skill,
+                project_id,
+                requested_tools,
+                tools,
+                additive,
+            )?;
+            Ok(SkillAssignmentPreview { skill, items })
+        })
+        .collect()
+}
+
+fn preview_project_skill_assignment(
+    store: &SkillStore,
+    skill: &SkillRecord,
+    project_id: &str,
+    requested_tools: &[String],
+    tools: &[AssignmentToolSpec],
+    additive: bool,
+) -> Result<Vec<AssignmentPreviewItem>> {
+    let requested_tools = normalized_keys(requested_tools);
+    let existing = project_assignment_records(store, &skill.id, project_id)?;
+    let mut desired_tools = requested_tools.iter().cloned().collect::<BTreeSet<_>>();
+    if additive {
+        desired_tools.extend(existing.iter().map(|assignment| assignment.tool.clone()));
+    }
+    let desired_tools = desired_tools.into_iter().collect::<Vec<_>>();
+    let draft = AssignmentDraft {
+        global_tools: Vec::new(),
+        projects: vec![ProjectAssignmentDraft {
+            project_id: project_id.to_string(),
+            tool_keys: desired_tools,
+        }],
+    };
+    let mut items = preview_skill_assignment(store, &skill.id, &draft, tools, false)?;
+    if additive {
+        let requested_keys = requested_tools
+            .iter()
+            .map(|tool| target_key("project", Some(project_id), tool))
+            .collect::<HashSet<_>>();
+        items.retain(|item| requested_keys.contains(&item.key));
+    } else {
+        items.extend(preview_assignment_removals(
+            store,
+            skill,
+            existing,
+            &draft_target_keys(&draft),
+        )?);
+    }
+    items.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(items)
+}
+
 pub fn apply_skill_assignments(
     store: &SkillStore,
     skill_ids: &[String],
@@ -480,6 +562,52 @@ pub fn apply_skill_assignments(
     replace_conflict_keys: &HashSet<AssignmentConflictKey>,
     additive: bool,
 ) -> Result<Vec<SkillAssignmentApplyOutcome>> {
+    apply_assignments_to_skills(
+        store,
+        skill_ids,
+        replace_conflict_keys,
+        |skill, replacements| {
+            apply_skill_assignment(store, &skill.id, draft, tools, replacements, additive)
+        },
+    )
+}
+
+pub fn apply_project_skill_assignments(
+    store: &SkillStore,
+    skill_ids: &[String],
+    project_id: &str,
+    requested_tools: &[String],
+    tools: &[AssignmentToolSpec],
+    replace_conflict_keys: &HashSet<AssignmentConflictKey>,
+    additive: bool,
+) -> Result<Vec<SkillAssignmentApplyOutcome>> {
+    apply_assignments_to_skills(
+        store,
+        skill_ids,
+        replace_conflict_keys,
+        |skill, replacements| {
+            apply_project_skill_assignment(
+                store,
+                skill,
+                project_id,
+                requested_tools,
+                tools,
+                replacements,
+                additive,
+            )
+        },
+    )
+}
+
+fn apply_assignments_to_skills<F>(
+    store: &SkillStore,
+    skill_ids: &[String],
+    replace_conflict_keys: &HashSet<AssignmentConflictKey>,
+    mut apply: F,
+) -> Result<Vec<SkillAssignmentApplyOutcome>>
+where
+    F: FnMut(&SkillRecord, &HashSet<String>) -> Result<AssignmentApplySummary>,
+{
     let mut outcomes = Vec::with_capacity(skill_ids.len());
     for skill_id in skill_ids {
         let skill = match require_skill(store, skill_id) {
@@ -488,11 +616,7 @@ pub fn apply_skill_assignments(
                 outcomes.push(SkillAssignmentApplyOutcome {
                     skill_id: skill_id.clone(),
                     skill_name: skill_id.clone(),
-                    summary: AssignmentApplySummary {
-                        failed: 1,
-                        errors: vec![format!("{err:#}")],
-                        ..AssignmentApplySummary::default()
-                    },
+                    summary: assignment_failure_summary(err),
                 });
                 continue;
             }
@@ -502,15 +626,7 @@ pub fn apply_skill_assignments(
             .filter(|key| key.skill_id == skill.id)
             .map(|key| key.target_key.clone())
             .collect::<HashSet<_>>();
-        let summary =
-            match apply_skill_assignment(store, &skill.id, draft, tools, &replacements, additive) {
-                Ok(summary) => summary,
-                Err(err) => AssignmentApplySummary {
-                    failed: 1,
-                    errors: vec![format!("{err:#}")],
-                    ..AssignmentApplySummary::default()
-                },
-            };
+        let summary = apply(&skill, &replacements).unwrap_or_else(assignment_failure_summary);
         outcomes.push(SkillAssignmentApplyOutcome {
             skill_id: skill.id,
             skill_name: skill.name,
@@ -518,6 +634,191 @@ pub fn apply_skill_assignments(
         });
     }
     Ok(outcomes)
+}
+
+fn assignment_failure_summary(err: anyhow::Error) -> AssignmentApplySummary {
+    AssignmentApplySummary {
+        failed: 1,
+        errors: vec![format!("{err:#}")],
+        ..AssignmentApplySummary::default()
+    }
+}
+
+fn blocking_preview_summary(preview: &[AssignmentPreviewItem]) -> Option<AssignmentApplySummary> {
+    let unavailable = preview
+        .iter()
+        .filter(|item| item.blocking && item.outcome == "unavailable")
+        .collect::<Vec<_>>();
+    if !unavailable.is_empty() {
+        return Some(AssignmentApplySummary {
+            failed: unavailable.len(),
+            errors: unavailable
+                .iter()
+                .map(|item| format!("{}: target is unavailable", item.tool))
+                .collect(),
+            ..AssignmentApplySummary::default()
+        });
+    }
+    let unsafe_removals = preview
+        .iter()
+        .filter(|item| item.blocking && item.outcome == "unsafe")
+        .collect::<Vec<_>>();
+    (!unsafe_removals.is_empty()).then(|| AssignmentApplySummary {
+        failed: unsafe_removals.len(),
+        errors: unsafe_removals
+            .iter()
+            .map(|item| format!("{}: target ownership could not be verified", item.tool))
+            .collect(),
+        ..AssignmentApplySummary::default()
+    })
+}
+
+fn skipped_preview_conflicts(
+    preview: &[AssignmentPreviewItem],
+    replace_conflicts: &HashSet<String>,
+    requested_keys: Option<&HashSet<String>>,
+) -> HashSet<String> {
+    preview
+        .iter()
+        .filter(|item| {
+            item.outcome == "conflict"
+                && !replace_conflicts.contains(&item.key)
+                && match requested_keys {
+                    Some(keys) => keys.contains(&item.key),
+                    None => true,
+                }
+        })
+        .map(|item| item.key.clone())
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_project_skill_assignment(
+    store: &SkillStore,
+    skill: &SkillRecord,
+    project_id: &str,
+    requested_tools: &[String],
+    tools: &[AssignmentToolSpec],
+    replace_conflicts: &HashSet<String>,
+    additive: bool,
+) -> Result<AssignmentApplySummary> {
+    let requested_tools = normalized_keys(requested_tools);
+    let existing = project_assignment_records(store, &skill.id, project_id)?;
+    let mut desired_tools = requested_tools.iter().cloned().collect::<BTreeSet<_>>();
+    if additive {
+        desired_tools.extend(existing.iter().map(|assignment| assignment.tool.clone()));
+    }
+    let desired_tools = desired_tools.into_iter().collect::<Vec<_>>();
+    let preview = preview_project_skill_assignment(
+        store,
+        skill,
+        project_id,
+        &requested_tools,
+        tools,
+        additive,
+    )?;
+    if let Some(blocked) = blocking_preview_summary(&preview) {
+        return Ok(blocked);
+    }
+    let skipped_conflicts = skipped_preview_conflicts(&preview, replace_conflicts, None);
+    if !skipped_conflicts.is_empty() {
+        return Ok(AssignmentApplySummary {
+            skipped: skipped_conflicts.len(),
+            ..AssignmentApplySummary::default()
+        });
+    }
+
+    let desired_set = desired_tools.iter().cloned().collect::<HashSet<_>>();
+    let removed_count = if additive {
+        0
+    } else {
+        existing
+            .iter()
+            .filter(|assignment| !desired_set.contains(&assignment.tool))
+            .count()
+    };
+    if !skill.enabled {
+        save_suspended_project_assignment(store, skill, project_id, &desired_tools)?;
+        if !additive {
+            remove_obsolete_project_assignment_records(store, &skill.id, project_id, &desired_set)?;
+        }
+        return Ok(AssignmentApplySummary {
+            succeeded: requested_tools.len() + removed_count,
+            ..AssignmentApplySummary::default()
+        });
+    }
+
+    let tool_specs = tools
+        .iter()
+        .filter(|tool| tool.supports_project_scope && !tool.project_skills_dir.is_empty())
+        .map(|tool| {
+            ProjectToolSpec::new(&tool.key, &tool.project_skills_dir)
+                .with_available(tool.global_available)
+        })
+        .collect::<Vec<_>>();
+    let overwrite_tools = requested_tools
+        .iter()
+        .filter(|tool| replace_conflicts.contains(&target_key("project", Some(project_id), tool)))
+        .cloned()
+        .collect::<HashSet<_>>();
+    let project_summary = if additive {
+        add_project_skill_tools_and_scan(
+            store,
+            project_id,
+            &skill.id,
+            &desired_tools,
+            &requested_tools,
+            &tool_specs,
+            &overwrite_tools,
+        )
+    } else {
+        assign_project_skill_tools_and_scan(
+            store,
+            project_id,
+            &skill.id,
+            &desired_tools,
+            &tool_specs,
+            &overwrite_tools,
+        )
+    };
+    let project_summary = match project_summary {
+        Ok(summary) => summary,
+        Err(err) => {
+            return Ok(AssignmentApplySummary {
+                failed: requested_tools.len().max(1),
+                errors: vec![format!("{err:#}")],
+                ..AssignmentApplySummary::default()
+            });
+        }
+    };
+    let applied_tools = if additive {
+        &requested_tools
+    } else {
+        &desired_tools
+    };
+    let mut summary = AssignmentApplySummary::default();
+    persist_project_outcomes(
+        store,
+        skill,
+        project_id,
+        applied_tools,
+        &project_summary,
+        &mut summary,
+    )?;
+    if summary.failed > 0 {
+        if let Err(err) = restore_project_assignment(store, skill, project_id, &existing, tools) {
+            summary
+                .errors
+                .push(format!("restore previous project assignment: {err:#}"));
+        }
+        summary.succeeded = 0;
+        return Ok(summary);
+    }
+    if !additive {
+        remove_obsolete_project_assignment_records(store, &skill.id, project_id, &desired_set)?;
+        summary.succeeded += removed_count;
+    }
+    Ok(summary)
 }
 
 pub fn apply_skill_assignment(
@@ -536,43 +837,16 @@ pub fn apply_skill_assignment(
     }
 
     let preview = preview_skill_assignment(store, skill_id, &normalized, tools, !additive)?;
-    let unavailable_replacements = preview
-        .iter()
-        .filter(|item| item.blocking && item.outcome == "unavailable")
-        .collect::<Vec<_>>();
-    if !additive && !unavailable_replacements.is_empty() {
-        return Ok(AssignmentApplySummary {
-            failed: unavailable_replacements.len(),
-            errors: unavailable_replacements
-                .iter()
-                .map(|item| format!("{}: target is unavailable", item.tool))
-                .collect(),
-            ..AssignmentApplySummary::default()
-        });
+    if !additive {
+        if let Some(blocked) = blocking_preview_summary(&preview) {
+            return Ok(blocked);
+        }
     }
-    let unsafe_removals = preview
-        .iter()
-        .filter(|item| item.blocking && item.outcome == "unsafe")
-        .collect::<Vec<_>>();
-    if !additive && !unsafe_removals.is_empty() {
-        return Ok(AssignmentApplySummary {
-            failed: unsafe_removals.len(),
-            errors: unsafe_removals
-                .iter()
-                .map(|item| format!("{}: target ownership could not be verified", item.tool))
-                .collect(),
-            ..AssignmentApplySummary::default()
-        });
-    }
-    let skipped_conflicts = preview
-        .iter()
-        .filter(|item| {
-            item.outcome == "conflict"
-                && !replace_conflicts.contains(&item.key)
-                && (!additive || requested_keys.contains(&item.key))
-        })
-        .map(|item| item.key.clone())
-        .collect::<HashSet<_>>();
+    let skipped_conflicts = skipped_preview_conflicts(
+        &preview,
+        replace_conflicts,
+        additive.then_some(&requested_keys),
+    );
     if !additive && !skipped_conflicts.is_empty() {
         return Ok(AssignmentApplySummary {
             skipped: skipped_conflicts.len(),
@@ -1790,6 +2064,78 @@ fn restore_existing_assignments(
             &tool_specs,
             &project.tool_keys.iter().cloned().collect(),
         )?;
+    }
+    for assignment in existing {
+        store.upsert_skill_assignment(assignment)?;
+    }
+    Ok(())
+}
+
+fn project_assignment_records(
+    store: &SkillStore,
+    skill_id: &str,
+    project_id: &str,
+) -> Result<Vec<SkillAssignmentRecord>> {
+    Ok(store
+        .list_skill_assignments(skill_id)?
+        .into_iter()
+        .filter(|assignment| {
+            assignment.scope == "project" && assignment.project_id.as_deref() == Some(project_id)
+        })
+        .collect())
+}
+
+fn remove_obsolete_project_assignment_records(
+    store: &SkillStore,
+    skill_id: &str,
+    project_id: &str,
+    desired_tools: &HashSet<String>,
+) -> Result<()> {
+    for assignment in project_assignment_records(store, skill_id, project_id)? {
+        if !desired_tools.contains(&assignment.tool) {
+            store.delete_skill_assignment(
+                skill_id,
+                &assignment.tool,
+                "project",
+                Some(project_id),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_project_assignment(
+    store: &SkillStore,
+    skill: &SkillRecord,
+    project_id: &str,
+    existing: &[SkillAssignmentRecord],
+    tools: &[AssignmentToolSpec],
+) -> Result<()> {
+    let desired_tools = existing
+        .iter()
+        .map(|assignment| assignment.tool.clone())
+        .collect::<Vec<_>>();
+    if !skill.enabled {
+        save_suspended_project_assignment(store, skill, project_id, &desired_tools)?;
+    } else {
+        let tool_specs = tools
+            .iter()
+            .filter(|tool| tool.supports_project_scope && !tool.project_skills_dir.is_empty())
+            .map(|tool| {
+                ProjectToolSpec::new(&tool.key, &tool.project_skills_dir).with_available(true)
+            })
+            .collect::<Vec<_>>();
+        assign_project_skill_tools_and_scan(
+            store,
+            project_id,
+            &skill.id,
+            &desired_tools,
+            &tool_specs,
+            &desired_tools.iter().cloned().collect(),
+        )?;
+    }
+    for assignment in project_assignment_records(store, &skill.id, project_id)? {
+        store.delete_skill_assignment(&skill.id, &assignment.tool, "project", Some(project_id))?;
     }
     for assignment in existing {
         store.upsert_skill_assignment(assignment)?;

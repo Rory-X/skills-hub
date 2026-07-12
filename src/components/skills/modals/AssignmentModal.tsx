@@ -26,8 +26,10 @@ import type {
   ToolInfoDto,
 } from '../types'
 import {
+  countVisibleAssignedProjects,
   getExpandedProjectsAfterToggle,
   getProjectToolsAfterToggle,
+  getVisibleAssignmentContextItems,
   getVisibleAssignmentProjects,
 } from '../assignmentModalState'
 import {
@@ -203,7 +205,7 @@ const AssignmentModal = ({
   const assignmentIssues = useMemo(
     () =>
       skills.flatMap((skill) =>
-        skill.assignments
+        getVisibleAssignmentContextItems(skill.assignments, contextProjectId)
           .filter(
             (assignment) =>
               assignment.state === 'error' &&
@@ -213,11 +215,14 @@ const AssignmentModal = ({
           )
           .map((assignment) => ({ skill, assignment })),
       ),
-    [skills],
+    [contextProjectId, skills],
   )
   const sourceIssues = useMemo(
-    () => skills.filter((skill) => Boolean(skill.source_issue)),
-    [skills],
+    () =>
+      contextProjectId
+        ? []
+        : skills.filter((skill) => Boolean(skill.source_issue)),
+    [contextProjectId, skills],
   )
   const existingIssueCount = assignmentIssues.length + sourceIssues.length
   const ignorableIssues = useMemo(
@@ -872,7 +877,7 @@ const AssignmentModal = ({
                     >
                       {t('assignment.retryAll')}
                     </button>
-                    {ignorableIssues.length > 0 ? (
+                    {!contextProjectId && ignorableIssues.length > 0 ? (
                       <button
                         className="btn btn-secondary assignment-ignore-all-btn"
                         type="button"
@@ -1040,7 +1045,7 @@ const AssignmentModal = ({
                   <FolderKanban size={17} />
                   <span>{t('assignment.projectsTitle')}</span>
                   <span className="assignment-count">
-                    {Object.values(projectTools).filter((keys) => keys.length > 0).length}
+                    {countVisibleAssignedProjects(projectTools, visibleProjects)}
                   </span>
                 </div>
                 {visibleProjects.length === 0 ? (

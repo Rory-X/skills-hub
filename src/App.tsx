@@ -40,10 +40,16 @@ import {
 } from './components/skills/discoveredImportResolution'
 import { getGitImportCustomName } from './components/skills/gitImportName'
 import {
+  getSkillListModeAfterImport,
+  matchesSkillListMode,
+  type SkillListMode,
+} from './components/skills/skillListMode'
+import {
   assignmentDraftForSkill,
   assignmentDraftReplacingProjectTools,
   emptyProjectAssignmentDraft,
 } from './components/skills/assignmentDraft'
+import { getVisibleAssignmentContextItems } from './components/skills/assignmentModalState'
 import { getAvailableProjectToolKeys } from './components/skills/toolAvailability'
 import { selectEntireLibrary } from './components/skills/bulkAssignmentWorkflow'
 import type {
@@ -146,6 +152,7 @@ function App() {
   const [searchQuery, setSearchQuery] = useState('')
   const [sortBy, setSortBy] = useState<'updated' | 'name'>('updated')
   const [scopeFilter, setScopeFilter] = useState<'all' | 'global' | 'project'>('all')
+  const [skillListMode, setSkillListMode] = useState<SkillListMode>('all')
   const [activeView, setActiveView] = useState<ActiveView>('projects')
   const [managementTab, setManagementTab] = useState<ManagementTab>('tags')
   const [detailSkill, setDetailSkill] = useState<ManagedSkill | null>(null)
@@ -344,8 +351,10 @@ function App() {
     try {
       const result = await invokeTauri<ManagedSkill[]>('get_managed_skills')
       setManagedSkills(result)
+      return result
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
+      return null
     }
   }, [invokeTauri])
 
@@ -610,6 +619,7 @@ function App() {
     const selectedTagSet = new Set(selectedTagIds)
     const hasTagFilter = selectedTagIds.length > 0 || includeUntagged
     const filtered = managedSkills.filter((skill) => {
+      if (!matchesSkillListMode(skill.pending_assignment, skillListMode)) return false
       if (scopeFilter !== 'all' && getSkillScope(skill) !== scopeFilter) return false
       if (hasTagFilter) {
         const matchesSelectedTag = skill.tags.some((tag) => selectedTagSet.has(tag.id))
@@ -635,11 +645,16 @@ function App() {
     getSkillScope,
     includeUntagged,
     managedSkills,
+    skillListMode,
     scopeFilter,
     searchQuery,
     selectedTagIds,
     sortBy,
   ])
+  const pendingAssignmentCount = useMemo(
+    () => managedSkills.filter((skill) => skill.pending_assignment).length,
+    [managedSkills],
+  )
   const untaggedCount = useMemo(
     () => managedSkills.filter((skill) => skill.tags.length === 0).length,
     [managedSkills],
@@ -2210,6 +2225,7 @@ function App() {
     setError(null)
     try {
       const collectedErrors: { title: string; message: string }[] = []
+      const importedSkillIds: string[] = []
       let successCount = 0
       for (const { group, decision } of importJobs) {
         const chosenPath = decision.variant?.path
@@ -2230,6 +2246,7 @@ function App() {
             conflictResolution: decision.conflictResolution ?? null,
           })
           highlightSkill(installResult.skill_id)
+          importedSkillIds.push(installResult.skill_id)
           successCount += 1
         } catch (err) {
           collectedErrors.push({
@@ -2294,7 +2311,18 @@ function App() {
 
       setActionMessage(t('status.importCompleted'))
       setActionMessage(null)
-      await loadManagedSkills()
+      const refreshedSkills = await loadManagedSkills()
+      const importedSkillIdSet = new Set(importedSkillIds)
+      if (
+        refreshedSkills?.some(
+          (skill) =>
+            importedSkillIdSet.has(skill.id) && skill.pending_assignment,
+        )
+      ) {
+        setSkillListMode((currentMode) =>
+          getSkillListModeAfterImport(currentMode, false),
+        )
+      }
       await loadPlan()
       if (collectedErrors.length > 0) {
         showActionErrors(collectedErrors)
@@ -2360,6 +2388,9 @@ function App() {
           : t('status.localSkillCreated')
         setActionMessage(successMessage)
         setSuccessToastMessage(successMessage)
+        setSkillListMode((currentMode) =>
+          getSkillListModeAfterImport(currentMode, Boolean(reimportSkill)),
+        )
         setActionMessage(null)
         setShowAddModal(false)
         setReimportSkill(null)
@@ -2574,6 +2605,9 @@ function App() {
         : t('status.gitSkillCreated')
       setActionMessage(successMessage)
       setSuccessToastMessage(successMessage)
+      setSkillListMode((currentMode) =>
+        getSkillListModeAfterImport(currentMode, Boolean(reimportSkill)),
+      )
       setActionMessage(null)
       setShowAddModal(false)
       setReimportSkill(null)
@@ -2727,6 +2761,9 @@ function App() {
       setLocalName('')
       setActionMessage(t('status.selectedSkillsInstalled'))
       setSuccessToastMessage(t('status.selectedSkillsInstalled'))
+      setSkillListMode((currentMode) =>
+        getSkillListModeAfterImport(currentMode, false),
+      )
       setActionMessage(null)
       setShowAddModal(false)
       await loadManagedSkills()
@@ -2829,6 +2866,9 @@ function App() {
       setGitName('')
       setActionMessage(t('status.selectedSkillsInstalled'))
       setSuccessToastMessage(t('status.selectedSkillsInstalled'))
+      setSkillListMode((currentMode) =>
+        getSkillListModeAfterImport(currentMode, false),
+      )
       setActionMessage(null)
       setShowGitPickModal(false)
       setGitCandidates([])
@@ -2960,6 +3000,10 @@ function App() {
       setLoadingStartAt(Date.now())
       setError(null)
       try {
+        const projectContextId =
+          activeView === 'projectDetail'
+            ? selectedProjectDetail?.project.id
+            : undefined
         if (
           projectBatchReplacesCurrentTools && selectedProjectDetail
         ) {
@@ -2979,17 +3023,30 @@ function App() {
                   projectToolKeys,
                 ),
                 additive: false,
+                projectId,
               },
             )
-            items.push(...preview.items)
+            items.push(
+              ...getVisibleAssignmentContextItems(preview.items, projectId),
+            )
           }
           return { items }
         }
-        return await invokeTauri<AssignmentPreviewDto>('preview_skill_assignments', {
-          skillIds: selectedSkills.map((skill) => skill.id),
-          draft,
-          additive: additiveOverride ?? assignmentModalAdditive,
-        })
+        const preview = await invokeTauri<AssignmentPreviewDto>(
+          'preview_skill_assignments',
+          {
+            skillIds: selectedSkills.map((skill) => skill.id),
+            draft,
+            additive: additiveOverride ?? assignmentModalAdditive,
+            projectId: projectContextId,
+          },
+        )
+        return {
+          items: getVisibleAssignmentContextItems(
+            preview.items,
+            projectContextId,
+          ),
+        }
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err))
         return null
@@ -2999,6 +3056,7 @@ function App() {
       }
     },
     [
+      activeView,
       assignmentModalAdditive,
       assignmentModalSkills,
       invokeTauri,
@@ -3024,6 +3082,10 @@ function App() {
       setError(null)
       setActionMessage(t('assignment.applying'))
       try {
+        const projectContextId =
+          activeView === 'projectDetail'
+            ? selectedProjectDetail?.project.id
+            : undefined
         let result: AssignmentApplyResultDto
         if (
           projectBatchReplacesCurrentTools && selectedProjectDetail
@@ -3045,6 +3107,7 @@ function App() {
                 ),
                 replaceConflictKeys,
                 additive: false,
+                projectId,
               },
             )
             results.push(...applied.skills)
@@ -3063,6 +3126,7 @@ function App() {
               draft,
               replaceConflictKeys,
               additive: additiveOverride ?? assignmentModalAdditive,
+              projectId: projectContextId,
             },
           )
         }
@@ -3111,6 +3175,7 @@ function App() {
       }
     },
     [
+      activeView,
       assignmentModalSkills,
       assignmentModalAdditive,
       invokeTauri,
@@ -3302,6 +3367,9 @@ function App() {
         ) : activeView === 'myskills' ? (
           <div className="dashboard-stack">
             <FilterBar
+              listMode={skillListMode}
+              allCount={managedSkills.length}
+              pendingCount={pendingAssignmentCount}
               sortBy={sortBy}
               searchQuery={searchQuery}
               scopeFilter={scopeFilter}
@@ -3312,6 +3380,7 @@ function App() {
               bulkMode={bulkMode}
               bulkSelectedCount={bulkSelectedIds.length}
               onSortChange={handleSortChange}
+              onListModeChange={setSkillListMode}
               onSearchChange={handleSearchChange}
               onScopeFilterChange={handleScopeFilterChange}
               onToggleTag={handleToggleTagFilter}

@@ -5,9 +5,11 @@ use tauri::State;
 use std::sync::Arc;
 
 use crate::core::assignments::{
+    apply_project_skill_assignments as apply_project_skill_assignments_core,
     apply_skill_assignments as apply_skill_assignments_core,
     ignore_all_assignment_issues as ignore_all_assignment_issues_core,
     ignore_assignment_issue as ignore_assignment_issue_core, managed_skill_projections,
+    preview_project_skill_assignments as preview_project_skill_assignments_core,
     preview_skill_assignments as preview_skill_assignments_core,
     resume_skill_assignment as resume_skill_assignment_core, AssignmentConflictKey,
     AssignmentDraft, AssignmentProjection, AssignmentToolSpec, ProjectAssignmentDraft,
@@ -1426,6 +1428,21 @@ fn assignment_tool_specs(store: &SkillStore) -> anyhow::Result<Vec<AssignmentToo
         .collect())
 }
 
+fn assignment_project_scope(
+    draft: &AssignmentDraftDto,
+    project_id: Option<String>,
+) -> Option<(String, Vec<String>)> {
+    project_id.map(|project_id| {
+        let tool_keys = draft
+            .projects
+            .iter()
+            .find(|project| project.project_id == project_id)
+            .map(|project| project.tool_keys.clone())
+            .unwrap_or_default();
+        (project_id, tool_keys)
+    })
+}
+
 #[tauri::command]
 #[allow(non_snake_case)]
 pub async fn preview_skill_assignments(
@@ -1433,19 +1450,28 @@ pub async fn preview_skill_assignments(
     skillIds: Vec<String>,
     draft: AssignmentDraftDto,
     additive: Option<bool>,
+    projectId: Option<String>,
 ) -> Result<AssignmentPreviewDto, String> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let tools = assignment_tool_specs(&store)?;
+        let project_scope = assignment_project_scope(&draft, projectId);
         let draft: AssignmentDraft = draft.into();
         let mut items = Vec::new();
-        for preview in preview_skill_assignments_core(
-            &store,
-            &skillIds,
-            &draft,
-            &tools,
-            additive.unwrap_or(false),
-        )? {
+        let additive = additive.unwrap_or(false);
+        let previews = if let Some((project_id, tool_keys)) = project_scope {
+            preview_project_skill_assignments_core(
+                &store,
+                &skillIds,
+                &project_id,
+                &tool_keys,
+                &tools,
+                additive,
+            )?
+        } else {
+            preview_skill_assignments_core(&store, &skillIds, &draft, &tools, additive)?
+        };
+        for preview in previews {
             items.extend(
                 preview
                     .items
@@ -1479,23 +1505,38 @@ pub async fn apply_skill_assignments(
     draft: AssignmentDraftDto,
     replaceConflictKeys: Vec<String>,
     additive: Option<bool>,
+    projectId: Option<String>,
 ) -> Result<AssignmentApplyResultDto, String> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let tools = assignment_tool_specs(&store)?;
+        let project_scope = assignment_project_scope(&draft, projectId);
         let draft: AssignmentDraft = draft.into();
         let replacements = replaceConflictKeys
             .into_iter()
             .map(|key| AssignmentConflictKey::decode(&key))
             .collect::<anyhow::Result<std::collections::HashSet<_>>>()?;
-        let results = apply_skill_assignments_core(
-            &store,
-            &skillIds,
-            &draft,
-            &tools,
-            &replacements,
-            additive.unwrap_or(false),
-        )?
+        let additive = additive.unwrap_or(false);
+        let results = if let Some((project_id, tool_keys)) = project_scope {
+            apply_project_skill_assignments_core(
+                &store,
+                &skillIds,
+                &project_id,
+                &tool_keys,
+                &tools,
+                &replacements,
+                additive,
+            )?
+        } else {
+            apply_skill_assignments_core(
+                &store,
+                &skillIds,
+                &draft,
+                &tools,
+                &replacements,
+                additive,
+            )?
+        }
         .into_iter()
         .map(|outcome| SkillAssignmentApplyResultDto {
             skill_id: outcome.skill_id,

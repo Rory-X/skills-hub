@@ -4,9 +4,10 @@ use std::path::Path;
 use crate::core::skill_store::{ProjectRecord, SkillAssignmentRecord, SkillRecord, SkillStore};
 
 use super::{
-    apply_skill_assignment, apply_skill_assignments, ignore_assignment_issue,
-    managed_skill_projections, preview_skill_assignment, project_skill_assignments,
-    AssignmentConflictKey, AssignmentDraft, AssignmentToolSpec, ProjectAssignmentDraft,
+    apply_project_skill_assignments, apply_skill_assignment, apply_skill_assignments,
+    ignore_assignment_issue, managed_skill_projections, preview_project_skill_assignments,
+    preview_skill_assignment, project_skill_assignments, AssignmentConflictKey, AssignmentDraft,
+    AssignmentToolSpec, ProjectAssignmentDraft,
 };
 
 #[test]
@@ -339,6 +340,149 @@ fn failed_project_replacement_keeps_the_existing_project_assignment() {
         .iter()
         .any(|assignment| { assignment.scope == "project" && assignment.tool == "codex" }));
     assert!(project_dir.path().join(".agents/skills/review").exists());
+}
+
+#[test]
+fn project_scoped_changes_do_not_process_other_assignments() {
+    let (_db, store) = make_store();
+    let central = tempfile::tempdir().expect("central");
+    write_skill(central.path(), "library");
+    let skill = add_skill(&store, central.path());
+    let project_one_dir = tempfile::tempdir().expect("project one");
+    let project_two_dir = tempfile::tempdir().expect("project two");
+    for (id, root) in [
+        ("project-1", project_one_dir.path()),
+        ("project-2", project_two_dir.path()),
+    ] {
+        store
+            .insert_project(&ProjectRecord {
+                id: id.to_string(),
+                name: id.to_string(),
+                root_path: root.to_string_lossy().to_string(),
+                enabled_tool_keys: vec![
+                    "codex".to_string(),
+                    "cursor".to_string(),
+                    "legacy".to_string(),
+                ],
+                local_git_exclude_enabled: false,
+                created_at: 1,
+                updated_at: 1,
+                last_scanned_at: None,
+            })
+            .expect("insert project");
+    }
+    let codex_global = tempfile::tempdir().expect("codex global");
+    let cursor_global = tempfile::tempdir().expect("cursor global");
+    let legacy_global = tempfile::tempdir().expect("legacy global");
+    let codex = tool(codex_global.path());
+    let mut cursor = tool(cursor_global.path());
+    cursor.key = "cursor".to_string();
+    cursor.label = "Cursor".to_string();
+    cursor.project_skills_dir = ".cursor/skills".to_string();
+    let mut legacy = tool(legacy_global.path());
+    legacy.key = "legacy".to_string();
+    legacy.label = "Legacy".to_string();
+    legacy.project_skills_dir = ".legacy/skills".to_string();
+    let tools = [codex, cursor, legacy];
+
+    apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft {
+            global_tools: vec!["legacy".to_string()],
+            projects: vec![
+                ProjectAssignmentDraft {
+                    project_id: "project-1".to_string(),
+                    tool_keys: vec!["codex".to_string()],
+                },
+                ProjectAssignmentDraft {
+                    project_id: "project-2".to_string(),
+                    tool_keys: vec!["legacy".to_string()],
+                },
+            ],
+        },
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("apply initial assignments");
+
+    let mut scoped_tools = tools.clone();
+    scoped_tools[2].global_available = false;
+    let previews = preview_project_skill_assignments(
+        &store,
+        std::slice::from_ref(&skill.id),
+        "project-1",
+        &["cursor".to_string()],
+        &scoped_tools,
+        false,
+    )
+    .expect("preview scoped replacement");
+    assert!(previews[0]
+        .items
+        .iter()
+        .all(|item| item.project_id.as_deref() == Some("project-1")));
+
+    let outcomes = apply_project_skill_assignments(
+        &store,
+        std::slice::from_ref(&skill.id),
+        "project-1",
+        &["cursor".to_string()],
+        &scoped_tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("apply scoped replacement");
+    assert_eq!(outcomes[0].summary.failed, 0);
+
+    let assignments = store.list_skill_assignments(&skill.id).unwrap();
+    assert!(assignments
+        .iter()
+        .any(|assignment| { assignment.scope == "global" && assignment.tool == "legacy" }));
+    assert!(assignments.iter().any(|assignment| {
+        assignment.project_id.as_deref() == Some("project-2") && assignment.tool == "legacy"
+    }));
+    assert!(assignments.iter().any(|assignment| {
+        assignment.project_id.as_deref() == Some("project-1") && assignment.tool == "cursor"
+    }));
+    assert!(legacy_global.path().join("review").exists());
+    assert!(project_two_dir
+        .path()
+        .join(".legacy/skills/review")
+        .exists());
+    assert!(!project_one_dir
+        .path()
+        .join(".agents/skills/review")
+        .exists());
+    assert!(project_one_dir
+        .path()
+        .join(".cursor/skills/review")
+        .exists());
+
+    let added = apply_project_skill_assignments(
+        &store,
+        std::slice::from_ref(&skill.id),
+        "project-1",
+        &["codex".to_string()],
+        &scoped_tools,
+        &HashSet::new(),
+        true,
+    )
+    .expect("add scoped assignment");
+    assert_eq!(added[0].summary.failed, 0);
+    let assignments = store.list_skill_assignments(&skill.id).unwrap();
+    assert!(assignments.iter().any(|assignment| {
+        assignment.project_id.as_deref() == Some("project-1") && assignment.tool == "cursor"
+    }));
+    assert!(assignments.iter().any(|assignment| {
+        assignment.project_id.as_deref() == Some("project-1") && assignment.tool == "codex"
+    }));
+    assert!(assignments
+        .iter()
+        .any(|assignment| { assignment.scope == "global" && assignment.tool == "legacy" }));
+    assert!(assignments.iter().any(|assignment| {
+        assignment.project_id.as_deref() == Some("project-2") && assignment.tool == "legacy"
+    }));
 }
 
 #[test]

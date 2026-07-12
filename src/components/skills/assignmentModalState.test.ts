@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  countVisibleAssignedProjects,
   getExpandedProjectsAfterToggle,
   getProjectToolsAfterToggle,
+  getVisibleAssignmentContextItems,
   getVisibleAssignmentProjects,
 } from './assignmentModalState'
 
@@ -29,5 +31,26 @@ describe('assignment modal project context', () => {
   it('shows every project outside project detail context', () => {
     const projects = [{ id: 'project-1' }, { id: 'project-2' }]
     expect(getVisibleAssignmentProjects(projects)).toEqual(projects)
+  })
+
+  it('shows only current-project assignment issues in project detail context', () => {
+    const assignments = [
+      { scope: 'global', project_id: null, tool: 'codex' },
+      { scope: 'project', project_id: 'project-1', tool: 'cursor' },
+      { scope: 'project', project_id: 'project-2', tool: 'claude_code' },
+    ]
+    expect(getVisibleAssignmentContextItems(assignments, 'project-1')).toEqual([
+      { scope: 'project', project_id: 'project-1', tool: 'cursor' },
+    ])
+    expect(getVisibleAssignmentContextItems(assignments)).toEqual(assignments)
+  })
+
+  it('counts assigned projects only inside the visible context', () => {
+    expect(
+      countVisibleAssignedProjects(
+        { 'project-1': ['codex'], 'project-2': ['cursor'] },
+        [{ id: 'project-1' }],
+      ),
+    ).toBe(1)
   })
 })

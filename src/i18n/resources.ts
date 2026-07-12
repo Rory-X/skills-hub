@@ -244,6 +244,7 @@ export const resources = {
         projectBatchReplace:
           'Set the selected Skills to the same Agents in this project. Other projects and global assignments are preserved.',
         selectAtLeastOneProjectAgent: 'Select at least one project Agent.',
+        pendingTab: 'Unassigned',
         open: 'Assignments',
         summary: '{{global}} global / {{projects}} projects',
         globalTitle: 'Global agents',
@@ -1149,6 +1150,7 @@ export const resources = {
         projectBatchReplace:
           '将所选 Skills 在当前项目中统一设置为相同 Agent；全局及其他项目分配保持不变。',
         selectAtLeastOneProjectAgent: '请至少选择一个项目 Agent。',
+        pendingTab: '待分配',
         open: '分配配置',
         summary: '全局 {{global}} / 项目 {{projects}}',
         globalTitle: '全局 Agent',
