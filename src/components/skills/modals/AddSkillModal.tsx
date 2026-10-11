@@ -1,14 +1,7 @@
-import { memo, type SetStateAction } from 'react'
+import { memo } from 'react'
 import { Check } from 'lucide-react'
 import type { TFunction } from 'i18next'
-import ScopeSelector from '../ScopeSelector'
-import {
-  getUnsupportedToolsForScope,
-  isToolUnsupportedForScope,
-  normalizeProjectPaths,
-  type InstallScope,
-} from '../installScope'
-import type { TagWithCountDto, ToolOption, ToolStatusDto } from '../types'
+import type { TagWithCountDto } from '../types'
 
 type AddSkillModalProps = {
   open: boolean
@@ -21,12 +14,7 @@ type AddSkillModalProps = {
   gitName: string
   tags: TagWithCountDto[]
   selectedTagIds: number[]
-  syncTargets: Record<string, boolean>
-  installedTools: ToolOption[]
-  toolStatus: ToolStatusDto | null
-  installScope: InstallScope
-  installProjects: string[]
-  recentProjects: string[]
+  reimportSkillName?: string | null
   onRequestClose: () => void
   onTabChange: (tab: 'local' | 'git') => void
   onLocalPathChange: (value: string) => void
@@ -35,10 +23,6 @@ type AddSkillModalProps = {
   onGitUrlChange: (value: string) => void
   onGitNameChange: (value: string) => void
   onToggleTag: (tagId: number) => void
-  onSyncTargetChange: (toolId: string, checked: boolean) => void
-  onInstallScopeChange: (scope: InstallScope) => void
-  onInstallProjectsChange: (projects: SetStateAction<string[]>) => void
-  onPickProject: () => Promise<string | undefined>
   onSubmit: () => void
   t: TFunction
 }
@@ -54,12 +38,7 @@ const AddSkillModal = ({
   gitName,
   tags,
   selectedTagIds,
-  syncTargets,
-  installedTools,
-  toolStatus,
-  installScope,
-  installProjects,
-  recentProjects,
+  reimportSkillName,
   onRequestClose,
   onTabChange,
   onLocalPathChange,
@@ -68,22 +47,10 @@ const AddSkillModal = ({
   onGitUrlChange,
   onGitNameChange,
   onToggleTag,
-  onSyncTargetChange,
-  onInstallScopeChange,
-  onInstallProjectsChange,
-  onPickProject,
   onSubmit,
   t,
 }: AddSkillModalProps) => {
   if (!open) return null
-
-  const projectRequired =
-    installScope === 'project' &&
-    normalizeProjectPaths(installProjects).length === 0
-  const unsupportedTools = getUnsupportedToolsForScope(
-    installedTools,
-    installScope,
-  )
 
   return (
     <div
@@ -92,7 +59,11 @@ const AddSkillModal = ({
     >
       <div className="modal add-skill-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
-          <div className="modal-title">{t('addSkillTitle')}</div>
+          <div className="modal-title">
+            {reimportSkillName
+              ? t('assignment.reimportTitle', { name: reimportSkillName })
+              : t('addSkillTitle')}
+          </div>
           <button
             className="modal-close"
             type="button"
@@ -143,15 +114,17 @@ const AddSkillModal = ({
                     </button>
                   </div>
                 </div>
-                <div className="form-field">
-                  <label className="label">{t('optionalNamePlaceholder')}</label>
-                  <input
-                    className="input"
-                    placeholder={t('optionalNamePlaceholder')}
-                    value={localName}
-                    onChange={(event) => onLocalNameChange(event.target.value)}
-                  />
-                </div>
+                {!reimportSkillName ? (
+                  <div className="form-field">
+                    <label className="label">{t('optionalNamePlaceholder')}</label>
+                    <input
+                      className="input"
+                      placeholder={t('optionalNamePlaceholder')}
+                      value={localName}
+                      onChange={(event) => onLocalNameChange(event.target.value)}
+                    />
+                  </div>
+                ) : null}
               </div>
             </>
           ) : (
@@ -166,111 +139,49 @@ const AddSkillModal = ({
                     onChange={(event) => onGitUrlChange(event.target.value)}
                   />
                 </div>
-                <div className="form-field">
-                  <label className="label">{t('optionalNamePlaceholder')}</label>
-                  <input
-                    className="input"
-                    placeholder={t('optionalNamePlaceholder')}
-                    value={gitName}
-                    onChange={(event) => onGitNameChange(event.target.value)}
-                  />
-                </div>
+                {!reimportSkillName ? (
+                  <div className="form-field">
+                    <label className="label">{t('optionalNamePlaceholder')}</label>
+                    <input
+                      className="input"
+                      placeholder={t('optionalNamePlaceholder')}
+                      value={gitName}
+                      onChange={(event) => onGitNameChange(event.target.value)}
+                    />
+                  </div>
+                ) : null}
               </div>
             </>
           )}
 
-          <div className="form-group tag-field-inline">
-            <label className="label">{t('addTags')}</label>
-            {tags.length > 0 ? (
-              <div className="add-tags-list">
-                {tags.map((tag) => {
-                  const selected = selectedTagIds.includes(tag.id)
-                  return (
-                    <button
-                      key={tag.id}
-                      className={`add-tag-pill${selected ? ' selected' : ''}`}
-                      type="button"
-                      onClick={() => onToggleTag(tag.id)}
-                    >
-                      <span className="add-tag-check">
-                        {selected ? <Check size={12} /> : null}
-                      </span>
-                      <span>#{tag.name}</span>
-                    </button>
-                  )
-                })}
-              </div>
-            ) : (
-              <div className="helper-text">{t('noTagsYet')}</div>
-            )}
-          </div>
+          {!reimportSkillName ? (
+            <div className="form-group tag-field-inline">
+              <label className="label">{t('addTags')}</label>
+              {tags.length > 0 ? (
+                <div className="add-tags-list">
+                  {tags.map((tag) => {
+                    const selected = selectedTagIds.includes(tag.id)
+                    return (
+                      <button
+                        key={tag.id}
+                        className={`add-tag-pill${selected ? ' selected' : ''}`}
+                        type="button"
+                        onClick={() => onToggleTag(tag.id)}
+                      >
+                        <span className="add-tag-check">
+                          {selected ? <Check size={12} /> : null}
+                        </span>
+                        <span>#{tag.name}</span>
+                      </button>
+                    )
+                  })}
+                </div>
+              ) : (
+                <div className="helper-text">{t('noTagsYet')}</div>
+              )}
+            </div>
+          ) : null}
 
-          <div className="form-group">
-            <ScopeSelector
-              scope={installScope}
-              projects={installProjects}
-              recentProjects={recentProjects}
-              disabled={loading}
-              compact
-              title={t('installScope.title')}
-              onScopeChange={onInstallScopeChange}
-              onProjectsChange={onInstallProjectsChange}
-              onPickProject={onPickProject}
-              t={t}
-            />
-          </div>
-
-          <div className="form-group">
-            <label className="label">{t('installToTools')}</label>
-            {toolStatus ? (
-              <div className="tool-matrix">
-                {installedTools.map((tool) => {
-                  const unsupported = isToolUnsupportedForScope(
-                    tool,
-                    installScope,
-                  )
-
-                  return (
-                    <label
-                      key={tool.id}
-                      className={`tool-pill-toggle${
-                        syncTargets[tool.id] ? ' active' : ''
-                      }${unsupported ? ' disabled' : ''}`}
-                      title={
-                        unsupported
-                          ? t('installScope.unsupportedTool', {
-                              tool: tool.label,
-                            })
-                          : undefined
-                      }
-                    >
-                      <input
-                        type="checkbox"
-                        checked={Boolean(syncTargets[tool.id])}
-                        onChange={(event) =>
-                          onSyncTargetChange(tool.id, event.target.checked)
-                        }
-                        disabled={unsupported}
-                      />
-                      {syncTargets[tool.id] ? (
-                        <span className="status-badge" />
-                      ) : null}
-                      {tool.label}
-                    </label>
-                  )
-                })}
-              </div>
-            ) : (
-              <div className="helper-text">{t('detectingTools')}</div>
-            )}
-            {unsupportedTools.length > 0 ? (
-              <div className="helper-text" role="status">
-                {t('installScope.unsupportedSelectedHint', {
-                  tools: unsupportedTools.map((tool) => tool.label).join(', '),
-                })}
-              </div>
-            ) : null}
-          </div>
         </div>
         <div className="modal-footer">
           <button
@@ -283,9 +194,13 @@ const AddSkillModal = ({
           <button
             className="btn btn-primary"
             onClick={onSubmit}
-            disabled={loading || projectRequired}
+            disabled={loading}
           >
-            {addModalTab === 'local' ? t('create') : t('install')}
+            {reimportSkillName
+              ? t('assignment.reimport')
+              : addModalTab === 'local'
+                ? t('create')
+                : t('install')}
           </button>
         </div>
       </div>

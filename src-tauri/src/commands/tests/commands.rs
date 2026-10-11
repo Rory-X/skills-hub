@@ -1,5 +1,6 @@
 use super::*;
-use crate::core::skill_store::SkillRecord;
+use crate::core::projects::{can_ignore_project_issue, project_issue_fingerprint};
+use crate::core::skill_store::{SkillAssignmentRecord, SkillRecord, SkillTargetRecord};
 
 fn make_store() -> (tempfile::TempDir, SkillStore) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -12,6 +13,9 @@ fn make_store() -> (tempfile::TempDir, SkillStore) {
 fn format_anyhow_error_passthrough_prefixes() {
     let err = anyhow::anyhow!("MULTI_SKILLS|abc");
     assert_eq!(format_anyhow_error(err), "MULTI_SKILLS|abc");
+
+    let err = anyhow::anyhow!("HUB_NAME_CONFLICT|skill-id");
+    assert_eq!(format_anyhow_error(err), "HUB_NAME_CONFLICT|skill-id");
 }
 
 #[test]
@@ -92,11 +96,34 @@ fn saving_custom_tool_config_creates_enabled_skills_dir() {
 }
 
 #[test]
-fn normalize_scope_defaults_to_global_and_rejects_unknown() {
-    assert_eq!(normalize_scope(None).unwrap(), "global");
-    assert_eq!(normalize_scope(Some("global")).unwrap(), "global");
-    assert_eq!(normalize_scope(Some("project")).unwrap(), "project");
-    assert!(normalize_scope(Some("workspace")).is_err());
+fn project_runtime_mapping_exposes_installation_and_defaults_to_installed_tools() {
+    let tools = vec![
+        RuntimeTool {
+            key: "codex".to_string(),
+            label: "Codex".to_string(),
+            installed: true,
+            enabled: true,
+            is_custom: false,
+            skills_dir: "/tmp/codex".into(),
+            project_skills_dir: ".agents/skills".to_string(),
+            supports_project_scope: true,
+        },
+        RuntimeTool {
+            key: "cursor".to_string(),
+            label: "Cursor".to_string(),
+            installed: false,
+            enabled: true,
+            is_custom: false,
+            skills_dir: "/tmp/cursor".into(),
+            project_skills_dir: ".cursor/skills".to_string(),
+            supports_project_scope: true,
+        },
+    ];
+
+    assert_eq!(default_project_tool_keys(&tools), vec!["codex"]);
+    let specs = project_specs_from_runtime(&tools);
+    assert!(specs[0].available);
+    assert!(!specs[1].available);
 }
 
 #[test]
@@ -176,7 +203,7 @@ fn remove_path_any_removes_symlink_only() {
 }
 
 #[test]
-fn get_managed_skills_impl_maps_targets() {
+fn get_managed_skills_impl_maps_targets_and_rejects_stale_assignment_state() {
     let (_dir, store) = make_store();
     let skill = SkillRecord {
         id: "s1".to_string(),
@@ -210,6 +237,20 @@ fn get_managed_skills_impl_maps_targets() {
         synced_at: None,
     };
     store.upsert_skill_target(&target).unwrap();
+    store
+        .upsert_skill_assignment(&SkillAssignmentRecord {
+            id: "a1".to_string(),
+            skill_id: "s1".to_string(),
+            tool: "cursor".to_string(),
+            scope: "global".to_string(),
+            project_id: None,
+            ownership: "hub".to_string(),
+            state: "active".to_string(),
+            last_error: None,
+            created_at: 1,
+            updated_at: 2,
+        })
+        .unwrap();
     let tag = store.create_tag("Frontend").unwrap();
     store.set_skill_tags("s1", &[tag.id]).unwrap();
 
@@ -222,4 +263,89 @@ fn get_managed_skills_impl_maps_targets() {
     assert_eq!(out[0].targets[0].tool, "cursor");
     assert_eq!(out[0].targets[0].scope, "global");
     assert!(out[0].targets[0].project_path.is_none());
+    assert!(out[0].pending_assignment);
+    assert_eq!(out[0].assignment_issue_count, 1);
+    assert_eq!(out[0].assignments.len(), 1);
+}
+
+#[test]
+fn managed_skill_without_active_or_suspended_assignment_is_pending() {
+    let (_dir, store) = make_store();
+    let skill = SkillRecord {
+        id: "pending".to_string(),
+        name: "Pending".to_string(),
+        description: None,
+        source_type: "local".to_string(),
+        source_ref: None,
+        source_subpath: None,
+        source_revision: None,
+        central_path: "/tmp/pending".to_string(),
+        content_hash: None,
+        created_at: 1,
+        updated_at: 1,
+        last_sync_at: None,
+        last_seen_at: 1,
+        enabled: true,
+        status: "ok".to_string(),
+    };
+    store.upsert_skill(&skill).unwrap();
+    store
+        .upsert_skill_assignment(&SkillAssignmentRecord {
+            id: "error".to_string(),
+            skill_id: skill.id.clone(),
+            tool: "codex".to_string(),
+            scope: "global".to_string(),
+            project_id: None,
+            ownership: "hub".to_string(),
+            state: "error".to_string(),
+            last_error: Some("failed".to_string()),
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+
+    let out = get_managed_skills_impl(&store).unwrap();
+    assert!(out[0].pending_assignment);
+    assert_eq!(out[0].assignment_issue_count, 1);
+}
+
+#[test]
+fn project_issue_ignore_rules_keep_blockers_visible_and_fingerprint_content() {
+    let (_dir, store) = make_store();
+    let project_dir = tempfile::tempdir().unwrap();
+    let project = ProjectRecord {
+        id: "project-1".to_string(),
+        name: "Project".to_string(),
+        root_path: project_dir.path().to_string_lossy().to_string(),
+        enabled_tool_keys: vec!["codex".to_string()],
+        local_git_exclude_enabled: false,
+        created_at: 1,
+        updated_at: 1,
+        last_scanned_at: None,
+    };
+    store.insert_project(&project).unwrap();
+    let issue_path = project_dir.path().join(".agents/skills/review");
+    std::fs::create_dir_all(&issue_path).unwrap();
+    std::fs::write(issue_path.join("SKILL.md"), "one").unwrap();
+    let issue = ProjectIssue {
+        id: "git_exclude_drift".to_string(),
+        kind: "git_exclude_drift".to_string(),
+        skill_id: None,
+        skill_name: Some("review".to_string()),
+        tool_key: Some("codex".to_string()),
+        path: Some(issue_path.to_string_lossy().to_string()),
+        actions: Vec::new(),
+    };
+
+    assert!(can_ignore_project_issue(&store, &project, &issue).unwrap());
+    let first = project_issue_fingerprint(&store, &project, &issue).unwrap();
+    std::fs::write(issue_path.join("SKILL.md"), "two").unwrap();
+    let second = project_issue_fingerprint(&store, &project, &issue).unwrap();
+    assert_ne!(first, second);
+
+    let blocker = ProjectIssue {
+        kind: "same_name_content_conflict".to_string(),
+        ..issue
+    };
+    assert!(!can_ignore_project_issue(&store, &project, &blocker).unwrap());
 }

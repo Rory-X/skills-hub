@@ -1,7 +1,7 @@
 use super::{
     record_auto_update_progress, record_auto_update_progress_snapshot, record_auto_update_result,
-    record_auto_update_started, record_auto_update_triggered, AutoUpdateProgressSnapshot,
-    AutoUpdateRunResult, AutoUpdateSkillProgress,
+    record_auto_update_retry_result, record_auto_update_started, record_auto_update_triggered,
+    AutoUpdateProgressSnapshot, AutoUpdateRunResult, AutoUpdateSkillProgress,
 };
 use crate::core::auto_update::{
     get_auto_update_config, is_auto_update_due, set_auto_update_config, AutoUpdateConfig,
@@ -357,6 +357,111 @@ fn started_and_finished_times_are_recorded_separately() {
     assert!(finished.last_started_at.is_some());
     assert!(finished.last_finished_at.is_some());
     assert!(finished.last_finished_at >= finished.last_started_at);
+}
+
+#[test]
+fn successful_retry_removes_persisted_failure_before_the_next_poll() {
+    let (_dir, store) = make_store();
+    let failed_skill = AutoUpdateSkillProgress {
+        skill_id: "langfuse".to_string(),
+        name: "langfuse".to_string(),
+        reason: Some("source path not found".to_string()),
+    };
+    record_auto_update_result(
+        &store,
+        &AutoUpdateRunResult {
+            checked: 2,
+            updated: 1,
+            failed: 1,
+            errors: vec!["langfuse: source path not found".to_string()],
+            progress: AutoUpdateProgressSnapshot {
+                total: 2,
+                succeeded: vec![AutoUpdateSkillProgress {
+                    skill_id: "working".to_string(),
+                    name: "working".to_string(),
+                    reason: None,
+                }],
+                failed: vec![failed_skill],
+                running: None,
+                pending: Vec::new(),
+            },
+        },
+    )
+    .unwrap();
+
+    record_auto_update_retry_result(
+        &store,
+        &["langfuse".to_string()],
+        vec![AutoUpdateSkillProgress {
+            skill_id: "langfuse".to_string(),
+            name: "langfuse".to_string(),
+            reason: None,
+        }],
+        Vec::new(),
+    )
+    .unwrap();
+
+    let polled = get_auto_update_config(&store).unwrap();
+    assert_eq!(polled.last_status.as_deref(), Some("ok"));
+    assert_eq!(polled.last_updated, 2);
+    assert_eq!(polled.last_failed, 0);
+    assert_eq!(polled.last_error.as_deref(), Some(""));
+    assert!(polled.progress.failed.is_empty());
+    assert!(polled
+        .progress
+        .succeeded
+        .iter()
+        .any(|item| item.skill_id == "langfuse"));
+}
+
+#[test]
+fn retry_preserves_failures_that_were_not_retried() {
+    let (_dir, store) = make_store();
+    let failed = |skill_id: &str| AutoUpdateSkillProgress {
+        skill_id: skill_id.to_string(),
+        name: skill_id.to_string(),
+        reason: Some("source path not found".to_string()),
+    };
+    record_auto_update_result(
+        &store,
+        &AutoUpdateRunResult {
+            checked: 2,
+            updated: 0,
+            failed: 2,
+            errors: vec![
+                "langfuse: source path not found".to_string(),
+                "other: source path not found".to_string(),
+            ],
+            progress: AutoUpdateProgressSnapshot {
+                total: 2,
+                failed: vec![failed("langfuse"), failed("other")],
+                ..AutoUpdateProgressSnapshot::default()
+            },
+        },
+    )
+    .unwrap();
+
+    let updated = record_auto_update_retry_result(
+        &store,
+        &["langfuse".to_string()],
+        vec![AutoUpdateSkillProgress {
+            skill_id: "langfuse".to_string(),
+            name: "langfuse".to_string(),
+            reason: None,
+        }],
+        Vec::new(),
+    )
+    .unwrap();
+
+    assert_eq!(updated.last_status.as_deref(), Some("error"));
+    assert_eq!(updated.last_updated, 1);
+    assert_eq!(updated.last_failed, 1);
+    assert_eq!(updated.progress.failed[0].skill_id, "other");
+    assert!(updated
+        .progress
+        .succeeded
+        .iter()
+        .any(|item| item.skill_id == "langfuse"));
 }
 
 #[test]

@@ -8,9 +8,12 @@ type GitPickModalProps = {
   loading: boolean
   gitCandidates: GitSkillCandidate[]
   gitCandidateSelected: Record<string, boolean>
+  customName: string
+  reimporting?: boolean
   onRequestClose: () => void
   onCancel: () => void
   onToggleCandidate: (subpath: string, checked: boolean) => void
+  onPreviewCandidate: (candidate: GitSkillCandidate) => void
   onInstall: () => void
   t: TFunction
 }
@@ -20,9 +23,12 @@ const GitPickModal = ({
   loading,
   gitCandidates,
   gitCandidateSelected,
+  customName,
+  reimporting,
   onRequestClose,
   onCancel,
   onToggleCandidate,
+  onPreviewCandidate,
   onInstall,
   t,
 }: GitPickModalProps) => {
@@ -37,6 +43,9 @@ const GitPickModal = ({
     )
   }, [gitCandidates, normalizedQuery])
   const selectedCount = filteredCandidates.filter(
+    (c) => gitCandidateSelected[c.subpath],
+  ).length
+  const totalSelectedCount = gitCandidates.filter(
     (c) => gitCandidateSelected[c.subpath],
   ).length
   const allVisibleSelected =
@@ -65,6 +74,13 @@ const GitPickModal = ({
         </div>
         <div className="modal-body">
           <p className="label">{t('gitPickBody')}</p>
+          {!reimporting && customName.trim() ? (
+            <div className="git-pick-name-hint">
+              {totalSelectedCount === 1
+                ? t('gitPickCustomNameSingle', { name: customName.trim() })
+                : t('gitPickCustomNameMultiple', { name: customName.trim() })}
+            </div>
+          ) : null}
           <div className="pick-search">
             <Search size={16} className="search-icon-abs" />
             <input
@@ -75,15 +91,17 @@ const GitPickModal = ({
             />
           </div>
           <div className="pick-toolbar">
-            <label className="inline-checkbox">
-              <input
-                type="checkbox"
-                checked={allVisibleSelected}
-                onChange={(e) => toggleVisibleCandidates(e.target.checked)}
-                disabled={filteredCandidates.length === 0}
-              />
-              {t('selectAll')}
-            </label>
+            {!reimporting ? (
+              <label className="inline-checkbox">
+                <input
+                  type="checkbox"
+                  checked={allVisibleSelected}
+                  onChange={(e) => toggleVisibleCandidates(e.target.checked)}
+                  disabled={filteredCandidates.length === 0}
+                />
+                {t('selectAll')}
+              </label>
+            ) : null}
             <span className="pick-toolbar-count">
               {t('selectedCount', {
                 selected: selectedCount,
@@ -99,13 +117,20 @@ const GitPickModal = ({
               <div className="pick-item" key={c.subpath}>
                 <label className="pick-item-checkbox">
                   <input
-                    type="checkbox"
+                    type={reimporting ? 'radio' : 'checkbox'}
+                    name={reimporting ? 'git-reimport-candidate' : undefined}
                     checked={Boolean(gitCandidateSelected[c.subpath])}
                     onChange={(e) => onToggleCandidate(c.subpath, e.target.checked)}
                   />
                 </label>
                 <div className="pick-item-main">
-                  <div className="pick-item-title">{c.name}</div>
+                  <button
+                    className="pick-item-title clickable"
+                    type="button"
+                    onClick={() => onPreviewCandidate(c)}
+                  >
+                    {c.name}
+                  </button>
                   {c.description ? (
                     <div className="pick-item-desc">{c.description}</div>
                   ) : null}
@@ -120,7 +145,7 @@ const GitPickModal = ({
             {t('cancel')}
           </button>
           <button className="btn btn-primary" onClick={onInstall} disabled={loading}>
-            {t('installSelected')}
+            {reimporting ? t('assignment.reimport') : t('installSelected')}
           </button>
         </div>
       </div>

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::central_repo::resolve_central_repo_path;
 use super::content_hash::hash_dir;
-use super::skill_store::SkillStore;
+use super::skill_store::{SkillRecord, SkillStore};
 use super::tool_adapters::{default_tool_adapters, scan_tool_dir, DetectedSkill};
 
 #[derive(Clone, Debug, Serialize)]
@@ -21,6 +21,15 @@ pub struct OnboardingVariant {
     pub plugin_name: Option<String>,
     pub plugin_version: Option<String>,
     pub plugin_scope: Option<String>,
+    pub hub_relation: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OnboardingHubSkill {
+    pub id: String,
+    pub name: String,
+    pub central_path: PathBuf,
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -28,6 +37,7 @@ pub struct OnboardingGroup {
     pub name: String,
     pub variants: Vec<OnboardingVariant>,
     pub has_conflict: bool,
+    pub hub_skill: Option<OnboardingHubSkill>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -44,17 +54,17 @@ pub fn build_onboarding_plan<R: tauri::Runtime>(
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("failed to resolve home directory"))?;
     let central = resolve_central_repo_path(app, store)?;
+    let managed_skills = store.list_skills()?;
     let mut managed_targets = store
-        .list_all_skill_target_paths()
-        .unwrap_or_default()
+        .list_all_skill_target_paths()?
         .into_iter()
         .map(|(tool, path)| managed_target_key(&tool, Path::new(&path)))
         .collect::<std::collections::HashSet<_>>();
-    for skill in store.list_skills().unwrap_or_default() {
-        if let Some(source_ref) = skill.source_ref {
+    for skill in &managed_skills {
+        if let Some(source_ref) = skill.source_ref.as_ref() {
             managed_targets.insert(managed_target_key(
                 CLAUDE_PLUGIN_TOOL_KEY,
-                Path::new(&source_ref),
+                Path::new(source_ref),
             ));
         }
     }
@@ -64,6 +74,7 @@ pub fn build_onboarding_plan<R: tauri::Runtime>(
         &claude_config_dir,
         Some(&central),
         Some(&managed_targets),
+        &managed_skills,
     )
 }
 
@@ -73,11 +84,27 @@ fn build_onboarding_plan_in_home(
     exclude_root: Option<&Path>,
     exclude_managed_targets: Option<&std::collections::HashSet<String>>,
 ) -> Result<OnboardingPlan> {
+    build_onboarding_plan_with_managed_skills_in_home(
+        home,
+        exclude_root,
+        exclude_managed_targets,
+        &[],
+    )
+}
+
+#[cfg(test)]
+fn build_onboarding_plan_with_managed_skills_in_home(
+    home: &Path,
+    exclude_root: Option<&Path>,
+    exclude_managed_targets: Option<&std::collections::HashSet<String>>,
+    managed_skills: &[SkillRecord],
+) -> Result<OnboardingPlan> {
     build_onboarding_plan_with_claude_dir(
         home,
         &home.join(".claude"),
         exclude_root,
         exclude_managed_targets,
+        managed_skills,
     )
 }
 
@@ -86,6 +113,7 @@ fn build_onboarding_plan_with_claude_dir(
     claude_config_dir: &Path,
     exclude_root: Option<&Path>,
     exclude_managed_targets: Option<&std::collections::HashSet<String>>,
+    managed_skills: &[SkillRecord],
 ) -> Result<OnboardingPlan> {
     let adapters = default_tool_adapters();
     let mut all_detected: Vec<DetectedSkill> = Vec::new();
@@ -123,6 +151,7 @@ fn build_onboarding_plan_with_claude_dir(
             plugin_name: None,
             plugin_version: None,
             plugin_scope: None,
+            hub_relation: None,
         });
     }
 
@@ -164,7 +193,7 @@ fn build_onboarding_plan_with_claude_dir(
 
     let groups: Vec<OnboardingGroup> = grouped
         .into_iter()
-        .map(|(name, variants)| {
+        .map(|(name, mut variants)| {
             let mut uniq = variants
                 .iter()
                 .filter_map(|v| v.fingerprint.as_ref())
@@ -173,10 +202,33 @@ fn build_onboarding_plan_with_claude_dir(
             if uniq == 0 {
                 uniq = 1;
             }
+            let hub_skill = managed_skills
+                .iter()
+                .find(|skill| skill.name.eq_ignore_ascii_case(&name))
+                .map(|skill| {
+                    let fingerprint = hash_dir(Path::new(&skill.central_path)).ok();
+                    for variant in &mut variants {
+                        variant.hub_relation = Some(
+                            match (variant.fingerprint.as_ref(), fingerprint.as_ref()) {
+                                (Some(discovered), Some(hub)) if discovered == hub => "same",
+                                (Some(_), Some(_)) => "different",
+                                _ => "unknown",
+                            }
+                            .to_string(),
+                        );
+                    }
+                    OnboardingHubSkill {
+                        id: skill.id.clone(),
+                        name: skill.name.clone(),
+                        central_path: PathBuf::from(&skill.central_path),
+                        fingerprint,
+                    }
+                });
             OnboardingGroup {
                 name,
                 has_conflict: uniq > 1,
                 variants,
+                hub_skill,
             }
         })
         .collect();
@@ -312,6 +364,7 @@ fn discover_claude_plugin_skills(claude_config_dir: &Path) -> Vec<OnboardingVari
                     plugin_name: Some(plugin_name.clone()),
                     plugin_version: install.version.clone(),
                     plugin_scope: Some(install.scope.clone()),
+                    hub_relation: None,
                 });
             }
         }

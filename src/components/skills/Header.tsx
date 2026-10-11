@@ -1,14 +1,26 @@
 import { memo } from 'react'
-import { Layers, Search, Settings, SlidersHorizontal } from 'lucide-react'
+import {
+  FolderKanban,
+  Library,
+  Search,
+  Settings,
+  SlidersHorizontal,
+} from 'lucide-react'
 import type { TFunction } from 'i18next'
 
 type HeaderProps = {
   language: string
   loading: boolean
-  activeView: 'myskills' | 'explore' | 'detail' | 'settings' | 'manage'
+  activeView:
+    | 'projects'
+    | 'projectDetail'
+    | 'myskills'
+    | 'explore'
+    | 'settings'
+    | 'manage'
   onToggleLanguage: () => void
   onOpenSettings: () => void
-  onViewChange: (view: 'myskills' | 'explore' | 'manage') => void
+  onViewChange: (view: 'projects' | 'myskills' | 'explore' | 'manage') => void
   t: TFunction
 }
 
@@ -31,12 +43,20 @@ const Header = ({
         </div>
         <nav className="nav-tabs">
           <button
-            className={`nav-tab${activeView === 'myskills' || activeView === 'detail' ? ' active' : ''}`}
+            className={`nav-tab${activeView === 'projects' || activeView === 'projectDetail' ? ' active' : ''}`}
+            type="button"
+            onClick={() => onViewChange('projects')}
+          >
+            <FolderKanban size={16} />
+            {t('navProjects')}
+          </button>
+          <button
+            className={`nav-tab${activeView === 'myskills' ? ' active' : ''}`}
             type="button"
             onClick={() => onViewChange('myskills')}
           >
-            <Layers size={16} />
-            {t('navMySkills')}
+            <Library size={16} />
+            {t('navSkillLibrary')}
           </button>
           <button
             className={`nav-tab${activeView === 'explore' ? ' active' : ''}`}

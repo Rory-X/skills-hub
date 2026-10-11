@@ -9,6 +9,13 @@
     "core:default",
     "dialog:default",
     "dialog:allow-open",
-    "updater:default"
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://github.com/login/device*" },
+        { "url": "https://gitlab.com/oauth/*" },
+        { "url": "https://gitee.com/oauth/*" }
+      ]
+    }
   ]
 }

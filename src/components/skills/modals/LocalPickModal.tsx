@@ -8,9 +8,11 @@ type LocalPickModalProps = {
   loading: boolean
   localCandidates: LocalSkillCandidate[]
   localCandidateSelected: Record<string, boolean>
+  reimporting?: boolean
   onRequestClose: () => void
   onCancel: () => void
   onToggleCandidate: (subpath: string, checked: boolean) => void
+  onPreviewCandidate: (candidate: LocalSkillCandidate) => void
   onInstall: () => void
   t: TFunction
 }
@@ -20,9 +22,11 @@ const LocalPickModal = ({
   loading,
   localCandidates,
   localCandidateSelected,
+  reimporting,
   onRequestClose,
   onCancel,
   onToggleCandidate,
+  onPreviewCandidate,
   onInstall,
   t,
 }: LocalPickModalProps) => {
@@ -86,15 +90,17 @@ const LocalPickModal = ({
             />
           </div>
           <div className="pick-toolbar">
-            <label className="inline-checkbox">
-              <input
-                type="checkbox"
-                checked={allVisibleSelected}
-                onChange={(e) => toggleVisibleCandidates(e.target.checked)}
-                disabled={selectableCount === 0}
-              />
-              {t('selectAll')}
-            </label>
+            {!reimporting ? (
+              <label className="inline-checkbox">
+                <input
+                  type="checkbox"
+                  checked={allVisibleSelected}
+                  onChange={(e) => toggleVisibleCandidates(e.target.checked)}
+                  disabled={selectableCount === 0}
+                />
+                {t('selectAll')}
+              </label>
+            ) : null}
             <span className="pick-toolbar-count">
               {t('selectedCount', {
                 selected: selectedCount,
@@ -113,14 +119,21 @@ const LocalPickModal = ({
               >
                 <label className="pick-item-checkbox">
                   <input
-                    type="checkbox"
+                    type={reimporting ? 'radio' : 'checkbox'}
+                    name={reimporting ? 'local-reimport-candidate' : undefined}
                     checked={Boolean(localCandidateSelected[c.subpath])}
                     onChange={(e) => onToggleCandidate(c.subpath, e.target.checked)}
                     disabled={!c.valid}
                   />
                 </label>
                 <div className="pick-item-main">
-                  <div className="pick-item-title">{c.name}</div>
+                  <button
+                    className="pick-item-title clickable"
+                    type="button"
+                    onClick={() => onPreviewCandidate(c)}
+                  >
+                    {c.name}
+                  </button>
                   {c.description ? (
                     <div className="pick-item-desc">{c.description}</div>
                   ) : null}
@@ -140,7 +153,7 @@ const LocalPickModal = ({
             {t('cancel')}
           </button>
           <button className="btn btn-primary" onClick={onInstall} disabled={loading}>
-            {t('installSelected')}
+            {reimporting ? t('assignment.reimport') : t('installSelected')}
           </button>
         </div>
       </div>

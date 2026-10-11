@@ -1,15 +1,26 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{Manager, State};
 
 use std::sync::Arc;
 
+use crate::core::assignments::{
+    apply_project_skill_assignments as apply_project_skill_assignments_core,
+    apply_skill_assignments as apply_skill_assignments_core,
+    ignore_all_assignment_issues as ignore_all_assignment_issues_core,
+    ignore_assignment_issue as ignore_assignment_issue_core, managed_skill_projections,
+    preview_project_skill_assignments as preview_project_skill_assignments_core,
+    preview_skill_assignments as preview_skill_assignments_core,
+    resume_skill_assignment as resume_skill_assignment_core, AssignmentConflictKey,
+    AssignmentDraft, AssignmentProjection, AssignmentToolSpec, ProjectAssignmentDraft,
+};
 use crate::core::auto_update::{
     get_auto_update_config as get_auto_update_config_core, record_auto_update_triggered,
+    retry_auto_update_skills as retry_auto_update_skills_core,
     run_auto_update_now as run_auto_update_now_core,
     set_auto_update_config as set_auto_update_config_core, AutoUpdateConfig,
-    AutoUpdateIntervalUnit, AutoUpdateProgressSnapshot, AutoUpdateRunResult, AutoUpdateSchedule,
-    AutoUpdateScheduleType,
+    AutoUpdateIntervalUnit, AutoUpdateProgressSnapshot, AutoUpdateRetryResult, AutoUpdateRunResult,
+    AutoUpdateSchedule, AutoUpdateScheduleType, AutoUpdateSkillProgress,
 };
 use crate::core::cache_cleanup::{
     cleanup_git_cache_dirs, get_git_cache_cleanup_days as get_git_cache_cleanup_days_core,
@@ -18,13 +29,13 @@ use crate::core::cache_cleanup::{
     set_git_cache_ttl_secs as set_git_cache_ttl_secs_core,
 };
 use crate::core::cancel_token::CancelToken;
-use crate::core::central_repo::{ensure_central_repo, resolve_central_repo_path};
-use crate::core::content_hash::hash_dir;
+use crate::core::central_repo::{ensure_central_repo, resolve_central_repo_from_runtime, resolve_central_repo_path};
 use crate::core::featured_skills::{fetch_featured_skills, FeaturedSkill};
 use crate::core::github_search::{search_github_repos, RepoSummary};
 use crate::core::installer::{
-    install_git_skill, install_git_skill_from_selection, install_local_skill,
-    install_local_skill_from_selection, list_git_skills, list_local_skills,
+    import_discovered_skill, install_git_skill, install_git_skill_from_selection,
+    install_local_skill, install_local_skill_from_selection, list_git_skills, list_local_skills,
+    reimport_git_skill_from_selection, reimport_local_skill_from_selection,
     update_managed_skill_from_source, GitSkillCandidate, InstallResult, LocalSkillCandidate,
 };
 use crate::core::network_proxy::{
@@ -34,25 +45,67 @@ use crate::core::network_proxy::{
     set_github_proxy_url as set_github_proxy_url_core, GithubProxyConfig,
 };
 use crate::core::onboarding::{build_onboarding_plan, OnboardingPlan};
-use crate::core::skill_store::{SkillStore, SkillTargetRecord};
+use crate::core::projects::{
+    build_project_detail_data, build_project_summary_data, collect_project_skill_and_scan,
+    ignore_all_project_issues_and_scan, ignore_project_issue_and_scan, import_project_and_scan,
+    inject_project_skill_and_scan, refresh_project, remove_project_skill_and_scan,
+    repair_project_issue_and_scan, update_project_and_scan, visible_project_issue_projections,
+    ProjectIssue, ProjectIssueProjection, ProjectToolSpec,
+};
+use crate::core::skill_files::FileContent;
+use crate::core::skill_preview::{
+    list_preview_files, read_preview_file, resolve_preview_root, PreviewSource,
+};
+use crate::core::skill_store::{ProjectRecord, SkillStore};
 use crate::core::skills_search::{
     search_skills_online as search_skills_online_core, OnlineSkillResult,
 };
-use crate::core::sync_engine::{
-    copy_dir_recursive, sync_dir_for_tool_with_overwrite, sync_dir_hybrid, SyncMode,
-};
+use crate::core::sync_engine::{copy_dir_recursive, sync_dir_hybrid, SyncMode};
 use crate::core::system_scheduler::{
     current_scheduler_config, get_auto_update_task_status, install_auto_update_task,
     trigger_auto_update_task_now, uninstall_auto_update_task,
 };
 use crate::core::tool_adapters::{
-    adapter_by_key, adapters_sharing_project_skills_dir, is_builtin_tool_enabled,
-    is_tool_installed, load_tool_config, project_relative_skills_dir, resolve_default_path,
-    save_tool_config, supports_project_scope, CustomToolConfig, ToolConfig,
+    is_builtin_tool_enabled, is_tool_installed, load_tool_config, project_relative_skills_dir,
+    resolve_default_path, save_tool_config, supports_project_scope, CustomToolConfig, ToolConfig,
 };
+
+
+use crate::core::device_sync::credentials::{
+    resolve_access_token_with_proxy, save_personal_access_token, CredentialStore,
+    SystemCredentialStore,
+};
+use crate::core::device_sync::oauth;
+use crate::core::device_sync::providers::provider;
+use crate::core::device_sync::types::{
+    ConflictResolution, CredentialUsage, DeviceSyncConfig, DeviceSyncDevice, OAuthPollResult,
+    OAuthProviderAvailability, OAuthStartResult, PendingOAuthAuthorization, ProviderAccount,
+    ProviderId, RemoteRepository, SyncChangeSummary, SyncConflict, SyncHistoryEntry, SyncRunResult,
+    SyncStatus, TrashEntry,
+};
+use crate::core::device_sync::DeviceSyncService;
+use crate::core::recycle_bin::{RecycleBinItem, RecycleBinService};
+use crate::core::skill_store::DEVICE_SYNC_HISTORY_LIMIT;
+use crate::services::operation_lock::{OperationKind, OperationLock};
 use uuid::Uuid;
 
 const RECENT_PROJECTS_SETTING: &str = "recent_projects_v1";
+const DEVICE_SYNC_PENDING_OAUTH_SETTING: &str = "device_sync_pending_oauth_v1";
+const DEVICE_SYNC_CREDENTIAL_CLEANUP_QUEUE_SETTING: &str =
+    "device_sync_credential_cleanup_queue_v1";
+
+
+fn acquire_operation_lock<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    kind: OperationKind,
+) -> anyhow::Result<OperationLock> {
+    let paths = crate::runtime_paths_for_tauri(app)?;
+    OperationLock::acquire(&paths, kind).map_err(Into::into)
+}
+
+fn oauth_proxy_url(store: &SkillStore, _provider_id: ProviderId) -> anyhow::Result<String> {
+    get_github_proxy_url_core(store)
+}
 
 fn format_anyhow_error(err: anyhow::Error) -> String {
     let first = err.to_string();
@@ -60,6 +113,8 @@ fn format_anyhow_error(err: anyhow::Error) -> String {
     if first.starts_with("MULTI_SKILLS|")
         || first.starts_with("TARGET_EXISTS|")
         || first.starts_with("TOOL_NOT_INSTALLED|")
+        || first.starts_with("PROJECT_LIBRARY_NAME_REQUIRED|")
+        || first.starts_with("HUB_NAME_CONFLICT|")
     {
         return first;
     }
@@ -251,46 +306,6 @@ fn runtime_tools(store: &SkillStore, include_disabled: bool) -> anyhow::Result<V
     Ok(tools)
 }
 
-fn runtime_tool_by_key(store: &SkillStore, key: &str) -> anyhow::Result<RuntimeTool> {
-    runtime_tools(store, false)?
-        .into_iter()
-        .find(|tool| tool.key == key)
-        .ok_or_else(|| anyhow::anyhow!("TOOL_NOT_INSTALLED|{}", key))
-}
-
-fn runtime_tools_sharing_dir(
-    store: &SkillStore,
-    selected: &RuntimeTool,
-    scope: &str,
-) -> anyhow::Result<Vec<RuntimeTool>> {
-    let tools = runtime_tools(store, false)?;
-    let shared = tools
-        .into_iter()
-        .filter(|tool| {
-            tool.installed
-                && if scope == "project" {
-                    tool.project_skills_dir == selected.project_skills_dir
-                } else {
-                    tool.skills_dir == selected.skills_dir
-                }
-        })
-        .collect::<Vec<_>>();
-    Ok(shared)
-}
-
-fn resolve_runtime_tool_root(
-    tool: &RuntimeTool,
-    project_root: Option<&std::path::Path>,
-) -> anyhow::Result<std::path::PathBuf> {
-    if let Some(project_root) = project_root {
-        if !tool.supports_project_scope {
-            anyhow::bail!("PROJECT_SCOPE_UNSUPPORTED|{}", tool.key);
-        }
-        return Ok(project_root.join(&tool.project_skills_dir));
-    }
-    Ok(tool.skills_dir.clone())
-}
-
 #[tauri::command]
 pub async fn get_tool_config(store: State<'_, SkillStore>) -> Result<ToolConfigDto, String> {
     let store = store.inner().clone();
@@ -469,6 +484,13 @@ pub struct AutoUpdateRunResultDto {
 }
 
 #[derive(Debug, Serialize)]
+pub struct AutoUpdateRetryResultDto {
+    pub updated: usize,
+    pub failed: Vec<AutoUpdateSkillProgress>,
+    pub config: AutoUpdateConfigDto,
+}
+
+#[derive(Debug, Serialize)]
 pub struct GithubProxyConfigDto {
     pub enabled: bool,
     pub port: u16,
@@ -607,6 +629,22 @@ pub async fn run_auto_update_now(
 }
 
 #[tauri::command]
+#[allow(non_snake_case)]
+pub async fn retry_auto_update_skills(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    skillIds: Vec<String>,
+) -> Result<AutoUpdateRetryResultDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        retry_auto_update_skills_core(&app, &store, &skillIds).map(to_auto_update_retry_result_dto)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
 pub async fn trigger_auto_update_task_now_cmd(store: State<'_, SkillStore>) -> Result<(), String> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -645,12 +683,458 @@ fn expand_home_path(input: &str) -> Result<std::path::PathBuf, anyhow::Error> {
     Ok(std::path::PathBuf::from(trimmed))
 }
 
-fn normalize_scope(scope: Option<&str>) -> Result<&'static str, anyhow::Error> {
-    match scope.unwrap_or("global") {
-        "global" => Ok("global"),
-        "project" => Ok("project"),
-        other => anyhow::bail!("invalid scope: {}", other),
+#[derive(Clone, Debug, Serialize)]
+pub struct ProjectSummaryDto {
+    pub id: String,
+    pub name: String,
+    pub root_path: String,
+    pub enabled_tool_keys: Vec<String>,
+    pub local_git_exclude_enabled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_scanned_at: Option<i64>,
+    pub skill_count: usize,
+    pub attention_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProjectToolDto {
+    pub key: String,
+    pub label: String,
+    pub project_skills_dir: String,
+    pub enabled: bool,
+    pub installed: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProjectSkillPathDto {
+    pub discovered_skill_id: String,
+    pub relative_path: String,
+    pub absolute_path: String,
+    pub tool_keys: Vec<String>,
+    pub content_hash: Option<String>,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProjectSkillDto {
+    pub name: String,
+    pub description: Option<String>,
+    pub source: String,
+    pub status: String,
+    pub linked_skill_id: Option<String>,
+    pub matched_skill_id: Option<String>,
+    pub tool_keys: Vec<String>,
+    pub paths: Vec<ProjectSkillPathDto>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProjectLibrarySkillDto {
+    pub skill_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub availability: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProjectIssueActionDto {
+    pub kind: String,
+    pub value: Option<String>,
+    pub label: Option<String>,
+    pub confirmation_required: bool,
+    pub destructive: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProjectIssueDto {
+    pub id: String,
+    pub kind: String,
+    pub skill_id: Option<String>,
+    pub skill_name: Option<String>,
+    pub tool_key: Option<String>,
+    pub path: Option<String>,
+    pub actions: Vec<ProjectIssueActionDto>,
+    pub fingerprint: String,
+    pub can_ignore: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProjectDetailDto {
+    pub project: ProjectSummaryDto,
+    pub tools: Vec<ProjectToolDto>,
+    pub current_skills: Vec<ProjectSkillDto>,
+    pub library_skills: Vec<ProjectLibrarySkillDto>,
+    pub issues: Vec<ProjectIssueDto>,
+}
+
+#[tauri::command]
+pub async fn list_projects(store: State<'_, SkillStore>) -> Result<Vec<ProjectSummaryDto>, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let specs = runtime_project_tool_specs(&store)?;
+        store
+            .list_projects()?
+            .into_iter()
+            .map(|project| build_project_summary(&store, &project, &specs))
+            .collect::<anyhow::Result<Vec<_>>>()
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn import_project(
+    store: State<'_, SkillStore>,
+    projectPath: String,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = expand_home_path(&projectPath)?;
+        let runtime_tools = runtime_project_tools(&store)?;
+        let default_tools = default_project_tool_keys(&runtime_tools);
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project = import_project_and_scan(&store, &root, &default_tools, &specs)?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn scan_project(
+    store: State<'_, SkillStore>,
+    projectId: String,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime_tools = runtime_project_tools(&store)?;
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project = refresh_project(&store, &projectId, &specs)?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn update_project_settings(
+    store: State<'_, SkillStore>,
+    projectId: String,
+    enabledToolKeys: Vec<String>,
+    localGitExcludeEnabled: bool,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime_tools = runtime_project_tools(&store)?;
+        let available = runtime_tools
+            .iter()
+            .filter(|tool| tool.installed)
+            .map(|tool| tool.key.clone())
+            .collect::<Vec<_>>();
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project = update_project_and_scan(
+            &store,
+            &projectId,
+            &enabledToolKeys,
+            localGitExcludeEnabled,
+            &available,
+            &specs,
+        )?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn inject_project_skill(
+    store: State<'_, SkillStore>,
+    projectId: String,
+    skillId: String,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime_tools = runtime_project_tools(&store)?;
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project = inject_project_skill_and_scan(&store, &projectId, &skillId, &specs)?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn remove_project_skill(
+    store: State<'_, SkillStore>,
+    projectId: String,
+    skillId: String,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime_tools = runtime_project_tools(&store)?;
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project = remove_project_skill_and_scan(&store, &projectId, &skillId, &specs)?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn repair_project_issue(
+    store: State<'_, SkillStore>,
+    projectId: String,
+    issueId: String,
+    actionKind: String,
+    actionValue: Option<String>,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime_tools = runtime_project_tools(&store)?;
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project = repair_project_issue_and_scan(
+            &store,
+            &projectId,
+            &issueId,
+            &actionKind,
+            actionValue.as_deref(),
+            &specs,
+        )?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn collect_project_skill(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    projectId: String,
+    discoveredSkillId: String,
+    libraryName: Option<String>,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime_tools = runtime_project_tools(&store)?;
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project = collect_project_skill_and_scan(
+            &app,
+            &store,
+            &projectId,
+            &discoveredSkillId,
+            libraryName.as_deref(),
+            &specs,
+        )?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+fn runtime_project_tools(store: &SkillStore) -> anyhow::Result<Vec<RuntimeTool>> {
+    Ok(runtime_tools(store, false)?
+        .into_iter()
+        .filter(|tool| tool.supports_project_scope && !tool.project_skills_dir.is_empty())
+        .collect())
+}
+
+fn runtime_project_tool_specs(store: &SkillStore) -> anyhow::Result<Vec<ProjectToolSpec>> {
+    runtime_project_tools(store).map(|tools| project_specs_from_runtime(&tools))
+}
+
+fn project_specs_from_runtime(tools: &[RuntimeTool]) -> Vec<ProjectToolSpec> {
+    tools
+        .iter()
+        .map(|tool| {
+            ProjectToolSpec::new(&tool.key, &tool.project_skills_dir).with_available(tool.installed)
+        })
+        .collect()
+}
+
+fn default_project_tool_keys(tools: &[RuntimeTool]) -> Vec<String> {
+    tools
+        .iter()
+        .filter(|tool| tool.installed)
+        .map(|tool| tool.key.clone())
+        .collect()
+}
+
+fn build_project_summary(
+    store: &SkillStore,
+    project: &ProjectRecord,
+    specs: &[ProjectToolSpec],
+) -> anyhow::Result<ProjectSummaryDto> {
+    let data = build_project_summary_data(store, project, specs)?;
+    let attention_count = visible_project_issues(store, project, data.issues)?.len();
+    Ok(ProjectSummaryDto {
+        id: project.id.clone(),
+        name: project.name.clone(),
+        root_path: project.root_path.clone(),
+        enabled_tool_keys: project.enabled_tool_keys.clone(),
+        local_git_exclude_enabled: project.local_git_exclude_enabled,
+        created_at: project.created_at,
+        updated_at: project.updated_at,
+        last_scanned_at: project.last_scanned_at,
+        skill_count: data.skill_count,
+        attention_count,
+    })
+}
+
+fn build_project_detail(
+    store: &SkillStore,
+    project: &ProjectRecord,
+    runtime_tools: &[RuntimeTool],
+) -> anyhow::Result<ProjectDetailDto> {
+    let specs = project_specs_from_runtime(runtime_tools);
+    let data = build_project_detail_data(store, project, &specs)?;
+    let issues = visible_project_issues(store, project, data.issues)?;
+    let summary = build_project_summary(store, project, &specs)?;
+    let tools = runtime_tools
+        .iter()
+        .map(|tool| ProjectToolDto {
+            key: tool.key.clone(),
+            label: tool.label.clone(),
+            project_skills_dir: tool.project_skills_dir.clone(),
+            enabled: project.enabled_tool_keys.contains(&tool.key),
+            installed: tool.installed,
+        })
+        .collect::<Vec<_>>();
+    Ok(ProjectDetailDto {
+        project: summary,
+        tools,
+        current_skills: data
+            .current_skills
+            .into_iter()
+            .map(|skill| ProjectSkillDto {
+                name: skill.name,
+                description: skill.description,
+                source: skill.source,
+                status: skill.status,
+                linked_skill_id: skill.linked_skill_id,
+                matched_skill_id: skill.matched_skill_id,
+                tool_keys: skill.tool_keys,
+                paths: skill
+                    .paths
+                    .into_iter()
+                    .map(|path| ProjectSkillPathDto {
+                        discovered_skill_id: path.discovered_skill_id,
+                        relative_path: path.relative_path,
+                        absolute_path: path.absolute_path,
+                        tool_keys: path.tool_keys,
+                        content_hash: path.content_hash,
+                        status: path.status,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        library_skills: data
+            .library_skills
+            .into_iter()
+            .map(|skill| ProjectLibrarySkillDto {
+                skill_id: skill.skill_id,
+                name: skill.name,
+                description: skill.description,
+                availability: skill.availability,
+            })
+            .collect(),
+        issues,
+    })
+}
+
+fn project_issue_dto(projection: ProjectIssueProjection) -> ProjectIssueDto {
+    let ProjectIssueProjection {
+        issue,
+        fingerprint,
+        can_ignore,
+        ..
+    } = projection;
+    ProjectIssueDto {
+        id: issue.id,
+        kind: issue.kind,
+        skill_id: issue.skill_id,
+        skill_name: issue.skill_name,
+        tool_key: issue.tool_key,
+        path: issue.path,
+        actions: issue
+            .actions
+            .into_iter()
+            .map(|action| ProjectIssueActionDto {
+                kind: action.kind,
+                value: action.value,
+                label: action.label,
+                confirmation_required: action.confirmation_required,
+                destructive: action.destructive,
+            })
+            .collect(),
+        fingerprint,
+        can_ignore,
     }
+}
+
+fn visible_project_issues(
+    store: &SkillStore,
+    project: &ProjectRecord,
+    issues: Vec<ProjectIssue>,
+) -> anyhow::Result<Vec<ProjectIssueDto>> {
+    Ok(visible_project_issue_projections(store, project, issues)?
+        .into_iter()
+        .map(project_issue_dto)
+        .collect())
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn ignore_project_issue(
+    store: State<'_, SkillStore>,
+    projectId: String,
+    issueId: String,
+    fingerprint: String,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime_tools = runtime_project_tools(&store)?;
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project =
+            ignore_project_issue_and_scan(&store, &projectId, &issueId, &fingerprint, &specs)?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn ignore_all_project_issues(
+    store: State<'_, SkillStore>,
+    projectId: String,
+) -> Result<ProjectDetailDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime_tools = runtime_project_tools(&store)?;
+        let specs = project_specs_from_runtime(&runtime_tools);
+        let project = ignore_all_project_issues_and_scan(&store, &projectId, &specs)?;
+        build_project_detail(&store, &project, &runtime_tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
 }
 
 #[tauri::command]
@@ -883,10 +1367,320 @@ pub async fn install_git_selection(
     .map_err(format_anyhow_error)
 }
 
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn reimport_local_selection(
+    store: State<'_, SkillStore>,
+    skillId: String,
+    basePath: String,
+    subpath: String,
+) -> Result<InstallResultDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let base = std::path::PathBuf::from(basePath);
+        let result = reimport_local_skill_from_selection(&store, &skillId, &base, &subpath)?;
+        Ok::<_, anyhow::Error>(to_install_dto(result))
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn reimport_git_selection(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    skillId: String,
+    repoUrl: String,
+    subpath: String,
+) -> Result<InstallResultDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = reimport_git_skill_from_selection(&app, &store, &skillId, &repoUrl, &subpath)?;
+        Ok::<_, anyhow::Error>(to_install_dto(result))
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
 #[derive(Debug, Serialize)]
 pub struct SyncResultDto {
     pub mode_used: String,
     pub target_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AssignmentDraftDto {
+    pub global_tools: Vec<String>,
+    pub projects: Vec<ProjectAssignmentDraftDto>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ProjectAssignmentDraftDto {
+    pub project_id: String,
+    pub tool_keys: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AssignmentPreviewItemDto {
+    pub key: String,
+    pub skill_id: String,
+    pub skill_name: String,
+    pub tool: String,
+    pub scope: String,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub target_path: Option<String>,
+    pub outcome: String,
+    pub blocking: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AssignmentPreviewDto {
+    pub items: Vec<AssignmentPreviewItemDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillAssignmentApplyResultDto {
+    pub skill_id: String,
+    pub skill_name: String,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AssignmentApplyResultDto {
+    pub skills: Vec<SkillAssignmentApplyResultDto>,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub skipped: usize,
+}
+
+impl From<AssignmentDraftDto> for AssignmentDraft {
+    fn from(draft: AssignmentDraftDto) -> Self {
+        Self {
+            global_tools: draft.global_tools,
+            projects: draft
+                .projects
+                .into_iter()
+                .map(|project| ProjectAssignmentDraft {
+                    project_id: project.project_id,
+                    tool_keys: project.tool_keys,
+                })
+                .collect(),
+        }
+    }
+}
+
+fn assignment_tool_specs(store: &SkillStore) -> anyhow::Result<Vec<AssignmentToolSpec>> {
+    Ok(runtime_tools(store, true)?
+        .into_iter()
+        .map(|tool| AssignmentToolSpec {
+            key: tool.key,
+            label: tool.label,
+            global_skills_dir: tool.skills_dir,
+            project_skills_dir: tool.project_skills_dir,
+            global_available: tool.installed,
+            enabled: tool.enabled,
+            supports_project_scope: tool.supports_project_scope,
+        })
+        .collect())
+}
+
+fn assignment_project_scope(
+    draft: &AssignmentDraftDto,
+    project_id: Option<String>,
+) -> Option<(String, Vec<String>)> {
+    project_id.map(|project_id| {
+        let tool_keys = draft
+            .projects
+            .iter()
+            .find(|project| project.project_id == project_id)
+            .map(|project| project.tool_keys.clone())
+            .unwrap_or_default();
+        (project_id, tool_keys)
+    })
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn preview_skill_assignments(
+    store: State<'_, SkillStore>,
+    skillIds: Vec<String>,
+    draft: AssignmentDraftDto,
+    additive: Option<bool>,
+    projectId: Option<String>,
+) -> Result<AssignmentPreviewDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let tools = assignment_tool_specs(&store)?;
+        let project_scope = assignment_project_scope(&draft, projectId);
+        let draft: AssignmentDraft = draft.into();
+        let mut items = Vec::new();
+        let additive = additive.unwrap_or(false);
+        let previews = if let Some((project_id, tool_keys)) = project_scope {
+            preview_project_skill_assignments_core(
+                &store,
+                &skillIds,
+                &project_id,
+                &tool_keys,
+                &tools,
+                additive,
+            )?
+        } else {
+            preview_skill_assignments_core(&store, &skillIds, &draft, &tools, additive)?
+        };
+        for preview in previews {
+            items.extend(
+                preview
+                    .items
+                    .into_iter()
+                    .map(|item| AssignmentPreviewItemDto {
+                        key: AssignmentConflictKey::new(&preview.skill.id, item.key).encode(),
+                        skill_id: preview.skill.id.clone(),
+                        skill_name: preview.skill.name.clone(),
+                        tool: item.tool,
+                        scope: item.scope,
+                        project_id: item.project_id,
+                        project_name: item.project_name,
+                        target_path: item.target_path,
+                        outcome: item.outcome,
+                        blocking: item.blocking,
+                    }),
+            );
+        }
+        Ok::<_, anyhow::Error>(AssignmentPreviewDto { items })
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn apply_skill_assignments(
+    store: State<'_, SkillStore>,
+    skillIds: Vec<String>,
+    draft: AssignmentDraftDto,
+    replaceConflictKeys: Vec<String>,
+    additive: Option<bool>,
+    projectId: Option<String>,
+) -> Result<AssignmentApplyResultDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let tools = assignment_tool_specs(&store)?;
+        let project_scope = assignment_project_scope(&draft, projectId);
+        let draft: AssignmentDraft = draft.into();
+        let replacements = replaceConflictKeys
+            .into_iter()
+            .map(|key| AssignmentConflictKey::decode(&key))
+            .collect::<anyhow::Result<std::collections::HashSet<_>>>()?;
+        let additive = additive.unwrap_or(false);
+        let results = if let Some((project_id, tool_keys)) = project_scope {
+            apply_project_skill_assignments_core(
+                &store,
+                &skillIds,
+                &project_id,
+                &tool_keys,
+                &tools,
+                &replacements,
+                additive,
+            )?
+        } else {
+            apply_skill_assignments_core(
+                &store,
+                &skillIds,
+                &draft,
+                &tools,
+                &replacements,
+                additive,
+            )?
+        }
+        .into_iter()
+        .map(|outcome| SkillAssignmentApplyResultDto {
+            skill_id: outcome.skill_id,
+            skill_name: outcome.skill_name,
+            succeeded: outcome.summary.succeeded,
+            failed: outcome.summary.failed,
+            skipped: outcome.summary.skipped,
+            errors: outcome.summary.errors,
+        })
+        .collect::<Vec<_>>();
+        Ok::<_, anyhow::Error>(AssignmentApplyResultDto {
+            succeeded: results.iter().map(|result| result.succeeded).sum(),
+            failed: results.iter().map(|result| result.failed).sum(),
+            skipped: results.iter().map(|result| result.skipped).sum(),
+            skills: results,
+        })
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn resume_skill_assignments(
+    store: State<'_, SkillStore>,
+    skillId: String,
+) -> Result<SkillAssignmentApplyResultDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let skill = store
+            .get_skill_by_id(&skillId)?
+            .with_context(|| format!("skill not found: {skillId}"))?;
+        let tools = assignment_tool_specs(&store)?;
+        let summary = resume_skill_assignment_core(&store, &skill.id, &tools)?;
+        Ok::<_, anyhow::Error>(SkillAssignmentApplyResultDto {
+            skill_id: skill.id,
+            skill_name: skill.name,
+            succeeded: summary.succeeded,
+            failed: summary.failed,
+            skipped: summary.skipped,
+            errors: summary.errors,
+        })
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn ignore_assignment_issue(
+    store: State<'_, SkillStore>,
+    skillId: String,
+    issueKey: String,
+    fingerprint: String,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let tools = assignment_tool_specs(&store)?;
+        ignore_assignment_issue_core(&store, &skillId, &issueKey, &fingerprint, &tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn ignore_all_assignment_issues(
+    store: State<'_, SkillStore>,
+    skillIds: Vec<String>,
+) -> Result<usize, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let tools = assignment_tool_specs(&store)?;
+        ignore_all_assignment_issues_core(&store, &skillIds, &tools)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
 }
 
 #[tauri::command]
@@ -906,221 +1700,6 @@ pub async fn sync_skill_dir(
             .to_string(),
             target_path: result.target_path.to_string_lossy().to_string(),
         })
-    })
-    .await
-    .map_err(|err| err.to_string())?
-    .map_err(format_anyhow_error)
-}
-
-#[tauri::command]
-#[allow(non_snake_case)]
-#[allow(clippy::too_many_arguments)]
-pub async fn sync_skill_to_tool(
-    store: State<'_, SkillStore>,
-    sourcePath: String,
-    skillId: String,
-    tool: String,
-    name: String,
-    overwrite: Option<bool>,
-    overwriteIfSameContent: Option<bool>,
-    scope: Option<String>,
-    projectPath: Option<String>,
-) -> Result<SyncResultDto, String> {
-    let store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let runtime_tool = runtime_tool_by_key(&store, &tool)?;
-        let scope = normalize_scope(scope.as_deref())?;
-        if scope == "project" && !runtime_tool.supports_project_scope {
-            anyhow::bail!("PROJECT_SCOPE_UNSUPPORTED|{}", runtime_tool.key);
-        }
-        let project_root = if scope == "project" {
-            let raw = projectPath
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("projectPath is required for project scope"))?;
-            let path = expand_home_path(raw)?;
-            if !path.is_dir() {
-                anyhow::bail!("projectPath must be an existing directory: {:?}", path);
-            }
-            Some(path)
-        } else {
-            None
-        };
-
-        if scope == "global" && !runtime_tool.installed {
-            anyhow::bail!("TOOL_NOT_INSTALLED|{}", runtime_tool.key);
-        }
-        let tool_root = resolve_runtime_tool_root(&runtime_tool, project_root.as_deref())?;
-        // Pre-check: ensure the skills directory is writable (fixes #20 — Windows OS error 5).
-        if let Err(err) = std::fs::create_dir_all(&tool_root) {
-            if err.kind() == std::io::ErrorKind::PermissionDenied {
-                anyhow::bail!(
-                    "TOOL_NOT_WRITABLE|{}|{}",
-                    runtime_tool.label,
-                    tool_root.to_string_lossy()
-                );
-            }
-            anyhow::bail!("failed to create skills dir {:?}: {}", tool_root, err);
-        }
-        let target = tool_root.join(&name);
-        let project_path_for_record = project_root
-            .as_ref()
-            .map(|path| path.to_string_lossy().to_string());
-        if let Some(existing) =
-            store.get_skill_target(&skillId, &tool, scope, project_path_for_record.as_deref())?
-        {
-            if existing.status != "disabled"
-                && existing.target_path == target.to_string_lossy()
-                && target.exists()
-            {
-                return Ok::<_, anyhow::Error>(SyncResultDto {
-                    mode_used: existing.mode,
-                    target_path: existing.target_path,
-                });
-            }
-        }
-        let overwrite = overwrite.unwrap_or(false)
-            || (overwriteIfSameContent.unwrap_or(false)
-                && target_has_same_content(sourcePath.as_ref(), &target));
-        let result =
-            sync_dir_for_tool_with_overwrite(&tool, sourcePath.as_ref(), &target, overwrite)
-                .map_err(|err| {
-                    let msg = err.to_string();
-                    if msg.contains("target already exists") {
-                        anyhow::anyhow!("TARGET_EXISTS|{}", target.to_string_lossy())
-                    } else if msg.contains("os error 5")
-                        || msg.contains("Access is denied")
-                        || msg.contains("Permission denied")
-                    {
-                        anyhow::anyhow!(
-                            "TOOL_NOT_WRITABLE|{}|{}",
-                            runtime_tool.label,
-                            tool_root.to_string_lossy()
-                        )
-                    } else {
-                        anyhow::anyhow!(msg)
-                    }
-                })?;
-
-        // Some tools share the same skills directory; keep DB records consistent across them.
-        let group = runtime_tools_sharing_dir(&store, &runtime_tool, scope)?;
-        for a in group {
-            let record = SkillTargetRecord {
-                id: Uuid::new_v4().to_string(),
-                skill_id: skillId.clone(),
-                tool: a.key,
-                scope: scope.to_string(),
-                project_path: project_path_for_record.clone(),
-                target_path: result.target_path.to_string_lossy().to_string(),
-                mode: match result.mode_used {
-                    SyncMode::Auto => "auto",
-                    SyncMode::Symlink => "symlink",
-                    SyncMode::Junction => "junction",
-                    SyncMode::Copy => "copy",
-                }
-                .to_string(),
-                status: "ok".to_string(),
-                last_error: None,
-                synced_at: Some(now_ms()),
-            };
-            store.upsert_skill_target(&record)?;
-        }
-
-        Ok::<_, anyhow::Error>(SyncResultDto {
-            mode_used: match result.mode_used {
-                SyncMode::Auto => "auto",
-                SyncMode::Symlink => "symlink",
-                SyncMode::Junction => "junction",
-                SyncMode::Copy => "copy",
-            }
-            .to_string(),
-            target_path: result.target_path.to_string_lossy().to_string(),
-        })
-    })
-    .await
-    .map_err(|err| err.to_string())?
-    .map_err(format_anyhow_error)
-}
-
-fn target_has_same_content(source: &std::path::Path, target: &std::path::Path) -> bool {
-    if !source.is_dir() || !target.is_dir() {
-        return false;
-    }
-    match (hash_dir(source), hash_dir(target)) {
-        (Ok(source_hash), Ok(target_hash)) => source_hash == target_hash,
-        _ => false,
-    }
-}
-
-#[tauri::command]
-#[allow(non_snake_case)]
-pub async fn unsync_skill_from_tool(
-    store: State<'_, SkillStore>,
-    skillId: String,
-    tool: String,
-    scope: Option<String>,
-    projectPath: Option<String>,
-) -> Result<(), String> {
-    let store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let scope = normalize_scope(scope.as_deref())?;
-        let project_path = if scope == "project" {
-            let raw = projectPath
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("projectPath is required for project scope"))?;
-            Some(expand_home_path(raw)?.to_string_lossy().to_string())
-        } else {
-            None
-        };
-
-        // Some tools share the same skills directory; unsync should update all of them.
-        let group_tool_keys: Vec<String> =
-            if let Ok(runtime_tool) = runtime_tool_by_key(&store, &tool) {
-                runtime_tools_sharing_dir(&store, &runtime_tool, scope)?
-                    .into_iter()
-                    .map(|tool| tool.key)
-                    .collect()
-            } else if let Some(adapter) = adapter_by_key(&tool) {
-                let group = if scope == "project" {
-                    adapters_sharing_project_skills_dir(&adapter)
-                } else {
-                    crate::core::tool_adapters::adapters_sharing_skills_dir(&adapter)
-                };
-                // If none of the group tools are installed, do nothing (treat as already not effective).
-                if scope == "global" {
-                    let mut any_installed = false;
-                    for a in &group {
-                        if is_tool_installed(a)? {
-                            any_installed = true;
-                            break;
-                        }
-                    }
-                    if !any_installed {
-                        return Ok::<_, anyhow::Error>(());
-                    }
-                }
-                group
-                    .into_iter()
-                    .map(|a| a.id.as_key().to_string())
-                    .collect()
-            } else {
-                vec![tool.clone()]
-            };
-
-        // Remove filesystem target once (shared dir => shared target path).
-        let mut removed = false;
-        for k in &group_tool_keys {
-            if let Some(target) =
-                store.get_skill_target(&skillId, k, scope, project_path.as_deref())?
-            {
-                if !removed {
-                    remove_path_any(&target.target_path).map_err(anyhow::Error::msg)?;
-                    removed = true;
-                }
-                store.delete_skill_target(&skillId, k, scope, project_path.as_deref())?;
-            }
-        }
-
-        Ok::<_, anyhow::Error>(())
     })
     .await
     .map_err(|err| err.to_string())?
@@ -1153,6 +1732,7 @@ pub async fn set_skill_enabled(
                     "disabled",
                 )?;
             }
+            store.set_skill_assignments_state(&skillId, "suspended")?;
             store.set_skill_enabled(&skillId, false)?;
             if !remove_failures.is_empty() {
                 anyhow::bail!(
@@ -1312,6 +1892,7 @@ pub async fn import_existing_skill(
     store: State<'_, SkillStore>,
     sourcePath: String,
     name: Option<String>,
+    conflictResolution: Option<String>,
 ) -> Result<InstallResultDto, String> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -1321,7 +1902,14 @@ pub async fn import_existing_skill(
         if !source.join("SKILL.md").exists() {
             anyhow::bail!("SKILL_INVALID|missing_skill_md");
         }
-        let result = install_local_skill(&app, &store, source, name)?;
+        let name = name.unwrap_or_else(|| {
+            source
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unnamed-skill".to_string())
+        });
+        let result =
+            import_discovered_skill(&app, &store, source, &name, conflictResolution.as_deref())?;
         Ok::<_, anyhow::Error>(to_install_dto(result))
     })
     .await
@@ -1344,6 +1932,28 @@ pub struct ManagedSkillDto {
     pub status: String,
     pub tags: Vec<TagDto>,
     pub targets: Vec<SkillTargetDto>,
+    pub assignments: Vec<SkillAssignmentDto>,
+    pub source_issue: Option<String>,
+    pub pending_assignment: bool,
+    pub assignment_issue_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillAssignmentDto {
+    pub tool: String,
+    pub scope: String,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub project_path: Option<String>,
+    pub ownership: String,
+    pub state: String,
+    pub last_error: Option<String>,
+    pub valid: bool,
+    pub issue_kind: Option<String>,
+    pub issue_key: Option<String>,
+    pub issue_fingerprint: Option<String>,
+    pub can_ignore: bool,
+    pub issue_ignored: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1372,8 +1982,14 @@ pub struct SkillTargetDto {
 }
 
 #[tauri::command]
-pub fn get_managed_skills(store: State<'_, SkillStore>) -> Result<Vec<ManagedSkillDto>, String> {
-    get_managed_skills_impl(store.inner())
+pub async fn get_managed_skills(
+    store: State<'_, SkillStore>,
+) -> Result<Vec<ManagedSkillDto>, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || get_managed_skills_impl(&store))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(format_anyhow_error)
 }
 
 #[tauri::command]
@@ -1587,6 +2203,14 @@ fn to_auto_update_run_result_dto(result: AutoUpdateRunResult) -> AutoUpdateRunRe
     }
 }
 
+fn to_auto_update_retry_result_dto(result: AutoUpdateRetryResult) -> AutoUpdateRetryResultDto {
+    AutoUpdateRetryResultDto {
+        updated: result.updated,
+        failed: result.failed,
+        config: to_auto_update_config_dto(result.config),
+    }
+}
+
 fn to_github_proxy_config_dto(config: GithubProxyConfig) -> GithubProxyConfigDto {
     GithubProxyConfigDto {
         enabled: config.enabled,
@@ -1603,52 +2227,87 @@ fn now_ms() -> i64 {
     now.as_millis() as i64
 }
 
-fn get_managed_skills_impl(store: &SkillStore) -> Result<Vec<ManagedSkillDto>, String> {
-    let skills = store.list_skills().map_err(|err| err.to_string())?;
-    Ok(skills
-        .into_iter()
-        .map(|skill| {
-            let targets = store
-                .list_skill_targets(&skill.id)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|target| SkillTargetDto {
-                    tool: target.tool,
-                    scope: target.scope,
-                    project_path: target.project_path,
-                    mode: target.mode,
-                    status: target.status,
-                    target_path: target.target_path,
-                    synced_at: target.synced_at,
-                })
-                .collect();
-            let tags = store
-                .get_skill_tags(&skill.id)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|tag| TagDto {
-                    id: tag.id,
-                    name: tag.name,
-                })
-                .collect();
+fn get_managed_skills_impl(store: &SkillStore) -> anyhow::Result<Vec<ManagedSkillDto>> {
+    let tools = assignment_tool_specs(store)?;
+    let projections = managed_skill_projections(store, &tools)?;
+    let mut managed = Vec::with_capacity(projections.len());
+    for projection in projections {
+        let skill = projection.skill;
+        let targets = projection
+            .targets
+            .into_iter()
+            .map(|target| SkillTargetDto {
+                tool: target.tool,
+                scope: target.scope,
+                project_path: target.project_path,
+                mode: target.mode,
+                status: target.status,
+                target_path: target.target_path,
+                synced_at: target.synced_at,
+            })
+            .collect();
+        let assignments = projection
+            .assignments
+            .into_iter()
+            .map(|projection| skill_assignment_dto(store, projection))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let tags = store
+            .get_skill_tags(&skill.id)?
+            .into_iter()
+            .map(|tag| TagDto {
+                id: tag.id,
+                name: tag.name,
+            })
+            .collect();
 
-            ManagedSkillDto {
-                id: skill.id,
-                name: skill.name,
-                description: skill.description,
-                source_type: skill.source_type,
-                source_ref: skill.source_ref,
-                central_path: skill.central_path,
-                created_at: skill.created_at,
-                updated_at: skill.updated_at,
-                last_sync_at: skill.last_sync_at,
-                enabled: skill.enabled,
-                status: skill.status,
-                tags,
-                targets,
-            }
-        })
-        .collect())
+        managed.push(ManagedSkillDto {
+            id: skill.id,
+            name: skill.name,
+            description: skill.description,
+            source_type: skill.source_type,
+            source_ref: skill.source_ref,
+            central_path: skill.central_path,
+            created_at: skill.created_at,
+            updated_at: skill.updated_at,
+            last_sync_at: skill.last_sync_at,
+            enabled: skill.enabled,
+            status: skill.status,
+            tags,
+            targets,
+            assignments,
+            source_issue: projection.source_issue,
+            pending_assignment: projection.pending_assignment,
+            assignment_issue_count: projection.assignment_issue_count,
+        });
+    }
+    Ok(managed)
+}
+
+fn skill_assignment_dto(
+    store: &SkillStore,
+    projection: AssignmentProjection,
+) -> anyhow::Result<SkillAssignmentDto> {
+    let assignment = projection.assignment;
+    let project = match assignment.project_id.as_deref() {
+        Some(project_id) => store.get_project(project_id)?,
+        None => None,
+    };
+    Ok(SkillAssignmentDto {
+        tool: assignment.tool,
+        scope: assignment.scope,
+        project_id: assignment.project_id,
+        project_name: project.as_ref().map(|item| item.name.clone()),
+        project_path: project.map(|item| item.root_path),
+        ownership: assignment.ownership,
+        state: projection.effective_state,
+        last_error: projection.effective_error,
+        valid: projection.valid,
+        issue_kind: projection.issue_kind,
+        issue_key: projection.issue_key,
+        issue_fingerprint: projection.issue_fingerprint,
+        can_ignore: projection.can_ignore,
+        issue_ignored: projection.ignored,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -1733,9 +2392,10 @@ pub struct SkillFileEntry {
 pub async fn list_skill_files(central_path: String) -> Result<Vec<SkillFileEntry>, String> {
     let path = std::path::PathBuf::from(&central_path);
     tauri::async_runtime::spawn_blocking(move || {
-        let entries = crate::core::skill_files::list_files(&path)?;
+        let manifest = crate::core::skill_files::list_files(&path)?;
         Ok::<_, anyhow::Error>(
-            entries
+            manifest
+                .entries
                 .into_iter()
                 .map(|e| SkillFileEntry {
                     path: e.path,
@@ -1753,7 +2413,144 @@ pub async fn list_skill_files(central_path: String) -> Result<Vec<SkillFileEntry
 pub async fn read_skill_file(central_path: String, file_path: String) -> Result<String, String> {
     let base = std::path::PathBuf::from(&central_path);
     tauri::async_runtime::spawn_blocking(move || {
-        crate::core::skill_files::read_file(&base, &file_path)
+        match crate::core::skill_files::read_file(&base, &file_path)? {
+            crate::core::skill_files::FileContent::Text(content) => Ok(content),
+            crate::core::skill_files::FileContent::Image { .. } => {
+                anyhow::bail!("Image files require the skill preview API")
+            }
+            crate::core::skill_files::FileContent::Unsupported(reason) => {
+                anyhow::bail!("File cannot be displayed: {reason}")
+            }
+        }
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SkillPreviewSourceDto {
+    Managed {
+        #[serde(rename = "skillId")]
+        skill_id: String,
+    },
+    Local {
+        #[serde(rename = "basePath")]
+        base_path: String,
+        subpath: String,
+    },
+    Git {
+        #[serde(rename = "repoUrl")]
+        repo_url: String,
+        subpath: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPreviewFileDto {
+    pub path: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPreviewManifestDto {
+    pub files: Vec<SkillPreviewFileDto>,
+    pub truncated: bool,
+    pub revision: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPreviewContentDto {
+    pub kind: String,
+    pub content: Option<String>,
+    pub media_type: Option<String>,
+    pub bytes: Option<Vec<u8>>,
+    pub reason: Option<String>,
+}
+
+fn to_preview_source(source: SkillPreviewSourceDto) -> Result<PreviewSource, anyhow::Error> {
+    Ok(match source {
+        SkillPreviewSourceDto::Managed { skill_id } => PreviewSource::Managed { skill_id },
+        SkillPreviewSourceDto::Local { base_path, subpath } => PreviewSource::Local {
+            base_path: expand_home_path(&base_path)?,
+            subpath,
+        },
+        SkillPreviewSourceDto::Git { repo_url, subpath } => {
+            PreviewSource::Git { repo_url, subpath }
+        }
+    })
+}
+
+#[tauri::command]
+pub async fn list_skill_preview(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    source: SkillPreviewSourceDto,
+    refresh: Option<bool>,
+) -> Result<SkillPreviewManifestDto, String> {
+    let store = store.inner().clone();
+    let source = to_preview_source(source).map_err(format_anyhow_error)?;
+    let refresh = refresh.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = resolve_preview_root(&app, &store, &source, refresh)?;
+        let manifest = list_preview_files(&root)?;
+        Ok::<_, anyhow::Error>(SkillPreviewManifestDto {
+            files: manifest
+                .entries
+                .into_iter()
+                .map(|entry| SkillPreviewFileDto {
+                    path: entry.path,
+                    size: entry.size,
+                })
+                .collect(),
+            truncated: manifest.truncated,
+            revision: root.revision,
+        })
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub async fn read_skill_preview_file(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    source: SkillPreviewSourceDto,
+    file_path: String,
+) -> Result<SkillPreviewContentDto, String> {
+    let store = store.inner().clone();
+    let source = to_preview_source(source).map_err(format_anyhow_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = resolve_preview_root(&app, &store, &source, false)?;
+        let content = read_preview_file(&root, &file_path)?;
+        Ok::<_, anyhow::Error>(match content {
+            FileContent::Text(content) => SkillPreviewContentDto {
+                kind: "text".to_string(),
+                content: Some(content),
+                media_type: None,
+                bytes: None,
+                reason: None,
+            },
+            FileContent::Image { media_type, bytes } => SkillPreviewContentDto {
+                kind: "image".to_string(),
+                content: None,
+                media_type: Some(media_type),
+                bytes: Some(bytes),
+                reason: None,
+            },
+            FileContent::Unsupported(reason) => SkillPreviewContentDto {
+                kind: "unsupported".to_string(),
+                content: None,
+                media_type: None,
+                bytes: None,
+                reason: Some(reason),
+            },
+        })
     })
     .await
     .map_err(|err| err.to_string())?
@@ -1764,6 +2561,941 @@ pub async fn read_skill_file(central_path: String, file_path: String) -> Result<
 pub fn cancel_current_operation(cancel: State<'_, Arc<CancelToken>>) -> Result<(), String> {
     cancel.cancel();
     Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DeviceSyncConfigDto {
+    pub visibility: crate::core::device_sync::types::RepositoryVisibility,
+    pub public_upload_confirmed: bool,
+    pub provider: ProviderId,
+    pub remote_url: String,
+    pub branch: String,
+    pub username: Option<String>,
+    pub auto_check: bool,
+    pub auto_sync: bool,
+    pub auto_sync_schedule: Option<crate::core::device_sync::scheduler::SyncSchedule>,
+    pub has_credential: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SaveDeviceSyncConfigInput {
+    #[serde(default)]
+    pub visibility: crate::core::device_sync::types::RepositoryVisibility,
+    #[serde(default)]
+    pub public_upload_confirmed: bool,
+    pub provider: ProviderId,
+    pub remote_url: String,
+    pub branch: String,
+    pub username: Option<String>,
+    pub token: Option<String>,
+    pub credential_key: Option<String>,
+    pub auto_check: bool,
+    pub auto_sync: bool,
+    #[serde(default)]
+    pub auto_sync_schedule: Option<crate::core::device_sync::scheduler::SyncSchedule>,
+}
+
+#[tauri::command]
+pub fn get_device_sync_config(
+    store: State<'_, SkillStore>,
+) -> Result<Option<DeviceSyncConfigDto>, String> {
+    store
+        .get_device_sync_config()
+        .map(|config| {
+            config.map(|item| DeviceSyncConfigDto {
+                visibility: item.visibility,
+                public_upload_confirmed: item.public_upload_confirmed,
+                provider: item.provider,
+                remote_url: item.remote_url,
+                branch: item.branch,
+                username: item.username,
+                auto_check: item.auto_check,
+                auto_sync: item.auto_sync && item.auto_sync_schedule.is_some(),
+                auto_sync_schedule: item.auto_sync_schedule,
+                has_credential: item.credential_key.is_some(),
+            })
+        })
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub fn save_device_sync_config(
+    store: State<'_, SkillStore>,
+    config: SaveDeviceSyncConfigInput,
+) -> Result<DeviceSyncConfigDto, String> {
+    let _sync_guard =
+        crate::core::device_sync::try_lock_device_sync().map_err(format_anyhow_error)?;
+    if config.auto_sync && config.auto_sync_schedule.is_none() {
+        return Err("choose an automatic sync schedule".to_string());
+    }
+    if let Some(schedule) = &config.auto_sync_schedule {
+        schedule.validate().map_err(format_anyhow_error)?;
+    }
+    if config.remote_url.trim().is_empty() {
+        return Err("device sync repository URL is empty".to_string());
+    }
+    validate_device_sync_remote(&config.remote_url)?;
+    let branch = if config.branch.trim().is_empty() {
+        "main"
+    } else {
+        config.branch.trim()
+    };
+    if !git2::Reference::is_valid_name(&format!("refs/heads/{branch}")) {
+        return Err("invalid device sync branch name".to_string());
+    }
+    let credentials = SystemCredentialStore;
+    let previous = store
+        .get_device_sync_config()
+        .map_err(format_anyhow_error)?;
+    let same_repository = previous.as_ref().is_some_and(|item| {
+        item.provider == config.provider
+            && item.remote_url == config.remote_url.trim()
+            && item.branch == branch
+    });
+    let requested_credential_key = config
+        .credential_key
+        .filter(|value| !value.trim().is_empty());
+    let remote_usage = CredentialUsage::from_https_remote(config.provider, &config.remote_url).ok();
+    if let Some(key) = requested_credential_key.as_deref() {
+        let usage = remote_usage
+            .as_ref()
+            .ok_or_else(|| "token authentication requires an HTTPS repository URL".to_string())?;
+        let proxy_url = get_github_proxy_url_core(&store).map_err(format_anyhow_error)?;
+        if resolve_access_token_with_proxy(&credentials, key, usage, &proxy_url)
+            .map_err(format_anyhow_error)?
+            .is_none()
+        {
+            return Err("OAuth authorization is no longer available; sign in again".to_string());
+        }
+    }
+    let credential_key = requested_credential_key.or_else(|| {
+        remote_usage
+            .as_ref()
+            .and_then(|usage| inherited_device_sync_credential(previous.as_ref(), usage))
+    });
+    let manual_token = config
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string);
+    let saved = DeviceSyncConfig {
+        visibility: config.visibility,
+        public_upload_confirmed: config.public_upload_confirmed
+            && config.visibility == crate::core::device_sync::types::RepositoryVisibility::Public,
+        provider: config.provider,
+        remote_url: config.remote_url.trim().to_string(),
+        branch: branch.to_string(),
+        username: config.username.filter(|value| !value.trim().is_empty()),
+        credential_key,
+        auto_check: config.auto_check,
+        auto_sync: config.auto_sync,
+        auto_sync_schedule: config.auto_sync_schedule,
+        last_synced_commit: if same_repository {
+            previous
+                .as_ref()
+                .and_then(|item| item.last_synced_commit.clone())
+        } else {
+            None
+        },
+    };
+    let persist_config = |candidate: &DeviceSyncConfig| -> anyhow::Result<()> {
+        if previous.is_some() && !same_repository {
+            store.clear_device_sync_repository_state()?;
+        }
+        store.save_device_sync_config(candidate)
+    };
+    let replaced_credential_key = previous
+        .as_ref()
+        .and_then(|item| item.credential_key.as_deref())
+        .filter(|old_key| {
+            manual_token.is_some() || Some(*old_key) != saved.credential_key.as_deref()
+        });
+    let saved = persist_device_sync_credential_replacement_with(
+        &store,
+        &credentials,
+        replaced_credential_key,
+        || {
+            if let Some(token) = manual_token.as_deref() {
+                let usage = remote_usage
+                    .as_ref()
+                    .context("token authentication requires an HTTPS repository URL")?;
+                persist_config_with_staged_personal_access_token(
+                    &store,
+                    &credentials,
+                    usage,
+                    token,
+                    saved,
+                    persist_config,
+                )
+            } else {
+                persist_config(&saved)?;
+                Ok(saved)
+            }
+        },
+    )
+    .map_err(format_anyhow_error)?;
+    if load_pending_oauth(&store)
+        .map_err(format_anyhow_error)?
+        .is_some()
+    {
+        clear_pending_oauth_with_credentials(&store, &credentials, true)
+            .map_err(format_anyhow_error)?;
+    }
+    Ok(DeviceSyncConfigDto {
+        provider: saved.provider,
+        remote_url: saved.remote_url,
+        branch: saved.branch,
+        username: saved.username,
+        auto_check: saved.auto_check,
+        auto_sync: saved.auto_sync,
+        auto_sync_schedule: saved.auto_sync_schedule,
+        has_credential: saved.credential_key.is_some(),
+        visibility: saved.visibility,
+        public_upload_confirmed: saved.public_upload_confirmed,
+    })
+}
+
+#[tauri::command]
+pub fn get_device_sync_oauth_availability() -> Vec<OAuthProviderAvailability> {
+    oauth::availability()
+}
+
+#[tauri::command]
+pub fn get_device_sync_pending_oauth(
+    store: State<'_, SkillStore>,
+) -> Result<Option<PendingOAuthAuthorization>, String> {
+    load_pending_oauth(&store).map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn start_device_sync_oauth(
+    store: State<'_, SkillStore>,
+    providerId: ProviderId,
+) -> Result<OAuthStartResult, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let proxy_url = oauth_proxy_url(&store, providerId)?;
+        oauth::start(providerId, &proxy_url)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn poll_device_sync_oauth(
+    store: State<'_, SkillStore>,
+    flowId: String,
+) -> Result<OAuthPollResult, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let credentials = SystemCredentialStore;
+        let proxy_url = get_github_proxy_url_core(&store)?;
+        poll_device_sync_oauth_with(
+            &store,
+            &credentials,
+            || oauth::poll(&flowId, &credentials, &proxy_url),
+            |pending| save_pending_oauth(&store, pending),
+        )
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub fn clear_device_sync_pending_oauth(store: State<'_, SkillStore>) -> Result<(), String> {
+    let _sync_guard =
+        crate::core::device_sync::try_lock_device_sync().map_err(format_anyhow_error)?;
+    clear_pending_oauth(&store, true).map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub fn cancel_device_sync_oauth(flowId: String) {
+    oauth::cancel(&flowId);
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn validate_device_sync_account(
+    store: State<'_, SkillStore>,
+    providerId: ProviderId,
+    token: String,
+) -> Result<ProviderAccount, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let proxy_url = get_github_proxy_url_core(&store)?;
+        provider(providerId, &proxy_url)?.validate_token(token.trim())
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn create_device_sync_repository(
+    store: State<'_, SkillStore>,
+    providerId: ProviderId,
+    token: Option<String>,
+    credentialKey: Option<String>,
+    name: String,
+) -> Result<RemoteRepository, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let token = resolve_device_sync_token(&store, providerId, token, credentialKey)?;
+        let proxy_url = get_github_proxy_url_core(&store)?;
+        let provider = provider(providerId, &proxy_url)?;
+        provider.validate_token(token.trim())?;
+        provider.create_private_repository(token.trim(), &name)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn list_device_sync_repositories(
+    store: State<'_, SkillStore>,
+    providerId: ProviderId,
+    token: Option<String>,
+    credentialKey: Option<String>,
+) -> Result<Vec<RemoteRepository>, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let token = resolve_device_sync_token(&store, providerId, token, credentialKey)?;
+        let proxy_url = get_github_proxy_url_core(&store)?;
+        provider(providerId, &proxy_url)?.list_repositories(&token)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub fn get_device_sync_status(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+) -> Result<SyncStatus, String> {
+    let (workspace, central) = device_sync_paths(&app, &store).map_err(format_anyhow_error)?;
+    let credentials = SystemCredentialStore;
+    let service = DeviceSyncService::new(&store, &credentials, workspace, central);
+    let mut status = service.status().map_err(format_anyhow_error)?;
+    let runtime = app
+        .try_state::<crate::core::device_sync::scheduler::SchedulerRuntime>()
+        .map(|state| state.inner().clone())
+        .unwrap_or_default();
+    status.schedule_status = Some(
+        runtime
+            .status(&store, status.conflict_count > 0, status.is_running)
+            .map_err(format_anyhow_error)?,
+    );
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn check_device_sync(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+) -> Result<SyncChangeSummary, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation_lock = acquire_operation_lock(&app, OperationKind::DeviceSync)?;
+        let (workspace, central) = device_sync_paths(&app, &store)?;
+        let credentials = SystemCredentialStore;
+        DeviceSyncService::new(&store, &credentials, workspace, central).check()
+    })
+    .await
+    .map_err(|_| "DEVICE_SYNC_FAILURE_unknown".to_string())?
+    .map_err(crate::core::device_sync::errors::format_error)
+}
+
+#[tauri::command]
+pub async fn run_device_sync(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+) -> Result<SyncRunResult, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation_lock = acquire_operation_lock(&app, OperationKind::DeviceSync)?;
+        let (workspace, central) = device_sync_paths(&app, &store)?;
+        let credentials = SystemCredentialStore;
+        DeviceSyncService::new(&store, &credentials, workspace, central).sync()
+    })
+    .await
+    .map_err(|_| "DEVICE_SYNC_FAILURE_unknown".to_string())?
+    .map_err(crate::core::device_sync::errors::format_error)
+}
+
+#[tauri::command]
+pub fn get_device_sync_history(
+    store: State<'_, SkillStore>,
+    limit: Option<usize>,
+) -> Result<Vec<SyncHistoryEntry>, String> {
+    store
+        .list_device_sync_history(limit.unwrap_or(50).clamp(1, DEVICE_SYNC_HISTORY_LIMIT))
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub fn get_device_sync_devices(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+) -> Result<Vec<DeviceSyncDevice>, String> {
+    let (workspace, central) = device_sync_paths(&app, &store).map_err(format_anyhow_error)?;
+    let credentials = SystemCredentialStore;
+    DeviceSyncService::new(&store, &credentials, workspace, central)
+        .devices()
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub fn set_device_sync_device_alias(
+    store: State<'_, SkillStore>,
+    deviceId: String,
+    alias: Option<String>,
+) -> Result<(), String> {
+    store
+        .set_device_sync_device_alias(&deviceId, alias.as_deref())
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub fn get_device_sync_conflicts(
+    store: State<'_, SkillStore>,
+) -> Result<Vec<SyncConflict>, String> {
+    store
+        .list_device_sync_conflicts()
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub fn get_device_sync_trash(store: State<'_, SkillStore>) -> Result<Vec<TrashEntry>, String> {
+    store.list_device_sync_trash().map_err(format_anyhow_error)
+}
+
+#[derive(Serialize)]
+pub struct RecycleBinLocationsDto {
+    pub manual_backup: String,
+    pub sync_backup: String,
+}
+
+#[tauri::command]
+pub fn get_recycle_bin_locations(app: tauri::AppHandle) -> Result<RecycleBinLocationsDto, String> {
+    let root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    Ok(RecycleBinLocationsDto {
+        manual_backup: root.join("recycle-bin").to_string_lossy().into_owned(),
+        sync_backup: root
+            .join("device-sync")
+            .join("trash")
+            .to_string_lossy()
+            .into_owned(),
+    })
+}
+
+#[tauri::command]
+pub fn get_recycle_bin_items(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+) -> Result<Vec<RecycleBinItem>, String> {
+    let root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("recycle-bin");
+    RecycleBinService::new(&store, root)
+        .list()
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn restore_recycle_bin_item(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    trashId: String,
+    targetIds: Vec<String>,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation_lock = acquire_operation_lock(&app, OperationKind::Restore)?;
+        let root = app.path().app_data_dir()?.join("recycle-bin");
+        let service = RecycleBinService::new(&store, root);
+        if service.has_snapshot(&trashId)? {
+            let _device_sync_guard = if store.get_device_sync_config()?.is_some() {
+                Some(crate::core::device_sync::try_lock_device_sync()?)
+            } else {
+                None
+            };
+            service.restore_with_targets(&trashId, Some(&targetIds))
+        } else {
+            let (workspace, central) = device_sync_paths(&app, &store)?;
+            let credentials = SystemCredentialStore;
+            DeviceSyncService::new(&store, &credentials, workspace, central).restore_trash(&trashId)
+        }
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn delete_recycle_bin_item(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    trashId: String,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation_lock = acquire_operation_lock(&app, OperationKind::Delete)?;
+        let root = app.path().app_data_dir()?.join("recycle-bin");
+        RecycleBinService::new(&store, root).delete_permanently(&trashId)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn clear_recycle_bin(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    trashIds: Vec<String>,
+) -> Result<usize, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation_lock = acquire_operation_lock(&app, OperationKind::Delete)?;
+        let root = app.path().app_data_dir()?.join("recycle-bin");
+        RecycleBinService::new(&store, root).clear(&trashIds)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn resolve_device_sync_conflict(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    conflictId: String,
+    resolution: ConflictResolution,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation_lock = acquire_operation_lock(&app, OperationKind::DeviceSync)?;
+        let (workspace, central) = device_sync_paths(&app, &store)?;
+        let credentials = SystemCredentialStore;
+        DeviceSyncService::new(&store, &credentials, workspace, central)
+            .resolve_conflict(&conflictId, resolution)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn restore_device_sync_trash(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    trashId: String,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation_lock = acquire_operation_lock(&app, OperationKind::Restore)?;
+        let (workspace, central) = device_sync_paths(&app, &store)?;
+        let credentials = SystemCredentialStore;
+        DeviceSyncService::new(&store, &credentials, workspace, central).restore_trash(&trashId)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub fn disconnect_device_sync(store: State<'_, SkillStore>) -> Result<(), String> {
+    let _sync_guard =
+        crate::core::device_sync::try_lock_device_sync().map_err(format_anyhow_error)?;
+    disconnect_device_sync_with_credentials(&store, &SystemCredentialStore)
+        .map_err(format_anyhow_error)
+}
+
+fn disconnect_device_sync_with_credentials(
+    store: &SkillStore,
+    credentials: &dyn CredentialStore,
+) -> anyhow::Result<()> {
+    retry_queued_credential_cleanup(store, credentials)?;
+    if let Some(key) = store
+        .get_device_sync_config()?
+        .and_then(|config| config.credential_key)
+    {
+        enqueue_credential_cleanup(store, &key)?;
+    }
+    clear_pending_oauth_with_credentials(store, credentials, true)?;
+    store.clear_device_sync_repository_state()?;
+    store.clear_device_sync_config()?;
+    retry_queued_credential_cleanup(store, credentials)
+}
+
+fn load_pending_oauth(store: &SkillStore) -> anyhow::Result<Option<PendingOAuthAuthorization>> {
+    store
+        .get_setting(DEVICE_SYNC_PENDING_OAUTH_SETTING)?
+        .map(|value| serde_json::from_str(&value).context("decode pending OAuth authorization"))
+        .transpose()
+}
+
+fn save_pending_oauth(
+    store: &SkillStore,
+    pending: &PendingOAuthAuthorization,
+) -> anyhow::Result<()> {
+    store.set_setting(
+        DEVICE_SYNC_PENDING_OAUTH_SETTING,
+        &serde_json::to_string(pending)?,
+    )
+}
+
+pub(crate) fn poll_device_sync_oauth_with<P, S>(
+    store: &SkillStore,
+    credentials: &dyn CredentialStore,
+    poll: P,
+    save: S,
+) -> anyhow::Result<OAuthPollResult>
+where
+    P: FnOnce() -> anyhow::Result<OAuthPollResult>,
+    S: FnOnce(&PendingOAuthAuthorization) -> anyhow::Result<()>,
+{
+    let _sync_guard = crate::core::device_sync::try_lock_device_sync()?;
+    retry_queued_credential_cleanup(store, credentials)?;
+    let result = poll()?;
+    persist_pending_oauth_result_with(store, credentials, &result, save)?;
+    Ok(result)
+}
+
+fn clear_pending_oauth(store: &SkillStore, delete_credential: bool) -> anyhow::Result<()> {
+    clear_pending_oauth_with_credentials(store, &SystemCredentialStore, delete_credential)
+}
+
+fn clear_pending_oauth_with_credentials(
+    store: &SkillStore,
+    credentials: &dyn CredentialStore,
+    delete_credential: bool,
+) -> anyhow::Result<()> {
+    let pending = load_pending_oauth(store)?;
+    let delete_key = if delete_credential {
+        pending
+            .as_ref()
+            .map(|pending| {
+                credential_key_is_active(store, &pending.credential_key)
+                    .map(|active| (!active).then(|| pending.credential_key.clone()))
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    if let Some(key) = delete_key.as_deref() {
+        enqueue_credential_cleanup(store, key)?;
+    }
+    store.delete_setting(DEVICE_SYNC_PENDING_OAUTH_SETTING)?;
+    retry_queued_credential_cleanup(store, credentials)?;
+    Ok(())
+}
+
+fn load_credential_cleanup_queue(store: &SkillStore) -> anyhow::Result<Vec<String>> {
+    let mut keys = store
+        .get_setting(DEVICE_SYNC_CREDENTIAL_CLEANUP_QUEUE_SETTING)?
+        .map(|value| {
+            serde_json::from_str::<Vec<String>>(&value).context("decode credential cleanup queue")
+        })
+        .transpose()?
+        .unwrap_or_default();
+    keys.retain(|key| !key.trim().is_empty());
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
+fn save_credential_cleanup_queue(store: &SkillStore, keys: &[String]) -> anyhow::Result<()> {
+    if keys.is_empty() {
+        store.delete_setting(DEVICE_SYNC_CREDENTIAL_CLEANUP_QUEUE_SETTING)
+    } else {
+        store.set_setting(
+            DEVICE_SYNC_CREDENTIAL_CLEANUP_QUEUE_SETTING,
+            &serde_json::to_string(keys)?,
+        )
+    }
+}
+
+fn enqueue_credential_cleanup(store: &SkillStore, key: &str) -> anyhow::Result<()> {
+    let mut keys = load_credential_cleanup_queue(store)?;
+    if !keys.iter().any(|queued| queued == key) {
+        keys.push(key.to_string());
+        keys.sort();
+        save_credential_cleanup_queue(store, &keys)?;
+    }
+    Ok(())
+}
+
+fn dequeue_credential_cleanup(store: &SkillStore, key: &str) -> anyhow::Result<()> {
+    let mut keys = load_credential_cleanup_queue(store)?;
+    keys.retain(|queued| queued != key);
+    save_credential_cleanup_queue(store, &keys)
+}
+
+fn persist_device_sync_credential_replacement_with<T, F>(
+    store: &SkillStore,
+    credentials: &dyn CredentialStore,
+    replaced_credential_key: Option<&str>,
+    persist: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce() -> anyhow::Result<T>,
+{
+    retry_queued_credential_cleanup(store, credentials)?;
+    if let Some(key) = replaced_credential_key {
+        enqueue_credential_cleanup(store, key)?;
+    }
+    let value = persist()?;
+    retry_queued_credential_cleanup(store, credentials)?;
+    Ok(value)
+}
+
+pub(crate) fn retry_queued_credential_cleanup(
+    store: &SkillStore,
+    credentials: &dyn CredentialStore,
+) -> anyhow::Result<()> {
+    let keys = load_credential_cleanup_queue(store)?;
+    let ownership = keys
+        .iter()
+        .map(|key| credential_key_is_owned(store, key).map(|owned| (key, owned)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut remaining = Vec::new();
+    let mut first_error = None;
+    for (key, owned) in ownership {
+        if owned {
+            remaining.push(key.clone());
+            continue;
+        }
+        if let Err(err) = credentials.delete(key) {
+            remaining.push(key.clone());
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        }
+    }
+    save_credential_cleanup_queue(store, &remaining)?;
+    if let Some(err) = first_error {
+        return Err(err).context("delete queued device sync credential");
+    }
+    Ok(())
+}
+
+fn persist_pending_oauth_result_with<F>(
+    store: &SkillStore,
+    credentials: &dyn CredentialStore,
+    result: &OAuthPollResult,
+    save: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&PendingOAuthAuthorization) -> anyhow::Result<()>,
+{
+    let (Some(credential_key), Some(account)) =
+        (result.credential_key.as_ref(), result.account.as_ref())
+    else {
+        return retry_queued_credential_cleanup(store, credentials);
+    };
+    let previous = match load_pending_oauth(store) {
+        Ok(previous) => previous,
+        Err(err) => {
+            return defer_credential_cleanup_after_failure(store, credentials, credential_key, err);
+        }
+    };
+    let previous_key = previous
+        .as_ref()
+        .map(|pending| pending.credential_key.as_str())
+        .filter(|previous_key| *previous_key != credential_key);
+    if let Some(previous_key) = previous_key {
+        let previous_is_active = match credential_key_is_active(store, previous_key) {
+            Ok(active) => active,
+            Err(err) => {
+                return defer_credential_cleanup_after_failure(
+                    store,
+                    credentials,
+                    credential_key,
+                    err,
+                );
+            }
+        };
+        if !previous_is_active {
+            if let Err(err) = enqueue_credential_cleanup(store, previous_key) {
+                return defer_credential_cleanup_after_failure(
+                    store,
+                    credentials,
+                    credential_key,
+                    err,
+                );
+            }
+        }
+    }
+    let pending = PendingOAuthAuthorization {
+        provider: result.provider,
+        credential_key: credential_key.clone(),
+        account: account.clone(),
+    };
+    if let Err(err) = save(&pending) {
+        return defer_credential_cleanup_after_failure(store, credentials, credential_key, err);
+    }
+    retry_queued_credential_cleanup(store, credentials)
+}
+
+fn defer_credential_cleanup_after_failure<T>(
+    store: &SkillStore,
+    credentials: &dyn CredentialStore,
+    key: &str,
+    primary_error: anyhow::Error,
+) -> anyhow::Result<T> {
+    let cleanup_result = match enqueue_credential_cleanup(store, key) {
+        Ok(()) => retry_queued_credential_cleanup(store, credentials),
+        Err(queue_error) => match credentials.delete(key) {
+            Ok(()) => Ok(()),
+            Err(delete_error) => Err(delete_error).with_context(|| {
+                format!(
+                    "persist cleanup intent after {queue_error:#} and delete uncommitted credential"
+                )
+            }),
+        },
+    };
+    match cleanup_result {
+        Ok(()) => Err(primary_error),
+        Err(cleanup_error) => Err(cleanup_error).with_context(|| {
+            format!("operation failed and credential cleanup was deferred: {primary_error:#}")
+        }),
+    }
+}
+
+fn credential_key_is_active(store: &SkillStore, key: &str) -> anyhow::Result<bool> {
+    Ok(store
+        .get_device_sync_config()?
+        .and_then(|config| config.credential_key)
+        .as_deref()
+        == Some(key))
+}
+
+fn credential_key_is_owned(store: &SkillStore, key: &str) -> anyhow::Result<bool> {
+    if credential_key_is_active(store, key)? {
+        return Ok(true);
+    }
+    Ok(load_pending_oauth(store)?
+        .map(|pending| pending.credential_key == key)
+        .unwrap_or(false))
+}
+
+fn persist_config_with_staged_personal_access_token<F>(
+    store: &SkillStore,
+    credentials: &dyn CredentialStore,
+    usage: &CredentialUsage,
+    token: &str,
+    mut config: DeviceSyncConfig,
+    save: F,
+) -> anyhow::Result<DeviceSyncConfig>
+where
+    F: FnOnce(&DeviceSyncConfig) -> anyhow::Result<()>,
+{
+    let staged_key = Uuid::new_v4().to_string();
+    enqueue_credential_cleanup(store, &staged_key)?;
+    if let Err(err) = save_personal_access_token(credentials, &staged_key, usage, token) {
+        return defer_credential_cleanup_after_failure(store, credentials, &staged_key, err);
+    }
+    config.credential_key = Some(staged_key.clone());
+    if let Err(err) = save(&config) {
+        return defer_credential_cleanup_after_failure(store, credentials, &staged_key, err);
+    }
+    dequeue_credential_cleanup(store, &staged_key)?;
+    retry_queued_credential_cleanup(store, credentials)?;
+    Ok(config)
+}
+
+fn device_sync_paths(
+    app: &tauri::AppHandle,
+    store: &SkillStore,
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let paths = crate::runtime_paths_for_tauri(app)?;
+    let workspace = paths.app_data_dir.join("device-sync");
+    let central = resolve_central_repo_from_runtime(&paths, store)?;
+    Ok((workspace, central))
+}
+
+fn resolve_device_sync_token(
+    store: &SkillStore,
+    provider: ProviderId,
+    token: Option<String>,
+    credential_key: Option<String>,
+) -> anyhow::Result<String> {
+    if let Some(token) = token.filter(|value| !value.trim().is_empty()) {
+        return Ok(token.trim().to_string());
+    }
+    let key = credential_key
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            store
+                .get_device_sync_config()
+                .ok()
+                .flatten()
+                .filter(|config| config.provider == provider)
+                .and_then(|config| config.credential_key)
+        })
+        .context("sign in or provide an access token first")?;
+    let proxy_url = get_github_proxy_url_core(store)?;
+    resolve_access_token_with_proxy(
+        &SystemCredentialStore,
+        &key,
+        &CredentialUsage::official(provider),
+        &proxy_url,
+    )
+    .context("read saved device sync authorization")?
+    .context("saved authorization is unavailable; sign in again")
+}
+
+fn inherited_device_sync_credential(
+    previous: Option<&DeviceSyncConfig>,
+    expected_usage: &CredentialUsage,
+) -> Option<String> {
+    let previous = previous?;
+    let previous_usage =
+        CredentialUsage::from_https_remote(previous.provider, &previous.remote_url).ok()?;
+    (previous_usage == *expected_usage)
+        .then(|| previous.credential_key.clone())
+        .flatten()
+}
+
+fn validate_device_sync_remote(value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.contains(['\n', '\r']) || value.contains('?') || value.contains('#') {
+        return Err("device sync repository URL contains unsupported characters".to_string());
+    }
+    if let Some(rest) = value.strip_prefix("https://") {
+        let authority = rest.split('/').next().unwrap_or_default();
+        if authority.contains('@') {
+            return Err("do not include credentials in the repository URL".to_string());
+        }
+        return Ok(());
+    }
+    if value.starts_with("ssh://") || value.starts_with("git@") {
+        return Ok(());
+    }
+    Err("use an HTTPS or SSH repository URL".to_string())
 }
 
 #[cfg(test)]

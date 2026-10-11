@@ -575,23 +575,6 @@ pub fn default_tool_adapters() -> Vec<ToolAdapter> {
     ]
 }
 
-/// Tools can share the same global skills directory (e.g. Amp and Kimi Code CLI).
-/// Use this to coordinate UI warnings and avoid duplicate filesystem operations.
-pub fn adapters_sharing_skills_dir(adapter: &ToolAdapter) -> Vec<ToolAdapter> {
-    default_tool_adapters()
-        .into_iter()
-        .filter(|a| a.relative_skills_dir == adapter.relative_skills_dir)
-        .collect()
-}
-
-pub fn adapters_sharing_project_skills_dir(adapter: &ToolAdapter) -> Vec<ToolAdapter> {
-    let relative = project_relative_skills_dir(adapter);
-    default_tool_adapters()
-        .into_iter()
-        .filter(|a| project_relative_skills_dir(a) == relative)
-        .collect()
-}
-
 pub fn adapter_by_key(key: &str) -> Option<ToolAdapter> {
     default_tool_adapters()
         .into_iter()

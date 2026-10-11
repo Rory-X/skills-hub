@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use crate::core::skill_store::{SkillRecord, SkillStore, SkillTargetRecord};
+use crate::core::skill_store::{
+    IgnoredIssueRecord, ProjectRecord, ProjectSkillLinkRecord, SkillAssignmentRecord, SkillRecord,
+    SkillStore, SkillTargetRecord,
+};
 use rusqlite::Connection;
 
 fn make_store() -> (tempfile::TempDir, SkillStore) {
@@ -375,6 +378,185 @@ fn deleting_skill_cascades_targets() {
 
     store.delete_skill("s1").unwrap();
     assert_eq!(store.list_skill_targets("s1").unwrap().len(), 0);
+}
+
+#[test]
+fn skill_assignments_upsert_update_and_delete_precisely() {
+    let (_dir, store) = make_store();
+    store
+        .upsert_skill(&make_skill("s1", "S1", "/central/s1", 1))
+        .unwrap();
+
+    let global = SkillAssignmentRecord {
+        id: "a-global".to_string(),
+        skill_id: "s1".to_string(),
+        tool: "codex".to_string(),
+        scope: "global".to_string(),
+        project_id: None,
+        ownership: "hub".to_string(),
+        state: "active".to_string(),
+        last_error: None,
+        created_at: 1,
+        updated_at: 1,
+    };
+    store.upsert_skill_assignment(&global).unwrap();
+
+    let mut updated = global.clone();
+    updated.id = "replacement-id".to_string();
+    updated.state = "error".to_string();
+    updated.last_error = Some("disk full".to_string());
+    updated.updated_at = 2;
+    store.upsert_skill_assignment(&updated).unwrap();
+
+    let stored = store
+        .get_skill_assignment("s1", "codex", "global", None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.id, "a-global");
+    assert_eq!(stored.state, "error");
+    assert_eq!(stored.last_error.as_deref(), Some("disk full"));
+
+    let project = ProjectRecord {
+        id: "p1".to_string(),
+        name: "Project".to_string(),
+        root_path: "/projects/one".to_string(),
+        enabled_tool_keys: vec!["codex".to_string()],
+        local_git_exclude_enabled: false,
+        created_at: 1,
+        updated_at: 1,
+        last_scanned_at: None,
+    };
+    store.insert_project(&project).unwrap();
+    store
+        .upsert_skill_assignment(&SkillAssignmentRecord {
+            id: "a-project".to_string(),
+            skill_id: "s1".to_string(),
+            tool: "codex".to_string(),
+            scope: "project".to_string(),
+            project_id: Some(project.id.clone()),
+            ownership: "native".to_string(),
+            state: "active".to_string(),
+            last_error: None,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+
+    assert_eq!(store.list_skill_assignments("s1").unwrap().len(), 2);
+    store
+        .delete_skill_assignment("s1", "codex", "project", Some("p1"))
+        .unwrap();
+    assert_eq!(store.list_skill_assignments("s1").unwrap(), vec![stored]);
+}
+
+#[test]
+fn migrates_v7_targets_and_project_links_into_assignments() {
+    let (dir, store) = make_store();
+    let skill = make_skill("s1", "S1", "/central/s1", 1);
+    store.upsert_skill(&skill).unwrap();
+    let project = ProjectRecord {
+        id: "p1".to_string(),
+        name: "Project".to_string(),
+        root_path: "/projects/one".to_string(),
+        enabled_tool_keys: vec!["codex".to_string(), "cursor".to_string()],
+        local_git_exclude_enabled: false,
+        created_at: 1,
+        updated_at: 2,
+        last_scanned_at: None,
+    };
+    store.insert_project(&project).unwrap();
+    store
+        .upsert_skill_target(&SkillTargetRecord {
+            id: "target-global".to_string(),
+            skill_id: skill.id.clone(),
+            tool: "codex".to_string(),
+            scope: "global".to_string(),
+            project_path: None,
+            target_path: "/target/s1".to_string(),
+            mode: "copy".to_string(),
+            status: "ok".to_string(),
+            last_error: None,
+            synced_at: Some(3),
+        })
+        .unwrap();
+    store
+        .upsert_project_skill_link(&ProjectSkillLinkRecord {
+            project_id: project.id.clone(),
+            skill_id: skill.id.clone(),
+            enabled: true,
+            desired_tools: vec!["codex".to_string(), "cursor".to_string()],
+            status: "ok".to_string(),
+            created_at: 1,
+            updated_at: 2,
+        })
+        .unwrap();
+
+    let conn = Connection::open(dir.path().join("test.db")).unwrap();
+    conn.execute_batch(
+        "DROP TABLE skill_assignments;
+         DROP TABLE ignored_issues;
+         PRAGMA user_version = 7;",
+    )
+    .unwrap();
+    drop(conn);
+
+    store.ensure_schema().unwrap();
+    let assignments = store.list_skill_assignments("s1").unwrap();
+    assert_eq!(assignments.len(), 3);
+    assert!(assignments
+        .iter()
+        .any(|item| { item.scope == "global" && item.tool == "codex" && item.ownership == "hub" }));
+    assert!(assignments.iter().any(|item| {
+        item.scope == "project"
+            && item.tool == "codex"
+            && item.project_id.as_deref() == Some("p1")
+            && item.ownership == "native"
+    }));
+    assert!(assignments.iter().any(|item| {
+        item.scope == "project"
+            && item.tool == "cursor"
+            && item.project_id.as_deref() == Some("p1")
+            && item.ownership == "native"
+    }));
+}
+
+#[test]
+fn ignored_issues_match_only_the_same_problem_instance() {
+    let (_dir, store) = make_store();
+    let ignored = IgnoredIssueRecord {
+        id: "ignored-1".to_string(),
+        scope: "project".to_string(),
+        scope_id: Some("p1".to_string()),
+        issue_key: "target_missing:s1:codex".to_string(),
+        fingerprint: "fingerprint-a".to_string(),
+        ignored_at: 10,
+    };
+    store.upsert_ignored_issue(&ignored).unwrap();
+
+    assert!(store
+        .is_issue_ignored(
+            "project",
+            Some("p1"),
+            "target_missing:s1:codex",
+            "fingerprint-a",
+        )
+        .unwrap());
+    assert!(!store
+        .is_issue_ignored(
+            "project",
+            Some("p1"),
+            "target_missing:s1:codex",
+            "fingerprint-b",
+        )
+        .unwrap());
+    assert!(!store
+        .is_issue_ignored(
+            "project",
+            Some("p2"),
+            "target_missing:s1:codex",
+            "fingerprint-a",
+        )
+        .unwrap());
 }
 
 #[test]
