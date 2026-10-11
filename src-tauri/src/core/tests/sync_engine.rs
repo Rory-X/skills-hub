@@ -1,8 +1,12 @@
 use std::fs;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 use crate::core::sync_engine::{
-    copy_dir_recursive, sync_dir_for_tool_with_overwrite, sync_dir_hybrid,
-    sync_dir_hybrid_with_overwrite, SyncMode,
+    copy_dir_recursive, path_is_protected_real_content, remove_path_safely_with,
+    sync_dir_for_tool_with_overwrite, sync_dir_hybrid, sync_dir_hybrid_with_overwrite,
+    sync_dir_with_mode_with_overwrite, sync_managed_copy_with_expected_hash,
+    PreparedDirReplacement, SyncMode,
 };
 
 #[test]
@@ -59,24 +63,100 @@ fn hybrid_sync_with_overwrite_replaces_existing() {
     assert!(out.replaced);
 }
 
+#[test]
+fn overwrite_rejects_same_source_and_target_without_deleting_source() {
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("keep.txt"), b"keep").unwrap();
+
+    let err = sync_dir_hybrid_with_overwrite(source.path(), source.path(), true).unwrap_err();
+
+    assert!(err.to_string().contains("overlap"));
+    assert_eq!(fs::read(source.path().join("keep.txt")).unwrap(), b"keep");
+}
+
+#[test]
+fn copy_sync_rejects_target_inside_source_without_creating_it() {
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("keep.txt"), b"keep").unwrap();
+    let target = source.path().join("nested/skill");
+
+    let err = crate::core::sync_engine::sync_dir_copy_with_overwrite(source.path(), &target, false)
+        .unwrap_err();
+
+    assert!(err.to_string().contains("overlap"));
+    assert!(!target.exists());
+    assert_eq!(fs::read(source.path().join("keep.txt")).unwrap(), b"keep");
+}
+
+#[test]
+fn overwrite_rejects_target_that_contains_source_without_deleting_either() {
+    let target = tempfile::tempdir().unwrap();
+    let source = target.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("keep.txt"), b"keep").unwrap();
+
+    let err = sync_dir_hybrid_with_overwrite(&source, target.path(), true).unwrap_err();
+
+    assert!(err.to_string().contains("overlap"));
+    assert_eq!(fs::read(source.join("keep.txt")).unwrap(), b"keep");
+    assert!(target.path().exists());
+}
+
+#[test]
+fn safe_remove_sends_real_directory_to_recycler() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("target");
+    let recycled = root.path().join("recycled");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("keep.txt"), b"keep").unwrap();
+
+    remove_path_safely_with(&target, |path| {
+        fs::rename(path, &recycled).map_err(anyhow::Error::from)
+    })
+    .unwrap();
+
+    assert!(!target.exists());
+    assert_eq!(fs::read(recycled.join("keep.txt")).unwrap(), b"keep");
+}
+
 #[cfg(unix)]
 #[test]
-fn hybrid_overwrite_replaces_only_the_symlink_and_preserves_its_old_target() {
-    use std::os::unix::fs::symlink;
+fn safe_remove_unlinks_symlink_without_recycling_target() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let link = root.path().join("link");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("keep.txt"), b"keep").unwrap();
+    std::os::unix::fs::symlink(&source, &link).unwrap();
 
-    let old_source = tempfile::tempdir().unwrap();
-    fs::write(old_source.path().join("old.txt"), b"old").unwrap();
-    let new_source = tempfile::tempdir().unwrap();
-    fs::write(new_source.path().join("new.txt"), b"new").unwrap();
-    let dst_dir = tempfile::tempdir().unwrap();
-    let target = dst_dir.path().join("t");
-    symlink(old_source.path(), &target).unwrap();
+    remove_path_safely_with(&link, |_| {
+        anyhow::bail!("symlink must not be sent to recycle bin")
+    })
+    .unwrap();
 
-    let out = sync_dir_hybrid_with_overwrite(new_source.path(), &target, true).unwrap();
+    assert!(fs::symlink_metadata(&link).is_err());
+    assert_eq!(fs::read(source.join("keep.txt")).unwrap(), b"keep");
+}
 
-    assert!(out.replaced);
-    assert_eq!(fs::read(old_source.path().join("old.txt")).unwrap(), b"old");
-    assert_eq!(fs::read(target.join("new.txt")).unwrap(), b"new");
+#[test]
+fn real_target_overlapping_protected_source_is_preserved() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+
+    assert!(path_is_protected_real_content(&source, std::slice::from_ref(&source)).unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_to_protected_source_can_be_unlinked_safely() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let link = root.path().join("link");
+    fs::create_dir_all(&source).unwrap();
+    std::os::unix::fs::symlink(&source, &link).unwrap();
+
+    assert!(!path_is_protected_real_content(&link, &[source]).unwrap());
 }
 
 #[test]
@@ -92,6 +172,374 @@ fn cursor_sync_forces_copy() {
     assert!(matches!(out.mode_used, SyncMode::Copy));
     assert!(target.join("s/a.txt").exists());
     assert_eq!(fs::read(target.join("s/a.txt")).unwrap(), b"ok");
+}
+
+#[test]
+fn explicit_copy_mode_copies_directory() {
+    let src_dir = tempfile::tempdir().unwrap();
+    fs::write(src_dir.path().join("a.txt"), b"ok").unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    let target = dst_dir.path().join("t");
+
+    let out =
+        sync_dir_with_mode_with_overwrite(SyncMode::Copy, src_dir.path(), &target, false).unwrap();
+
+    assert_eq!(out.mode_used, SyncMode::Copy);
+    assert_eq!(fs::read(target.join("a.txt")).unwrap(), b"ok");
+}
+
+#[test]
+fn managed_copy_accepts_python_bytecode_cache() {
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("a.txt"), b"new").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("target");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("a.txt"), b"old").unwrap();
+    let expected = crate::core::content_hash::hash_dir_strict(&target).unwrap();
+    fs::create_dir(target.join("__pycache__")).unwrap();
+    fs::write(target.join("__pycache__/module.cpython-313.pyc"), b"cache").unwrap();
+    sync_managed_copy_with_expected_hash(source.path(), &target, &expected).unwrap();
+    assert_eq!(fs::read(target.join("a.txt")).unwrap(), b"new");
+}
+
+#[test]
+fn managed_copy_rollback_preserves_new_python_cache() {
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("a.txt"), b"new").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("target");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("a.txt"), b"old").unwrap();
+    let expected = crate::core::content_hash::hash_dir_for_sync_conflict(&target).unwrap();
+    let mut replacement =
+        PreparedDirReplacement::prepare_managed_copy(source.path(), &target, Some(expected), true)
+            .unwrap();
+    replacement.activate().unwrap();
+    fs::create_dir(target.join("__pycache__")).unwrap();
+    fs::write(target.join("__pycache__/module.pyc"), b"new cache").unwrap();
+    assert!(replacement
+        .rollback()
+        .unwrap_err()
+        .to_string()
+        .contains("ROLLBACK_CONFLICT"));
+    assert_eq!(fs::read(target.join("a.txt")).unwrap(), b"old");
+    let recovery = fs::read_dir(root.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".skills-hub-recovery-")
+        })
+        .unwrap();
+    assert_eq!(
+        fs::read(recovery.join("__pycache__/module.pyc")).unwrap(),
+        b"new cache"
+    );
+}
+
+#[test]
+fn managed_copy_replaces_only_content_matching_the_expected_hash() {
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("a.txt"), b"new").unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    let target = target_root.path().join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("a.txt"), b"old").unwrap();
+    let expected_hash =
+        crate::core::content_hash::hash_dir_for_sync_conflict(&target).unwrap();
+
+    let outcome =
+        sync_managed_copy_with_expected_hash(source.path(), &target, &expected_hash).unwrap();
+
+    assert!(outcome.replaced);
+    assert_eq!(fs::read(target.join("a.txt")).unwrap(), b"new");
+    assert!(fs::read_dir(target_root.path()).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".skills-hub-")));
+}
+
+#[test]
+fn managed_copy_preserves_a_real_directory_with_unexpected_content() {
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("a.txt"), b"new").unwrap();
+    let expected = tempfile::tempdir().unwrap();
+    fs::write(expected.path().join("a.txt"), b"old").unwrap();
+    let expected_hash =
+        crate::core::content_hash::hash_dir_for_sync_conflict(expected.path()).unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    let target = target_root.path().join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("a.txt"), b"manual").unwrap();
+
+    let error =
+        sync_managed_copy_with_expected_hash(source.path(), &target, &expected_hash).unwrap_err();
+
+    assert!(format!("{error:#}").contains("TARGET_MODIFIED"));
+    assert_eq!(fs::read(target.join("a.txt")).unwrap(), b"manual");
+}
+
+#[test]
+fn managed_copy_preserves_a_target_with_only_added_git_metadata() {
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("a.txt"), b"new").unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    let target = target_root.path().join("target");
+    fs::create_dir_all(target.join(".git")).unwrap();
+    fs::write(target.join("a.txt"), b"old").unwrap();
+    let clean = tempfile::tempdir().unwrap();
+    fs::write(clean.path().join("a.txt"), b"old").unwrap();
+    let expected_hash = crate::core::content_hash::hash_dir_strict(clean.path()).unwrap();
+    fs::write(target.join(".git/history"), b"keep").unwrap();
+
+    let error =
+        sync_managed_copy_with_expected_hash(source.path(), &target, &expected_hash).unwrap_err();
+
+    assert!(format!("{error:#}").contains("TARGET_MODIFIED"));
+    assert_eq!(fs::read(target.join(".git/history")).unwrap(), b"keep");
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_copy_preserves_a_target_with_only_an_added_internal_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("a.txt"), b"new").unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    let target = target_root.path().join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("a.txt"), b"old").unwrap();
+    let expected_hash = crate::core::content_hash::hash_dir_strict(&target).unwrap();
+    symlink("a.txt", target.join("shortcut")).unwrap();
+
+    let error =
+        sync_managed_copy_with_expected_hash(source.path(), &target, &expected_hash).unwrap_err();
+
+    assert!(format!("{error:#}").contains("TARGET_MODIFIED"));
+    assert_eq!(
+        fs::read_link(target.join("shortcut")).unwrap(),
+        PathBuf::from("a.txt")
+    );
+}
+
+#[test]
+fn managed_copy_rechecks_the_actual_directory_after_staging() {
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("a.txt"), b"new").unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    let target = target_root.path().join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("a.txt"), b"old").unwrap();
+    let expected_hash = crate::core::content_hash::hash_dir_strict(&target).unwrap();
+    let mut replacement =
+        PreparedDirReplacement::prepare_copy(source.path(), &target, Some(expected_hash), true)
+            .unwrap();
+
+    fs::write(target.join("a.txt"), b"manual-after-staging").unwrap();
+    let error = replacement.activate().unwrap_err();
+
+    assert!(format!("{error:#}").contains("TARGET_MODIFIED"));
+    assert_eq!(
+        fs::read(target.join("a.txt")).unwrap(),
+        b"manual-after-staging"
+    );
+    drop(replacement);
+    assert!(fs::read_dir(target_root.path()).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".skills-hub-")));
+}
+
+#[test]
+fn legacy_rollback_retries_transient_backup_restore_failure_on_drop() {
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("a.txt"), b"new").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("target");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("a.txt"), b"old").unwrap();
+    let expected_hash = crate::core::content_hash::hash_dir_strict(&target).unwrap();
+    let mut replacement =
+        PreparedDirReplacement::prepare_copy(source.path(), &target, Some(expected_hash), false)
+            .unwrap();
+    replacement.activate().unwrap();
+    let backup = replacement.backup.clone().unwrap();
+    let temporarily_unavailable = root.path().join("temporarily-unavailable-backup");
+    fs::rename(&backup, &temporarily_unavailable).unwrap();
+
+    assert!(replacement.rollback().is_err());
+    assert!(!target.exists());
+    fs::rename(&temporarily_unavailable, &backup).unwrap();
+    drop(replacement);
+
+    assert_eq!(fs::read(target.join("a.txt")).unwrap(), b"old");
+    assert!(!backup.exists());
+}
+
+#[test]
+fn detailed_rollback_keeps_reported_recovery_and_backup_paths_stable_after_drop() {
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("a.txt"), b"new").unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("target");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("a.txt"), b"old").unwrap();
+    let expected_hash = crate::core::content_hash::hash_dir_strict(&target).unwrap();
+    let mut replacement =
+        PreparedDirReplacement::prepare_copy(source.path(), &target, Some(expected_hash), false)
+            .unwrap();
+    replacement.activate().unwrap();
+    fs::write(target.join("user.txt"), b"concurrent content").unwrap();
+    let backup = replacement.backup.clone().unwrap();
+    let temporarily_unavailable = root.path().join("temporarily-unavailable-backup");
+    fs::rename(&backup, &temporarily_unavailable).unwrap();
+
+    let report = replacement.rollback_with_outcome().unwrap_err().outcome;
+    assert!(!report.files_restored);
+    assert_eq!(report.reason, super::DirRollbackReason::RollbackFailed);
+    assert_eq!(report.backup_path.as_ref(), Some(&backup));
+    let recovery = report.recovery_path.unwrap();
+    fs::rename(&temporarily_unavailable, &backup).unwrap();
+    drop(replacement);
+
+    assert!(!target.exists());
+    assert_eq!(fs::read(backup.join("a.txt")).unwrap(), b"old");
+    assert_eq!(fs::read(recovery.join("a.txt")).unwrap(), b"new");
+    assert_eq!(
+        fs::read(recovery.join("user.txt")).unwrap(),
+        b"concurrent content"
+    );
+}
+
+#[test]
+fn rollback_preserves_changes_written_after_activation() {
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("a.txt"), b"new").unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    let target = target_root.path().join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("a.txt"), b"old").unwrap();
+    let expected_hash = crate::core::content_hash::hash_dir_strict(&target).unwrap();
+    let mut replacement =
+        PreparedDirReplacement::prepare_copy(source.path(), &target, Some(expected_hash), true)
+            .unwrap();
+    replacement.activate().unwrap();
+    fs::write(target.join("user-created.txt"), b"keep me").unwrap();
+
+    let error = replacement.rollback().unwrap_err();
+
+    assert!(format!("{error:#}").contains("ROLLBACK_CONFLICT"));
+    let typed = error.downcast_ref::<super::DirRollbackError>().unwrap();
+    assert!(typed.outcome.files_restored);
+    assert_eq!(
+        typed.outcome.reason,
+        super::DirRollbackReason::ConcurrentContentPreserved
+    );
+    assert!(typed.outcome.backup_path.is_none());
+    assert_eq!(fs::read(target.join("a.txt")).unwrap(), b"old");
+    let recovery = fs::read_dir(target_root.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".skills-hub-recovery-")
+        })
+        .expect("concurrent changes should be preserved in a recovery directory");
+    assert_eq!(typed.outcome.recovery_path.as_ref(), Some(&recovery));
+    drop(replacement);
+    assert_eq!(
+        fs::read(recovery.join("user-created.txt")).unwrap(),
+        b"keep me"
+    );
+}
+
+#[test]
+fn rollback_preserves_git_metadata_written_after_activation() {
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("a.txt"), b"new").unwrap();
+    let target_root = tempfile::tempdir().unwrap();
+    let target = target_root.path().join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("a.txt"), b"old").unwrap();
+    let expected_hash = crate::core::content_hash::hash_dir_strict(&target).unwrap();
+    let mut replacement =
+        PreparedDirReplacement::prepare_copy(source.path(), &target, Some(expected_hash), true)
+            .unwrap();
+    replacement.activate().unwrap();
+    fs::create_dir_all(target.join(".git")).unwrap();
+    fs::write(target.join(".git/history"), b"keep").unwrap();
+
+    let error = replacement.rollback().unwrap_err();
+
+    assert!(format!("{error:#}").contains("ROLLBACK_CONFLICT"));
+    let recovery = fs::read_dir(target_root.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".skills-hub-recovery-")
+        })
+        .unwrap();
+    assert_eq!(fs::read(recovery.join(".git/history")).unwrap(), b"keep");
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_symlink_mode_creates_symlink() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    let target = dst_dir.path().join("t");
+
+    let out = sync_dir_with_mode_with_overwrite(SyncMode::Symlink, src_dir.path(), &target, false)
+        .unwrap();
+
+    assert_eq!(out.mode_used, SyncMode::Symlink);
+    assert_eq!(fs::read_link(&target).unwrap(), src_dir.path());
+}
+
+#[cfg(not(windows))]
+#[test]
+fn explicit_junction_mode_reports_unsupported_platform() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dst_dir = tempfile::tempdir().unwrap();
+    let target = dst_dir.path().join("t");
+
+    let err = sync_dir_with_mode_with_overwrite(SyncMode::Junction, src_dir.path(), &target, false)
+        .unwrap_err();
+
+    assert!(err.to_string().contains("junction not supported"));
+}
+
+#[cfg(windows)]
+#[test]
+fn overwrite_removes_junction_without_removing_its_target() {
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("source.txt"), b"source").unwrap();
+
+    let target_root = tempfile::tempdir().unwrap();
+    let junction_target = target_root.path().join("junction-target");
+    fs::create_dir_all(&junction_target).unwrap();
+    fs::write(junction_target.join("keep.txt"), b"keep").unwrap();
+
+    let target = target_root.path().join("target");
+    junction::create(&junction_target, &target).unwrap();
+
+    let out = sync_dir_hybrid_with_overwrite(source.path(), &target, true).unwrap();
+    assert!(out.replaced);
+    assert!(junction_target.join("keep.txt").exists());
 }
 
 #[cfg(unix)]

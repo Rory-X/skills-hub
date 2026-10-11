@@ -807,6 +807,140 @@ pub struct UpdateResult {
     pub content_hash: Option<String>,
     pub source_revision: Option<String>,
     pub updated_targets: Vec<String>,
+    pub changed: bool,
+}
+
+#[allow(dead_code)]
+pub(crate) fn update_managed_skill_from_source_for_paths(
+    paths: &super::runtime_paths::RuntimePaths,
+    store: &SkillStore,
+    skill_id: &str,
+) -> Result<UpdateResult> {
+    update_managed_skill_from_source_with_lock_held(paths, store, skill_id, false)
+}
+
+pub(crate) fn update_managed_skill_from_source_with_lock_held(
+    _paths: &super::runtime_paths::RuntimePaths,
+    store: &SkillStore,
+    skill_id: &str,
+    preserve_newer_managed_content: bool,
+) -> Result<UpdateResult> {
+    if store
+        .get_skill_by_id(skill_id)?
+        .is_some_and(|skill| skill.has_unbound_local_source())
+    {
+        anyhow::bail!(
+            "SKILL_SOURCE_UNBOUND|This Skill receives device sync updates; no local source is bound"
+        );
+    }
+    let record = store
+        .get_skill_by_id(skill_id)?
+        .ok_or_else(|| anyhow::anyhow!("skill not found"))?;
+    if record.source_type != "local" {
+        anyhow::bail!("git source update requires the application runtime");
+    }
+    let central_path = PathBuf::from(&record.central_path);
+    let previous_hash = if central_path.exists() {
+        Some(
+            hash_dir(&central_path)
+                .with_context(|| format!("hash current central Skill {:?}", central_path))?,
+        )
+    } else {
+        None
+    };
+    let source = record
+        .source_ref
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("missing source_ref for local skill"))?;
+    let source_path = PathBuf::from(source);
+    if !source_path.exists() {
+        anyhow::bail!("source path not found: {:?}", source_path);
+    }
+    let central_parent = central_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid central path"))?
+        .to_path_buf();
+    std::fs::create_dir_all(&central_parent)
+        .with_context(|| format!("create central skill parent {:?}", central_parent))?;
+    let staging_dir = central_parent.join(format!(".skills-hub-update-{}", Uuid::new_v4()));
+    if let Err(err) = copy_dir_recursive(&source_path, &staging_dir) {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(err).with_context(|| format!("copy {:?} -> {:?}", source_path, staging_dir));
+    }
+    if let Err(err) = prepare_staging_dir(&staging_dir) {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(err);
+    }
+    let next_hash = match hash_dir(&staging_dir) {
+        Ok(hash) => hash,
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(err);
+        }
+    };
+    let source_baseline = if preserve_newer_managed_content {
+        store.source_baseline(&record.id)?
+    } else {
+        None
+    };
+    let source_is_unchanged = source_baseline
+        .as_ref()
+        .map(|baseline| baseline.matches(&record, &next_hash))
+        .unwrap_or(true);
+    if preserve_newer_managed_content
+        && previous_hash.is_some()
+        && previous_hash.as_deref() != Some(next_hash.as_str())
+        && source_is_unchanged
+    {
+        let checked = record.clone();
+        store.record_source_check_success(&checked, next_hash)?;
+        std::fs::remove_dir_all(&staging_dir)?;
+        return Ok(UpdateResult {
+            skill_id: record.id,
+            name: record.name,
+            central_path,
+            content_hash: previous_hash,
+            source_revision: record.source_revision,
+            updated_targets: Vec::new(),
+            changed: false,
+        });
+    }
+
+    let now = now_ms();
+    activate_staging_dir(&staging_dir, &central_path)?;
+    let description = parse_skill_md(&central_path.join("SKILL.md"))
+        .and_then(|(_, desc)| desc)
+        .or(record.description.clone());
+    let content_hash = Some(next_hash.clone());
+    let updated = SkillRecord {
+        id: record.id.clone(),
+        name: record.name.clone(),
+        description,
+        source_type: record.source_type.clone(),
+        source_ref: record.source_ref.clone(),
+        source_subpath: record.source_subpath.clone(),
+        source_revision: record.source_revision.clone(),
+        central_path: record.central_path.clone(),
+        content_hash: content_hash.clone(),
+        created_at: record.created_at,
+        updated_at: now,
+        last_sync_at: record.last_sync_at,
+        last_seen_at: now,
+        enabled: record.enabled,
+        status: "ok".to_string(),
+    };
+    store.upsert_skill(&updated)?;
+    store.record_source_check_success(&updated, next_hash)?;
+    let updated_targets = resync_managed_copy_targets(store, skill_id, &central_path, now)?;
+    Ok(UpdateResult {
+        skill_id: record.id,
+        name: record.name,
+        central_path,
+        content_hash: content_hash.clone(),
+        source_revision: record.source_revision,
+        updated_targets,
+        changed: previous_hash.as_deref() != content_hash.as_deref(),
+    })
 }
 
 pub fn update_managed_skill_from_source<R: tauri::Runtime>(
@@ -814,6 +948,22 @@ pub fn update_managed_skill_from_source<R: tauri::Runtime>(
     store: &SkillStore,
     skill_id: &str,
 ) -> Result<UpdateResult> {
+    if let Some(record) = store.get_skill_by_id(skill_id)? {
+        if record.has_unbound_local_source() {
+            anyhow::bail!(
+                "SKILL_SOURCE_UNBOUND|This Skill receives device sync updates; no local source is bound"
+            );
+        }
+        if record.source_type == "local" {
+            let paths = super::runtime_paths::RuntimePaths::from_tauri(
+                super::runtime_paths::RuntimeProfile::Production,
+                std::env::temp_dir(),
+                std::env::temp_dir(),
+                std::env::temp_dir(),
+            );
+            return update_managed_skill_from_source_with_lock_held(&paths, store, skill_id, false);
+        }
+    }
     let record = store
         .get_skill_by_id(skill_id)?
         .ok_or_else(|| anyhow::anyhow!("skill not found"))?;
@@ -962,6 +1112,7 @@ pub fn update_managed_skill_from_source<R: tauri::Runtime>(
         content_hash,
         source_revision: new_revision,
         updated_targets,
+        changed: true,
     })
 }
 
@@ -1832,7 +1983,7 @@ pub fn backfill_skill_content_hashes(store: &SkillStore) -> usize {
     updated
 }
 
-fn parse_skill_md(path: &Path) -> Option<(String, Option<String>)> {
+pub(crate) fn parse_skill_md(path: &Path) -> Option<(String, Option<String>)> {
     parse_skill_md_with_reason(path).ok()
 }
 

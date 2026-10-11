@@ -8,6 +8,7 @@ import {
 import './App.css'
 import { useTranslation } from 'react-i18next'
 import { Toaster, toast } from 'sonner'
+import DeviceSyncPage from './components/skills/DeviceSyncPage'
 import ExplorePage from './components/skills/ExplorePage'
 import FilterBar from './components/skills/FilterBar'
 import SkillPreviewDrawer, {
@@ -100,7 +101,7 @@ type ProjectAssignmentBatch = {
   mode: 'library-add' | 'current-tools'
   skillIds: string[]
 }
-type ManagementTab = 'tags' | 'tools' | 'updates'
+type ManagementTab = 'tags' | 'tools' | 'updates' | 'device-sync'
 
 function App() {
   const { t, i18n } = useTranslation()
@@ -3576,10 +3577,31 @@ function App() {
                 >
                   {t('manageTabs.updates')}
                 </button>
+                <button
+                  className={`management-tab${managementTab === 'device-sync' ? ' active' : ''}`}
+                  type="button"
+                  role="tab"
+                  aria-selected={managementTab === 'device-sync'}
+                  onClick={() => setManagementTab('device-sync')}
+                >
+                  {t('manageTabs.deviceSync')}
+                </button>
               </div>
             </div>
             <div className="management-panel">
-              {managementTab === 'tags' ? (
+              {managementTab === 'device-sync' ? (
+                <DeviceSyncPage
+                  active
+                  isTauri={isTauri}
+                  onSkillsChanged={async () => { await loadManagedSkills() }}
+                  onOpenToolIssues={() => setManagementTab('tools')}
+                  toolLabels={Object.fromEntries(
+                    toolInfos.map((tool) => [tool.key, tool.label]),
+                  )}
+                  onConflictCountChange={() => {}}
+                  t={t}
+                />
+              ) : managementTab === 'tags' ? (
                 <TagsPage
                   embedded
                   tags={tags}

@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::installer::update_managed_skill_from_source;
+use super::installer::{
+    update_managed_skill_from_source, update_managed_skill_from_source_with_lock_held,
+};
+use super::runtime_paths::{RuntimePaths, RuntimeProfile};
 use super::skill_store::SkillStore;
 
 pub const AUTO_UPDATE_ENABLED_KEY: &str = "skill_auto_update_enabled";
@@ -245,14 +248,16 @@ pub fn run_auto_update_now<R: tauri::Runtime>(
             .retain(|pending| pending.skill_id != skill_id);
         record_auto_update_progress_snapshot(store, &progress)?;
 
-        match update_managed_skill_from_source(app, store, &skill_id) {
+        match update_auto_managed_skill(app, store, &skill_id) {
             Ok(update) => {
-                result.updated += 1;
-                progress.succeeded.push(AutoUpdateSkillProgress {
-                    skill_id,
-                    name: update.name,
-                    reason: None,
-                });
+                if update.changed {
+                    result.updated += 1;
+                    progress.succeeded.push(AutoUpdateSkillProgress {
+                        skill_id,
+                        name: update.name,
+                        reason: None,
+                    });
+                }
             }
             Err(err) => {
                 result.failed += 1;
@@ -288,7 +293,7 @@ pub fn retry_auto_update_skills<R: tauri::Runtime>(
             .with_context(|| format!("load Skill {skill_id} before auto-update retry"))?
             .map(|skill| skill.name)
             .unwrap_or_else(|| skill_id.clone());
-        match update_managed_skill_from_source(app, store, skill_id) {
+        match update_auto_managed_skill(app, store, skill_id) {
             Ok(update) => succeeded.push(AutoUpdateSkillProgress {
                 skill_id: skill_id.clone(),
                 name: update.name,
@@ -430,11 +435,35 @@ fn record_auto_update_result(store: &SkillStore, result: &AutoUpdateRunResult) -
     Ok(())
 }
 
+fn update_auto_managed_skill<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    store: &SkillStore,
+    skill_id: &str,
+) -> Result<super::installer::UpdateResult> {
+    let local = store
+        .get_skill_by_id(skill_id)?
+        .is_some_and(|skill| skill.source_type == "local");
+    if local {
+        let paths = RuntimePaths::from_tauri(
+            RuntimeProfile::Production,
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        update_managed_skill_from_source_with_lock_held(&paths, store, skill_id, true)
+    } else {
+        update_managed_skill_from_source(app, store, skill_id)
+    }
+}
+
 fn list_auto_update_skill_entries(store: &SkillStore) -> Result<Vec<AutoUpdateSkillProgress>> {
     let mut skills = store
         .list_skills()?
         .into_iter()
-        .filter(|skill| skill.source_type == "git" || skill.source_type == "local")
+        .filter(|skill| {
+            skill.source_type == "git"
+                || (skill.source_type == "local" && !skill.has_unbound_local_source())
+        })
         .map(|skill| AutoUpdateSkillProgress {
             skill_id: skill.id,
             name: skill.name,

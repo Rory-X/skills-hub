@@ -1,6 +1,6 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{Manager, State};
 
 use std::sync::Arc;
 
@@ -29,7 +29,7 @@ use crate::core::cache_cleanup::{
     set_git_cache_ttl_secs as set_git_cache_ttl_secs_core,
 };
 use crate::core::cancel_token::CancelToken;
-use crate::core::central_repo::{ensure_central_repo, resolve_central_repo_path};
+use crate::core::central_repo::{ensure_central_repo, resolve_central_repo_from_runtime, resolve_central_repo_path};
 use crate::core::featured_skills::{fetch_featured_skills, FeaturedSkill};
 use crate::core::github_search::{search_github_repos, RepoSummary};
 use crate::core::installer::{
@@ -70,7 +70,42 @@ use crate::core::tool_adapters::{
     resolve_default_path, save_tool_config, supports_project_scope, CustomToolConfig, ToolConfig,
 };
 
+
+use crate::core::device_sync::credentials::{
+    resolve_access_token_with_proxy, save_personal_access_token, CredentialStore,
+    SystemCredentialStore,
+};
+use crate::core::device_sync::oauth;
+use crate::core::device_sync::providers::provider;
+use crate::core::device_sync::types::{
+    ConflictResolution, CredentialUsage, DeviceSyncConfig, DeviceSyncDevice, OAuthPollResult,
+    OAuthProviderAvailability, OAuthStartResult, PendingOAuthAuthorization, ProviderAccount,
+    ProviderId, RemoteRepository, SyncChangeSummary, SyncConflict, SyncHistoryEntry, SyncRunResult,
+    SyncStatus, TrashEntry,
+};
+use crate::core::device_sync::DeviceSyncService;
+use crate::core::recycle_bin::{RecycleBinItem, RecycleBinService};
+use crate::core::skill_store::DEVICE_SYNC_HISTORY_LIMIT;
+use crate::services::operation_lock::{OperationKind, OperationLock};
+use uuid::Uuid;
+
 const RECENT_PROJECTS_SETTING: &str = "recent_projects_v1";
+const DEVICE_SYNC_PENDING_OAUTH_SETTING: &str = "device_sync_pending_oauth_v1";
+const DEVICE_SYNC_CREDENTIAL_CLEANUP_QUEUE_SETTING: &str =
+    "device_sync_credential_cleanup_queue_v1";
+
+
+fn acquire_operation_lock<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    kind: OperationKind,
+) -> anyhow::Result<OperationLock> {
+    let paths = crate::runtime_paths_for_tauri(app)?;
+    OperationLock::acquire(&paths, kind).map_err(Into::into)
+}
+
+fn oauth_proxy_url(store: &SkillStore, _provider_id: ProviderId) -> anyhow::Result<String> {
+    get_github_proxy_url_core(store)
+}
 
 fn format_anyhow_error(err: anyhow::Error) -> String {
     let first = err.to_string();
@@ -2526,6 +2561,941 @@ pub async fn read_skill_preview_file(
 pub fn cancel_current_operation(cancel: State<'_, Arc<CancelToken>>) -> Result<(), String> {
     cancel.cancel();
     Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DeviceSyncConfigDto {
+    pub visibility: crate::core::device_sync::types::RepositoryVisibility,
+    pub public_upload_confirmed: bool,
+    pub provider: ProviderId,
+    pub remote_url: String,
+    pub branch: String,
+    pub username: Option<String>,
+    pub auto_check: bool,
+    pub auto_sync: bool,
+    pub auto_sync_schedule: Option<crate::core::device_sync::scheduler::SyncSchedule>,
+    pub has_credential: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SaveDeviceSyncConfigInput {
+    #[serde(default)]
+    pub visibility: crate::core::device_sync::types::RepositoryVisibility,
+    #[serde(default)]
+    pub public_upload_confirmed: bool,
+    pub provider: ProviderId,
+    pub remote_url: String,
+    pub branch: String,
+    pub username: Option<String>,
+    pub token: Option<String>,
+    pub credential_key: Option<String>,
+    pub auto_check: bool,
+    pub auto_sync: bool,
+    #[serde(default)]
+    pub auto_sync_schedule: Option<crate::core::device_sync::scheduler::SyncSchedule>,
+}
+
+#[tauri::command]
+pub fn get_device_sync_config(
+    store: State<'_, SkillStore>,
+) -> Result<Option<DeviceSyncConfigDto>, String> {
+    store
+        .get_device_sync_config()
+        .map(|config| {
+            config.map(|item| DeviceSyncConfigDto {
+                visibility: item.visibility,
+                public_upload_confirmed: item.public_upload_confirmed,
+                provider: item.provider,
+                remote_url: item.remote_url,
+                branch: item.branch,
+                username: item.username,
+                auto_check: item.auto_check,
+                auto_sync: item.auto_sync && item.auto_sync_schedule.is_some(),
+                auto_sync_schedule: item.auto_sync_schedule,
+                has_credential: item.credential_key.is_some(),
+            })
+        })
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub fn save_device_sync_config(
+    store: State<'_, SkillStore>,
+    config: SaveDeviceSyncConfigInput,
+) -> Result<DeviceSyncConfigDto, String> {
+    let _sync_guard =
+        crate::core::device_sync::try_lock_device_sync().map_err(format_anyhow_error)?;
+    if config.auto_sync && config.auto_sync_schedule.is_none() {
+        return Err("choose an automatic sync schedule".to_string());
+    }
+    if let Some(schedule) = &config.auto_sync_schedule {
+        schedule.validate().map_err(format_anyhow_error)?;
+    }
+    if config.remote_url.trim().is_empty() {
+        return Err("device sync repository URL is empty".to_string());
+    }
+    validate_device_sync_remote(&config.remote_url)?;
+    let branch = if config.branch.trim().is_empty() {
+        "main"
+    } else {
+        config.branch.trim()
+    };
+    if !git2::Reference::is_valid_name(&format!("refs/heads/{branch}")) {
+        return Err("invalid device sync branch name".to_string());
+    }
+    let credentials = SystemCredentialStore;
+    let previous = store
+        .get_device_sync_config()
+        .map_err(format_anyhow_error)?;
+    let same_repository = previous.as_ref().is_some_and(|item| {
+        item.provider == config.provider
+            && item.remote_url == config.remote_url.trim()
+            && item.branch == branch
+    });
+    let requested_credential_key = config
+        .credential_key
+        .filter(|value| !value.trim().is_empty());
+    let remote_usage = CredentialUsage::from_https_remote(config.provider, &config.remote_url).ok();
+    if let Some(key) = requested_credential_key.as_deref() {
+        let usage = remote_usage
+            .as_ref()
+            .ok_or_else(|| "token authentication requires an HTTPS repository URL".to_string())?;
+        let proxy_url = get_github_proxy_url_core(&store).map_err(format_anyhow_error)?;
+        if resolve_access_token_with_proxy(&credentials, key, usage, &proxy_url)
+            .map_err(format_anyhow_error)?
+            .is_none()
+        {
+            return Err("OAuth authorization is no longer available; sign in again".to_string());
+        }
+    }
+    let credential_key = requested_credential_key.or_else(|| {
+        remote_usage
+            .as_ref()
+            .and_then(|usage| inherited_device_sync_credential(previous.as_ref(), usage))
+    });
+    let manual_token = config
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string);
+    let saved = DeviceSyncConfig {
+        visibility: config.visibility,
+        public_upload_confirmed: config.public_upload_confirmed
+            && config.visibility == crate::core::device_sync::types::RepositoryVisibility::Public,
+        provider: config.provider,
+        remote_url: config.remote_url.trim().to_string(),
+        branch: branch.to_string(),
+        username: config.username.filter(|value| !value.trim().is_empty()),
+        credential_key,
+        auto_check: config.auto_check,
+        auto_sync: config.auto_sync,
+        auto_sync_schedule: config.auto_sync_schedule,
+        last_synced_commit: if same_repository {
+            previous
+                .as_ref()
+                .and_then(|item| item.last_synced_commit.clone())
+        } else {
+            None
+        },
+    };
+    let persist_config = |candidate: &DeviceSyncConfig| -> anyhow::Result<()> {
+        if previous.is_some() && !same_repository {
+            store.clear_device_sync_repository_state()?;
+        }
+        store.save_device_sync_config(candidate)
+    };
+    let replaced_credential_key = previous
+        .as_ref()
+        .and_then(|item| item.credential_key.as_deref())
+        .filter(|old_key| {
+            manual_token.is_some() || Some(*old_key) != saved.credential_key.as_deref()
+        });
+    let saved = persist_device_sync_credential_replacement_with(
+        &store,
+        &credentials,
+        replaced_credential_key,
+        || {
+            if let Some(token) = manual_token.as_deref() {
+                let usage = remote_usage
+                    .as_ref()
+                    .context("token authentication requires an HTTPS repository URL")?;
+                persist_config_with_staged_personal_access_token(
+                    &store,
+                    &credentials,
+                    usage,
+                    token,
+                    saved,
+                    persist_config,
+                )
+            } else {
+                persist_config(&saved)?;
+                Ok(saved)
+            }
+        },
+    )
+    .map_err(format_anyhow_error)?;
+    if load_pending_oauth(&store)
+        .map_err(format_anyhow_error)?
+        .is_some()
+    {
+        clear_pending_oauth_with_credentials(&store, &credentials, true)
+            .map_err(format_anyhow_error)?;
+    }
+    Ok(DeviceSyncConfigDto {
+        provider: saved.provider,
+        remote_url: saved.remote_url,
+        branch: saved.branch,
+        username: saved.username,
+        auto_check: saved.auto_check,
+        auto_sync: saved.auto_sync,
+        auto_sync_schedule: saved.auto_sync_schedule,
+        has_credential: saved.credential_key.is_some(),
+        visibility: saved.visibility,
+        public_upload_confirmed: saved.public_upload_confirmed,
+    })
+}
+
+#[tauri::command]
+pub fn get_device_sync_oauth_availability() -> Vec<OAuthProviderAvailability> {
+    oauth::availability()
+}
+
+#[tauri::command]
+pub fn get_device_sync_pending_oauth(
+    store: State<'_, SkillStore>,
+) -> Result<Option<PendingOAuthAuthorization>, String> {
+    load_pending_oauth(&store).map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn start_device_sync_oauth(
+    store: State<'_, SkillStore>,
+    providerId: ProviderId,
+) -> Result<OAuthStartResult, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let proxy_url = oauth_proxy_url(&store, providerId)?;
+        oauth::start(providerId, &proxy_url)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn poll_device_sync_oauth(
+    store: State<'_, SkillStore>,
+    flowId: String,
+) -> Result<OAuthPollResult, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let credentials = SystemCredentialStore;
+        let proxy_url = get_github_proxy_url_core(&store)?;
+        poll_device_sync_oauth_with(
+            &store,
+            &credentials,
+            || oauth::poll(&flowId, &credentials, &proxy_url),
+            |pending| save_pending_oauth(&store, pending),
+        )
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub fn clear_device_sync_pending_oauth(store: State<'_, SkillStore>) -> Result<(), String> {
+    let _sync_guard =
+        crate::core::device_sync::try_lock_device_sync().map_err(format_anyhow_error)?;
+    clear_pending_oauth(&store, true).map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub fn cancel_device_sync_oauth(flowId: String) {
+    oauth::cancel(&flowId);
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn validate_device_sync_account(
+    store: State<'_, SkillStore>,
+    providerId: ProviderId,
+    token: String,
+) -> Result<ProviderAccount, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let proxy_url = get_github_proxy_url_core(&store)?;
+        provider(providerId, &proxy_url)?.validate_token(token.trim())
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn create_device_sync_repository(
+    store: State<'_, SkillStore>,
+    providerId: ProviderId,
+    token: Option<String>,
+    credentialKey: Option<String>,
+    name: String,
+) -> Result<RemoteRepository, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let token = resolve_device_sync_token(&store, providerId, token, credentialKey)?;
+        let proxy_url = get_github_proxy_url_core(&store)?;
+        let provider = provider(providerId, &proxy_url)?;
+        provider.validate_token(token.trim())?;
+        provider.create_private_repository(token.trim(), &name)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn list_device_sync_repositories(
+    store: State<'_, SkillStore>,
+    providerId: ProviderId,
+    token: Option<String>,
+    credentialKey: Option<String>,
+) -> Result<Vec<RemoteRepository>, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let token = resolve_device_sync_token(&store, providerId, token, credentialKey)?;
+        let proxy_url = get_github_proxy_url_core(&store)?;
+        provider(providerId, &proxy_url)?.list_repositories(&token)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub fn get_device_sync_status(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+) -> Result<SyncStatus, String> {
+    let (workspace, central) = device_sync_paths(&app, &store).map_err(format_anyhow_error)?;
+    let credentials = SystemCredentialStore;
+    let service = DeviceSyncService::new(&store, &credentials, workspace, central);
+    let mut status = service.status().map_err(format_anyhow_error)?;
+    let runtime = app
+        .try_state::<crate::core::device_sync::scheduler::SchedulerRuntime>()
+        .map(|state| state.inner().clone())
+        .unwrap_or_default();
+    status.schedule_status = Some(
+        runtime
+            .status(&store, status.conflict_count > 0, status.is_running)
+            .map_err(format_anyhow_error)?,
+    );
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn check_device_sync(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+) -> Result<SyncChangeSummary, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation_lock = acquire_operation_lock(&app, OperationKind::DeviceSync)?;
+        let (workspace, central) = device_sync_paths(&app, &store)?;
+        let credentials = SystemCredentialStore;
+        DeviceSyncService::new(&store, &credentials, workspace, central).check()
+    })
+    .await
+    .map_err(|_| "DEVICE_SYNC_FAILURE_unknown".to_string())?
+    .map_err(crate::core::device_sync::errors::format_error)
+}
+
+#[tauri::command]
+pub async fn run_device_sync(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+) -> Result<SyncRunResult, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation_lock = acquire_operation_lock(&app, OperationKind::DeviceSync)?;
+        let (workspace, central) = device_sync_paths(&app, &store)?;
+        let credentials = SystemCredentialStore;
+        DeviceSyncService::new(&store, &credentials, workspace, central).sync()
+    })
+    .await
+    .map_err(|_| "DEVICE_SYNC_FAILURE_unknown".to_string())?
+    .map_err(crate::core::device_sync::errors::format_error)
+}
+
+#[tauri::command]
+pub fn get_device_sync_history(
+    store: State<'_, SkillStore>,
+    limit: Option<usize>,
+) -> Result<Vec<SyncHistoryEntry>, String> {
+    store
+        .list_device_sync_history(limit.unwrap_or(50).clamp(1, DEVICE_SYNC_HISTORY_LIMIT))
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub fn get_device_sync_devices(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+) -> Result<Vec<DeviceSyncDevice>, String> {
+    let (workspace, central) = device_sync_paths(&app, &store).map_err(format_anyhow_error)?;
+    let credentials = SystemCredentialStore;
+    DeviceSyncService::new(&store, &credentials, workspace, central)
+        .devices()
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub fn set_device_sync_device_alias(
+    store: State<'_, SkillStore>,
+    deviceId: String,
+    alias: Option<String>,
+) -> Result<(), String> {
+    store
+        .set_device_sync_device_alias(&deviceId, alias.as_deref())
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub fn get_device_sync_conflicts(
+    store: State<'_, SkillStore>,
+) -> Result<Vec<SyncConflict>, String> {
+    store
+        .list_device_sync_conflicts()
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub fn get_device_sync_trash(store: State<'_, SkillStore>) -> Result<Vec<TrashEntry>, String> {
+    store.list_device_sync_trash().map_err(format_anyhow_error)
+}
+
+#[derive(Serialize)]
+pub struct RecycleBinLocationsDto {
+    pub manual_backup: String,
+    pub sync_backup: String,
+}
+
+#[tauri::command]
+pub fn get_recycle_bin_locations(app: tauri::AppHandle) -> Result<RecycleBinLocationsDto, String> {
+    let root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    Ok(RecycleBinLocationsDto {
+        manual_backup: root.join("recycle-bin").to_string_lossy().into_owned(),
+        sync_backup: root
+            .join("device-sync")
+            .join("trash")
+            .to_string_lossy()
+            .into_owned(),
+    })
+}
+
+#[tauri::command]
+pub fn get_recycle_bin_items(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+) -> Result<Vec<RecycleBinItem>, String> {
+    let root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("recycle-bin");
+    RecycleBinService::new(&store, root)
+        .list()
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn restore_recycle_bin_item(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    trashId: String,
+    targetIds: Vec<String>,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation_lock = acquire_operation_lock(&app, OperationKind::Restore)?;
+        let root = app.path().app_data_dir()?.join("recycle-bin");
+        let service = RecycleBinService::new(&store, root);
+        if service.has_snapshot(&trashId)? {
+            let _device_sync_guard = if store.get_device_sync_config()?.is_some() {
+                Some(crate::core::device_sync::try_lock_device_sync()?)
+            } else {
+                None
+            };
+            service.restore_with_targets(&trashId, Some(&targetIds))
+        } else {
+            let (workspace, central) = device_sync_paths(&app, &store)?;
+            let credentials = SystemCredentialStore;
+            DeviceSyncService::new(&store, &credentials, workspace, central).restore_trash(&trashId)
+        }
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn delete_recycle_bin_item(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    trashId: String,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation_lock = acquire_operation_lock(&app, OperationKind::Delete)?;
+        let root = app.path().app_data_dir()?.join("recycle-bin");
+        RecycleBinService::new(&store, root).delete_permanently(&trashId)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn clear_recycle_bin(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    trashIds: Vec<String>,
+) -> Result<usize, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation_lock = acquire_operation_lock(&app, OperationKind::Delete)?;
+        let root = app.path().app_data_dir()?.join("recycle-bin");
+        RecycleBinService::new(&store, root).clear(&trashIds)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn resolve_device_sync_conflict(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    conflictId: String,
+    resolution: ConflictResolution,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation_lock = acquire_operation_lock(&app, OperationKind::DeviceSync)?;
+        let (workspace, central) = device_sync_paths(&app, &store)?;
+        let credentials = SystemCredentialStore;
+        DeviceSyncService::new(&store, &credentials, workspace, central)
+            .resolve_conflict(&conflictId, resolution)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn restore_device_sync_trash(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    trashId: String,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation_lock = acquire_operation_lock(&app, OperationKind::Restore)?;
+        let (workspace, central) = device_sync_paths(&app, &store)?;
+        let credentials = SystemCredentialStore;
+        DeviceSyncService::new(&store, &credentials, workspace, central).restore_trash(&trashId)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub fn disconnect_device_sync(store: State<'_, SkillStore>) -> Result<(), String> {
+    let _sync_guard =
+        crate::core::device_sync::try_lock_device_sync().map_err(format_anyhow_error)?;
+    disconnect_device_sync_with_credentials(&store, &SystemCredentialStore)
+        .map_err(format_anyhow_error)
+}
+
+fn disconnect_device_sync_with_credentials(
+    store: &SkillStore,
+    credentials: &dyn CredentialStore,
+) -> anyhow::Result<()> {
+    retry_queued_credential_cleanup(store, credentials)?;
+    if let Some(key) = store
+        .get_device_sync_config()?
+        .and_then(|config| config.credential_key)
+    {
+        enqueue_credential_cleanup(store, &key)?;
+    }
+    clear_pending_oauth_with_credentials(store, credentials, true)?;
+    store.clear_device_sync_repository_state()?;
+    store.clear_device_sync_config()?;
+    retry_queued_credential_cleanup(store, credentials)
+}
+
+fn load_pending_oauth(store: &SkillStore) -> anyhow::Result<Option<PendingOAuthAuthorization>> {
+    store
+        .get_setting(DEVICE_SYNC_PENDING_OAUTH_SETTING)?
+        .map(|value| serde_json::from_str(&value).context("decode pending OAuth authorization"))
+        .transpose()
+}
+
+fn save_pending_oauth(
+    store: &SkillStore,
+    pending: &PendingOAuthAuthorization,
+) -> anyhow::Result<()> {
+    store.set_setting(
+        DEVICE_SYNC_PENDING_OAUTH_SETTING,
+        &serde_json::to_string(pending)?,
+    )
+}
+
+pub(crate) fn poll_device_sync_oauth_with<P, S>(
+    store: &SkillStore,
+    credentials: &dyn CredentialStore,
+    poll: P,
+    save: S,
+) -> anyhow::Result<OAuthPollResult>
+where
+    P: FnOnce() -> anyhow::Result<OAuthPollResult>,
+    S: FnOnce(&PendingOAuthAuthorization) -> anyhow::Result<()>,
+{
+    let _sync_guard = crate::core::device_sync::try_lock_device_sync()?;
+    retry_queued_credential_cleanup(store, credentials)?;
+    let result = poll()?;
+    persist_pending_oauth_result_with(store, credentials, &result, save)?;
+    Ok(result)
+}
+
+fn clear_pending_oauth(store: &SkillStore, delete_credential: bool) -> anyhow::Result<()> {
+    clear_pending_oauth_with_credentials(store, &SystemCredentialStore, delete_credential)
+}
+
+fn clear_pending_oauth_with_credentials(
+    store: &SkillStore,
+    credentials: &dyn CredentialStore,
+    delete_credential: bool,
+) -> anyhow::Result<()> {
+    let pending = load_pending_oauth(store)?;
+    let delete_key = if delete_credential {
+        pending
+            .as_ref()
+            .map(|pending| {
+                credential_key_is_active(store, &pending.credential_key)
+                    .map(|active| (!active).then(|| pending.credential_key.clone()))
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    if let Some(key) = delete_key.as_deref() {
+        enqueue_credential_cleanup(store, key)?;
+    }
+    store.delete_setting(DEVICE_SYNC_PENDING_OAUTH_SETTING)?;
+    retry_queued_credential_cleanup(store, credentials)?;
+    Ok(())
+}
+
+fn load_credential_cleanup_queue(store: &SkillStore) -> anyhow::Result<Vec<String>> {
+    let mut keys = store
+        .get_setting(DEVICE_SYNC_CREDENTIAL_CLEANUP_QUEUE_SETTING)?
+        .map(|value| {
+            serde_json::from_str::<Vec<String>>(&value).context("decode credential cleanup queue")
+        })
+        .transpose()?
+        .unwrap_or_default();
+    keys.retain(|key| !key.trim().is_empty());
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
+fn save_credential_cleanup_queue(store: &SkillStore, keys: &[String]) -> anyhow::Result<()> {
+    if keys.is_empty() {
+        store.delete_setting(DEVICE_SYNC_CREDENTIAL_CLEANUP_QUEUE_SETTING)
+    } else {
+        store.set_setting(
+            DEVICE_SYNC_CREDENTIAL_CLEANUP_QUEUE_SETTING,
+            &serde_json::to_string(keys)?,
+        )
+    }
+}
+
+fn enqueue_credential_cleanup(store: &SkillStore, key: &str) -> anyhow::Result<()> {
+    let mut keys = load_credential_cleanup_queue(store)?;
+    if !keys.iter().any(|queued| queued == key) {
+        keys.push(key.to_string());
+        keys.sort();
+        save_credential_cleanup_queue(store, &keys)?;
+    }
+    Ok(())
+}
+
+fn dequeue_credential_cleanup(store: &SkillStore, key: &str) -> anyhow::Result<()> {
+    let mut keys = load_credential_cleanup_queue(store)?;
+    keys.retain(|queued| queued != key);
+    save_credential_cleanup_queue(store, &keys)
+}
+
+fn persist_device_sync_credential_replacement_with<T, F>(
+    store: &SkillStore,
+    credentials: &dyn CredentialStore,
+    replaced_credential_key: Option<&str>,
+    persist: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce() -> anyhow::Result<T>,
+{
+    retry_queued_credential_cleanup(store, credentials)?;
+    if let Some(key) = replaced_credential_key {
+        enqueue_credential_cleanup(store, key)?;
+    }
+    let value = persist()?;
+    retry_queued_credential_cleanup(store, credentials)?;
+    Ok(value)
+}
+
+pub(crate) fn retry_queued_credential_cleanup(
+    store: &SkillStore,
+    credentials: &dyn CredentialStore,
+) -> anyhow::Result<()> {
+    let keys = load_credential_cleanup_queue(store)?;
+    let ownership = keys
+        .iter()
+        .map(|key| credential_key_is_owned(store, key).map(|owned| (key, owned)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut remaining = Vec::new();
+    let mut first_error = None;
+    for (key, owned) in ownership {
+        if owned {
+            remaining.push(key.clone());
+            continue;
+        }
+        if let Err(err) = credentials.delete(key) {
+            remaining.push(key.clone());
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        }
+    }
+    save_credential_cleanup_queue(store, &remaining)?;
+    if let Some(err) = first_error {
+        return Err(err).context("delete queued device sync credential");
+    }
+    Ok(())
+}
+
+fn persist_pending_oauth_result_with<F>(
+    store: &SkillStore,
+    credentials: &dyn CredentialStore,
+    result: &OAuthPollResult,
+    save: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&PendingOAuthAuthorization) -> anyhow::Result<()>,
+{
+    let (Some(credential_key), Some(account)) =
+        (result.credential_key.as_ref(), result.account.as_ref())
+    else {
+        return retry_queued_credential_cleanup(store, credentials);
+    };
+    let previous = match load_pending_oauth(store) {
+        Ok(previous) => previous,
+        Err(err) => {
+            return defer_credential_cleanup_after_failure(store, credentials, credential_key, err);
+        }
+    };
+    let previous_key = previous
+        .as_ref()
+        .map(|pending| pending.credential_key.as_str())
+        .filter(|previous_key| *previous_key != credential_key);
+    if let Some(previous_key) = previous_key {
+        let previous_is_active = match credential_key_is_active(store, previous_key) {
+            Ok(active) => active,
+            Err(err) => {
+                return defer_credential_cleanup_after_failure(
+                    store,
+                    credentials,
+                    credential_key,
+                    err,
+                );
+            }
+        };
+        if !previous_is_active {
+            if let Err(err) = enqueue_credential_cleanup(store, previous_key) {
+                return defer_credential_cleanup_after_failure(
+                    store,
+                    credentials,
+                    credential_key,
+                    err,
+                );
+            }
+        }
+    }
+    let pending = PendingOAuthAuthorization {
+        provider: result.provider,
+        credential_key: credential_key.clone(),
+        account: account.clone(),
+    };
+    if let Err(err) = save(&pending) {
+        return defer_credential_cleanup_after_failure(store, credentials, credential_key, err);
+    }
+    retry_queued_credential_cleanup(store, credentials)
+}
+
+fn defer_credential_cleanup_after_failure<T>(
+    store: &SkillStore,
+    credentials: &dyn CredentialStore,
+    key: &str,
+    primary_error: anyhow::Error,
+) -> anyhow::Result<T> {
+    let cleanup_result = match enqueue_credential_cleanup(store, key) {
+        Ok(()) => retry_queued_credential_cleanup(store, credentials),
+        Err(queue_error) => match credentials.delete(key) {
+            Ok(()) => Ok(()),
+            Err(delete_error) => Err(delete_error).with_context(|| {
+                format!(
+                    "persist cleanup intent after {queue_error:#} and delete uncommitted credential"
+                )
+            }),
+        },
+    };
+    match cleanup_result {
+        Ok(()) => Err(primary_error),
+        Err(cleanup_error) => Err(cleanup_error).with_context(|| {
+            format!("operation failed and credential cleanup was deferred: {primary_error:#}")
+        }),
+    }
+}
+
+fn credential_key_is_active(store: &SkillStore, key: &str) -> anyhow::Result<bool> {
+    Ok(store
+        .get_device_sync_config()?
+        .and_then(|config| config.credential_key)
+        .as_deref()
+        == Some(key))
+}
+
+fn credential_key_is_owned(store: &SkillStore, key: &str) -> anyhow::Result<bool> {
+    if credential_key_is_active(store, key)? {
+        return Ok(true);
+    }
+    Ok(load_pending_oauth(store)?
+        .map(|pending| pending.credential_key == key)
+        .unwrap_or(false))
+}
+
+fn persist_config_with_staged_personal_access_token<F>(
+    store: &SkillStore,
+    credentials: &dyn CredentialStore,
+    usage: &CredentialUsage,
+    token: &str,
+    mut config: DeviceSyncConfig,
+    save: F,
+) -> anyhow::Result<DeviceSyncConfig>
+where
+    F: FnOnce(&DeviceSyncConfig) -> anyhow::Result<()>,
+{
+    let staged_key = Uuid::new_v4().to_string();
+    enqueue_credential_cleanup(store, &staged_key)?;
+    if let Err(err) = save_personal_access_token(credentials, &staged_key, usage, token) {
+        return defer_credential_cleanup_after_failure(store, credentials, &staged_key, err);
+    }
+    config.credential_key = Some(staged_key.clone());
+    if let Err(err) = save(&config) {
+        return defer_credential_cleanup_after_failure(store, credentials, &staged_key, err);
+    }
+    dequeue_credential_cleanup(store, &staged_key)?;
+    retry_queued_credential_cleanup(store, credentials)?;
+    Ok(config)
+}
+
+fn device_sync_paths(
+    app: &tauri::AppHandle,
+    store: &SkillStore,
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let paths = crate::runtime_paths_for_tauri(app)?;
+    let workspace = paths.app_data_dir.join("device-sync");
+    let central = resolve_central_repo_from_runtime(&paths, store)?;
+    Ok((workspace, central))
+}
+
+fn resolve_device_sync_token(
+    store: &SkillStore,
+    provider: ProviderId,
+    token: Option<String>,
+    credential_key: Option<String>,
+) -> anyhow::Result<String> {
+    if let Some(token) = token.filter(|value| !value.trim().is_empty()) {
+        return Ok(token.trim().to_string());
+    }
+    let key = credential_key
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            store
+                .get_device_sync_config()
+                .ok()
+                .flatten()
+                .filter(|config| config.provider == provider)
+                .and_then(|config| config.credential_key)
+        })
+        .context("sign in or provide an access token first")?;
+    let proxy_url = get_github_proxy_url_core(store)?;
+    resolve_access_token_with_proxy(
+        &SystemCredentialStore,
+        &key,
+        &CredentialUsage::official(provider),
+        &proxy_url,
+    )
+    .context("read saved device sync authorization")?
+    .context("saved authorization is unavailable; sign in again")
+}
+
+fn inherited_device_sync_credential(
+    previous: Option<&DeviceSyncConfig>,
+    expected_usage: &CredentialUsage,
+) -> Option<String> {
+    let previous = previous?;
+    let previous_usage =
+        CredentialUsage::from_https_remote(previous.provider, &previous.remote_url).ok()?;
+    (previous_usage == *expected_usage)
+        .then(|| previous.credential_key.clone())
+        .flatten()
+}
+
+fn validate_device_sync_remote(value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.contains(['\n', '\r']) || value.contains('?') || value.contains('#') {
+        return Err("device sync repository URL contains unsupported characters".to_string());
+    }
+    if let Some(rest) = value.strip_prefix("https://") {
+        let authority = rest.split('/').next().unwrap_or_default();
+        if authority.contains('@') {
+            return Err("do not include credentials in the repository URL".to_string());
+        }
+        return Ok(());
+    }
+    if value.starts_with("ssh://") || value.starts_with("git@") {
+        return Ok(());
+    }
+    Err("use an HTTPS or SSH repository URL".to_string())
 }
 
 #[cfg(test)]
