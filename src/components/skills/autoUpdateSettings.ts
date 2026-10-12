@@ -66,6 +66,22 @@ export function summarizeAutoUpdateErrors(rawError: string | null | undefined) {
   }
 }
 
+export function getAutoUpdateFailureNoticeId(
+  config: Pick<
+    AutoUpdateConfigDto,
+    'last_run_at' | 'last_status' | 'last_failed'
+  > | null | undefined,
+) {
+  if (
+    config?.last_status !== 'error' ||
+    !config.last_run_at ||
+    config.last_failed <= 0
+  ) {
+    return null
+  }
+  return `${config.last_run_at}:${config.last_failed}`
+}
+
 export function getAutoUpdateProgressCounts(
   progress: AutoUpdateProgressSnapshotDto | null | undefined,
 ) {
@@ -157,6 +173,7 @@ function classifyAutoUpdateError(line: string) {
   if (
     lower.includes('failed to connect to github.com') ||
     lower.includes('unable to access') ||
+    lower.includes('could not resolve host') ||
     lower.includes('operation too slow') ||
     lower.includes('unexpected disconnect') ||
     lower.includes('early eof') ||
@@ -167,6 +184,14 @@ function classifyAutoUpdateError(line: string) {
   }
   if (lower.includes('rate limit')) {
     return 'autoUpdateErrorRateLimited'
+  }
+  if (
+    lower.includes('需要系统 git') ||
+    lower.includes('system git is required') ||
+    lower.includes('xcodebuild -license') ||
+    (lower.includes('xcode') && lower.includes('license'))
+  ) {
+    return 'autoUpdateErrorGitUnavailable'
   }
   return 'autoUpdateErrorOther'
 }

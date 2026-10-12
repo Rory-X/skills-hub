@@ -1,10 +1,12 @@
 import { memo } from 'react'
 import {
+  FileText,
   FolderKanban,
   Library,
   Search,
   Settings,
   SlidersHorizontal,
+  Workflow,
 } from 'lucide-react'
 import type { TFunction } from 'i18next'
 
@@ -15,12 +17,18 @@ type HeaderProps = {
     | 'projects'
     | 'projectDetail'
     | 'myskills'
+    | 'templates'
     | 'explore'
+    | 'prompts'
     | 'settings'
     | 'manage'
   onToggleLanguage: () => void
   onOpenSettings: () => void
-  onViewChange: (view: 'projects' | 'myskills' | 'explore' | 'manage') => void
+  onOpenUpdates: () => void
+  updateFailureCount: number
+  onViewChange: (
+    view: 'projects' | 'myskills' | 'templates' | 'explore' | 'prompts' | 'manage',
+  ) => void
   t: TFunction
 }
 
@@ -29,6 +37,8 @@ const Header = ({
   activeView,
   onToggleLanguage,
   onOpenSettings,
+  onOpenUpdates,
+  updateFailureCount,
   onViewChange,
   t,
 }: HeaderProps) => {
@@ -59,6 +69,14 @@ const Header = ({
             {t('navSkillLibrary')}
           </button>
           <button
+            className={`nav-tab${activeView === 'templates' ? ' active' : ''}`}
+            type="button"
+            onClick={() => onViewChange('templates')}
+          >
+            <Workflow size={16} />
+            {t('navTemplates')}
+          </button>
+          <button
             className={`nav-tab${activeView === 'explore' ? ' active' : ''}`}
             type="button"
             onClick={() => onViewChange('explore')}
@@ -67,12 +85,31 @@ const Header = ({
             {t('navExplore')}
           </button>
           <button
+            className={`nav-tab${activeView === 'prompts' ? ' active' : ''}`}
+            type="button"
+            onClick={() => onViewChange('prompts')}
+          >
+            <FileText size={16} />
+            {t('navPrompts')}
+          </button>
+          <button
             className={`nav-tab${activeView === 'manage' ? ' active' : ''}`}
             type="button"
-            onClick={() => onViewChange('manage')}
+            onClick={() => {
+              if (updateFailureCount > 0) {
+                onOpenUpdates()
+                return
+              }
+              onViewChange('manage')
+            }}
           >
             <SlidersHorizontal size={16} />
             {t('navManageCenter')}
+            {updateFailureCount > 0 ? (
+              <span className="nav-alert-badge">
+                {updateFailureCount > 99 ? '99+' : updateFailureCount}
+              </span>
+            ) : null}
           </button>
         </nav>
       </div>

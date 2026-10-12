@@ -6,6 +6,10 @@ type DeleteModalProps = {
   open: boolean
   loading: boolean
   skillName: string | null
+  title?: string
+  description?: string
+  warnings?: string[]
+  confirmLabel?: string
   onRequestClose: () => void
   onConfirm: () => void
   t: TFunction
@@ -15,14 +19,26 @@ const DeleteModal = ({
   open,
   loading,
   skillName,
+  title,
+  description,
+  warnings,
+  confirmLabel,
   onRequestClose,
   onConfirm,
   t,
 }: DeleteModalProps) => {
   if (!open) return null
 
+  const warningItems = warnings ?? [
+    t('delete.warningRemoveFromTools'),
+    t('delete.warningDeleteFromHub'),
+  ]
+
   return (
-    <div className="modal-backdrop" onClick={onRequestClose}>
+    <div
+      className="modal-backdrop"
+      onClick={loading ? undefined : onRequestClose}
+    >
       <div
         className="modal modal-delete"
         onClick={(e) => e.stopPropagation()}
@@ -32,10 +48,10 @@ const DeleteModal = ({
         <div className="modal-body delete-body">
           <div className="delete-title">
             <TriangleAlert size={20} />
-            {t('deleteTitle')}
+            {title ?? t('deleteTitle')}
           </div>
           <div className="delete-desc">
-            {skillName ? (
+            {description ?? (skillName ? (
               <>
                 {t('delete.confirmPrefix')}
                 <strong>{skillName}</strong>
@@ -43,12 +59,13 @@ const DeleteModal = ({
               </>
             ) : (
               t('deleteBody')
-            )}
+            ))}
           </div>
           <div className="delete-warning">
             <ul>
-              <li>{t('delete.warningRemoveFromTools')}</li>
-              <li>{t('delete.warningDeleteFromHub')}</li>
+              {warningItems.map((warning) => (
+                <li key={warning}>{warning}</li>
+              ))}
             </ul>
           </div>
         </div>
@@ -65,7 +82,7 @@ const DeleteModal = ({
             onClick={onConfirm}
             disabled={loading}
           >
-            {t('delete.confirmButton')}
+            {confirmLabel ?? t('delete.confirmButton')}
           </button>
         </div>
       </div>

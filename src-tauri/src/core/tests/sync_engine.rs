@@ -249,8 +249,7 @@ fn managed_copy_replaces_only_content_matching_the_expected_hash() {
     let target = target_root.path().join("target");
     fs::create_dir_all(&target).unwrap();
     fs::write(target.join("a.txt"), b"old").unwrap();
-    let expected_hash =
-        crate::core::content_hash::hash_dir_for_sync_conflict(&target).unwrap();
+    let expected_hash = crate::core::content_hash::hash_dir_for_sync_conflict(&target).unwrap();
 
     let outcome =
         sync_managed_copy_with_expected_hash(source.path(), &target, &expected_hash).unwrap();

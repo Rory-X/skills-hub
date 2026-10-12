@@ -8,7 +8,7 @@ use crate::core::auto_update::{
     AutoUpdateIntervalUnit, AutoUpdateSchedule, AutoUpdateScheduleType,
     AUTO_UPDATE_LAST_CHECKED_KEY, AUTO_UPDATE_LAST_ERROR_KEY, DEFAULT_AUTO_UPDATE_INTERVAL_HOURS,
 };
-use crate::core::skill_store::{SkillRecord, SkillStore};
+use crate::core::skill_store::{SkillRecord, SkillStore, SkillTargetRecord};
 
 fn make_store() -> (tempfile::TempDir, SkillStore) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -87,6 +87,7 @@ fn config_roundtrips_and_rejects_invalid_interval() {
             enabled: true,
             interval_hours: 12,
             schedule: hourly_schedule(12),
+            eligible_skill_count: 0,
             local_skill_count: 0,
             protected_local_skill_count: 0,
             last_run_at: None,
@@ -113,6 +114,7 @@ fn config_roundtrips_and_rejects_invalid_interval() {
             enabled: true,
             interval_hours: 0,
             schedule: minute_schedule(10),
+            eligible_skill_count: 0,
             local_skill_count: 0,
             protected_local_skill_count: 0,
             last_run_at: None,
@@ -140,6 +142,7 @@ fn schedule_supports_minutes_and_daily_time() {
             enabled: true,
             interval_hours: 1,
             schedule: minute_schedule(30),
+            eligible_skill_count: 0,
             local_skill_count: 0,
             protected_local_skill_count: 0,
             last_run_at: None,
@@ -175,6 +178,7 @@ fn due_check_respects_enabled_state_and_interval() {
         enabled: false,
         interval_hours: 24,
         schedule: hourly_schedule(24),
+        eligible_skill_count: 0,
         local_skill_count: 0,
         protected_local_skill_count: 0,
         last_run_at: Some(1_000),
@@ -240,6 +244,117 @@ fn eligible_skills_include_git_and_local_sources() {
         ids,
         vec!["git-skill".to_string(), "local-skill".to_string()]
     );
+}
+
+#[test]
+fn eligible_skills_exclude_disabled_and_managed_local_sources() {
+    let (_dir, store) = make_store();
+    let mut disabled = make_skill("disabled", "git", "/tmp/disabled");
+    disabled.enabled = false;
+    store.upsert_skill(&disabled).unwrap();
+
+    let mut managed = make_skill("managed", "local", "/tmp/managed-central");
+    managed.source_ref = Some("/tmp/managed-target".to_string());
+    store.upsert_skill(&managed).unwrap();
+    store
+        .upsert_skill_target(&SkillTargetRecord {
+            id: "managed-target".to_string(),
+            skill_id: managed.id.clone(),
+            tool: "cline".to_string(),
+            scope: "global".to_string(),
+            project_path: None,
+            target_path: "/tmp/managed-target".to_string(),
+            mode: "symlink".to_string(),
+            status: "ok".to_string(),
+            last_error: None,
+            synced_at: None,
+        })
+        .unwrap();
+
+    store
+        .upsert_skill(&make_skill("external", "local", "/tmp/external-central"))
+        .unwrap();
+
+    let ids = crate::core::auto_update::list_auto_update_skill_ids(&store).unwrap();
+    let config = get_auto_update_config(&store).unwrap();
+
+    assert_eq!(ids, vec!["external".to_string()]);
+    assert_eq!(config.eligible_skill_count, 1);
+    assert_eq!(config.local_skill_count, 1);
+}
+
+#[test]
+fn config_hides_persisted_failures_for_skills_that_are_no_longer_eligible() {
+    let (_dir, store) = make_store();
+    let mut disabled = make_skill("disabled", "local", "/tmp/disabled-central");
+    disabled.enabled = false;
+    store.upsert_skill(&disabled).unwrap();
+
+    let mut managed = make_skill("managed", "local", "/tmp/managed-central");
+    managed.source_ref = Some("/tmp/managed-target".to_string());
+    store.upsert_skill(&managed).unwrap();
+    store
+        .upsert_skill_target(&SkillTargetRecord {
+            id: "managed-target".to_string(),
+            skill_id: managed.id.clone(),
+            tool: "cline".to_string(),
+            scope: "global".to_string(),
+            project_path: None,
+            target_path: "/tmp/managed-target".to_string(),
+            mode: "symlink".to_string(),
+            status: "ok".to_string(),
+            last_error: None,
+            synced_at: None,
+        })
+        .unwrap();
+    store
+        .upsert_skill(&make_skill("external", "git", "/tmp/external-central"))
+        .unwrap();
+
+    record_auto_update_result(
+        &store,
+        &AutoUpdateRunResult {
+            checked: 3,
+            updated: 1,
+            failed: 2,
+            errors: vec![
+                "disabled: source path not found".to_string(),
+                "managed: source path not found".to_string(),
+            ],
+            progress: AutoUpdateProgressSnapshot {
+                total: 3,
+                succeeded: vec![AutoUpdateSkillProgress {
+                    skill_id: "external".to_string(),
+                    name: "external".to_string(),
+                    reason: None,
+                }],
+                failed: vec![
+                    AutoUpdateSkillProgress {
+                        skill_id: "disabled".to_string(),
+                        name: "disabled".to_string(),
+                        reason: Some("source path not found".to_string()),
+                    },
+                    AutoUpdateSkillProgress {
+                        skill_id: "managed".to_string(),
+                        name: "managed".to_string(),
+                        reason: Some("source path not found".to_string()),
+                    },
+                ],
+                ..AutoUpdateProgressSnapshot::default()
+            },
+        },
+    )
+    .unwrap();
+
+    let config = get_auto_update_config(&store).unwrap();
+
+    assert_eq!(config.eligible_skill_count, 1);
+    assert_eq!(config.last_checked, 1);
+    assert_eq!(config.last_updated, 1);
+    assert_eq!(config.last_failed, 0);
+    assert_eq!(config.last_status.as_deref(), Some("ok"));
+    assert_eq!(config.last_error.as_deref(), Some(""));
+    assert!(config.progress.failed.is_empty());
 }
 
 #[test]

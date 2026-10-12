@@ -139,6 +139,12 @@ export type AssignmentApplyResultDto = {
   skipped: number
 }
 
+export type SkillEnableResultDto = {
+  restored: number
+  failed: number
+  errors: string[]
+}
+
 export type GitSkillCandidate = {
   name: string
   description?: string | null
@@ -205,6 +211,7 @@ export type AutoUpdateConfigDto = {
   interval_value: number
   interval_unit: 'minutes' | 'hours'
   daily_time: string
+  eligible_skill_count: number
   local_skill_count: number
   protected_local_skill_count: number
   task_registered: boolean
@@ -342,6 +349,8 @@ export type ProjectSkillDto = {
   linked_skill_id?: string | null
   matched_skill_id?: string | null
   tool_keys: string[]
+  origin_types: ('manual' | 'template' | string)[]
+  additionally_visible_tool_keys: string[]
   paths: ProjectSkillPathDto[]
 }
 
@@ -369,6 +378,7 @@ export type ProjectIssueKind =
   | 'git_exclude_drift'
   | 'git_exclude_unavailable'
   | 'library_skill_unavailable'
+  | 'template_sync_failed'
 
 export type ProjectIssueActionKind =
   | 'delete_invalid_skill'
@@ -382,6 +392,7 @@ export type ProjectIssueActionKind =
   | 'initialize_git_repository'
   | 'enable_library_skill'
   | 'remove_unavailable_library_skill'
+  | 'retry_template'
 
 export type ProjectIssueActionDto = {
   kind: ProjectIssueActionKind
@@ -405,6 +416,7 @@ export type ProjectIssueDto = {
 
 export type ProjectDetailDto = {
   project: ProjectSummaryDto
+  template_binding?: ProjectTemplateBindingDto | null
   tools: ProjectToolDto[]
   current_skills: ProjectSkillDto[]
   library_skills: ProjectLibrarySkillDto[]
@@ -551,4 +563,229 @@ export type DeviceSyncTrashEntry = {
   skill_name: string
   deleted_at: number
   expires_at: number
+}
+
+export type TemplateMode = 'live' | 'snapshot'
+
+export type TemplateSkillDto = {
+  id: string
+  name: string
+  description?: string | null
+  enabled: boolean
+}
+
+export type TemplateProjectLinkDto = {
+  project_id: string
+  project_name: string
+  project_root: string
+  applied_revision_id: string
+  snapshot_outdated: boolean
+  sync_error?: string | null
+}
+
+export type SkillTemplateDto = {
+  id: string
+  name: string
+  description?: string | null
+  mode: TemplateMode
+  archived: boolean
+  current_revision_id: string
+  created_at: number
+  updated_at: number
+  skills: TemplateSkillDto[]
+  linked_projects: TemplateProjectLinkDto[]
+  failure_count: number
+}
+
+export type TemplateRevisionSkillDto = {
+  skill_id: string
+  skill_name: string
+}
+
+export type SkillTemplateRevisionDto = {
+  id: string
+  template_id: string
+  revision_number: number
+  name: string
+  description?: string | null
+  created_at: number
+  skills: TemplateRevisionSkillDto[]
+}
+
+export type TemplateDiffDto = {
+  added: TemplateSkillDto[]
+  removed: TemplateSkillDto[]
+  retained: TemplateSkillDto[]
+}
+
+export type TemplateMutationResultDto = {
+  template?: SkillTemplateDto | null
+  membership_changed: boolean
+  reconciled_projects: number
+  failed_projects: number
+}
+
+export type TemplateFailureDto = {
+  skill_id: string
+  tool: string
+  kind: string
+  error: string
+}
+
+export type TemplateReconcileResultDto = {
+  project_id: string
+  template_id: string
+  applied_revision_id: string
+  succeeded: number
+  failed: TemplateFailureDto[]
+}
+
+export type ProjectTemplateBindingDto = {
+  template_id: string
+  template_name: string
+  mode: TemplateMode
+  applied_revision_id: string
+  current_revision_id: string
+  snapshot_outdated: boolean
+  sync_error?: string | null
+}
+
+export type PromptTool = 'codex' | 'claude_code' | 'pi' | 'ds_harness'
+
+export type PromptProfileDto = {
+  id: string
+  tool: PromptTool
+  label: string
+  config_root: string
+  source: 'default' | 'environment' | 'custom' | string
+  is_default: boolean
+  config_root_exists: boolean
+  tool_version?: string | null
+}
+
+export type PromptProfileInputDto = {
+  id: string
+  tool: PromptTool
+  label: string
+  config_root: string
+}
+
+export type PromptSourceScope =
+  | 'managed'
+  | 'global'
+  | 'project'
+  | 'local'
+  | 'import'
+
+export type PromptSourceKind =
+  | 'primary'
+  | 'override'
+  | 'fallback'
+  | 'local'
+  | 'rule'
+  | 'import'
+  | 'managed_policy'
+
+export type PromptSourceDto = {
+  id: string
+  tool: PromptTool
+  profile_id: string
+  project_id?: string | null
+  scope: PromptSourceScope
+  kind: PromptSourceKind
+  path: string
+  display_path: string
+  real_path?: string | null
+  exists: boolean
+  is_symlink: boolean
+  link_target?: string | null
+  writable: boolean
+  git_status?: string | null
+  content_hash?: string | null
+  modified_at?: number | null
+  byte_len?: number | null
+  empty: boolean
+  encoding: string
+  can_create: boolean
+  can_delete: boolean
+  warning?: string | null
+}
+
+export type PromptDocumentDto = {
+  source: PromptSourceDto
+  content: string
+  content_hash?: string | null
+  line_ending: 'lf' | 'crlf' | string
+  has_bom: boolean
+  read_only: boolean
+  warnings: string[]
+}
+
+export type PromptScenarioDto = {
+  profile_id: string
+  project_id?: string | null
+  working_directory?: string | null
+  target_path?: string | null
+}
+
+export type PromptChainSourceDto = {
+  source: PromptSourceDto
+  phase: string
+  order: number
+  loaded_bytes: number
+  truncated: boolean
+  imported_from?: string | null
+  path_patterns: string[]
+  matches_target?: boolean | null
+}
+
+export type PromptInstructionChainDto = {
+  tool: PromptTool
+  profile_id: string
+  project_id?: string | null
+  working_directory?: string | null
+  target_path?: string | null
+  startup_sources: PromptChainSourceDto[]
+  conditional_sources: PromptChainSourceDto[]
+  warnings: string[]
+  accuracy: string
+}
+
+export type PromptMutationResultDto = {
+  source: PromptSourceDto
+  revision_id: string
+  created: boolean
+  deleted: boolean
+}
+
+export type PromptRevisionSummaryDto = {
+  id: string
+  logical_path: string
+  real_path?: string | null
+  tool: string
+  profile_id: string
+  project_id?: string | null
+  operation: string
+  content_hash: string
+  byte_len: number
+  created_at: number
+}
+
+export type PromptRevisionDocumentDto = {
+  summary: PromptRevisionSummaryDto
+  content: string
+  encoding: string
+  line_ending: string
+  has_bom: boolean
+}
+
+export type PromptWatchStatusDto = {
+  watch_id: string
+  watched_roots: string[]
+  truncated: boolean
+}
+
+export type PromptWatchEventDto = {
+  watch_id: string
+  paths: string[]
 }

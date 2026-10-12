@@ -55,6 +55,7 @@ pub enum ToolId {
     Windsurf,
     Moltbot,
     HermesAgent,
+    DsHarness,
 }
 
 impl ToolId {
@@ -106,6 +107,7 @@ impl ToolId {
             ToolId::Windsurf => "windsurf",
             ToolId::Moltbot => "moltbot",
             ToolId::HermesAgent => "hermes_agent",
+            ToolId::DsHarness => "ds_harness",
         }
     }
 }
@@ -572,6 +574,14 @@ pub fn default_tool_adapters() -> Vec<ToolAdapter> {
             relative_skills_dir: ".hermes/skills",
             relative_detect_dir: ".hermes",
         },
+        ToolAdapter {
+            id: ToolId::DsHarness,
+            display_name: "DeepSeek Harness",
+            // dsh-skill-filesystem scans <dshHome>/skills (rank 400) and
+            // <projectRoot>/.dsh/skills (rank 100); dshHome is $DSH_HOME or ~/.dsh.
+            relative_skills_dir: ".dsh/skills",
+            relative_detect_dir: ".dsh",
+        },
     ]
 }
 
@@ -641,7 +651,18 @@ pub fn project_relative_skills_dir(adapter: &ToolAdapter) -> &'static str {
         | ToolId::Clawdbot
         | ToolId::Moltbot
         | ToolId::HermesAgent => adapter.relative_skills_dir,
+        ToolId::DsHarness => ".dsh/skills",
     }
+}
+
+pub fn project_discovery_skills_dirs(adapter: &ToolAdapter) -> Vec<&'static str> {
+    let mut dirs = vec![project_relative_skills_dir(adapter)];
+    match adapter.id {
+        ToolId::Cursor => dirs.push(".cursor/skills"),
+        ToolId::Codex => dirs.push(".codex/skills"),
+        _ => {}
+    }
+    dirs
 }
 
 pub fn resolve_detect_path(adapter: &ToolAdapter) -> Result<PathBuf> {
@@ -667,6 +688,13 @@ pub fn scan_tool_dir(tool: &ToolAdapter, dir: &Path) -> Result<Vec<DetectedSkill
         let file_type = entry.file_type()?;
         let is_dir = file_type.is_dir() || (file_type.is_symlink() && path.is_dir());
         if !is_dir {
+            continue;
+        }
+
+        // Only offer directories that can be imported as a Skill. Tool state
+        // folders without a manifest (for example Cursor auxiliary folders)
+        // must not appear in onboarding discovery.
+        if !path.join("SKILL.md").is_file() {
             continue;
         }
 

@@ -78,7 +78,6 @@ fn update_frame(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-
 use std::ffi::OsStr;
 use std::path::PathBuf;
 

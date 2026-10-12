@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  getAutoUpdateFailureNoticeId,
   getAutoUpdateProgressCounts,
   getAutoUpdateTaskStatusKey,
   getAutoUpdateToastKey,
@@ -27,17 +28,55 @@ describe('summarizeAutoUpdateErrors', () => {
       's1: source path not found: "/Users/may/Downloads/demo"',
       's2: git 命令执行失败。git 操作超时 (300s)。error: RPC failed; curl 28 Operation too slow',
       's3: fatal: unable to access github.com port 443',
+      's4: fatal: could not resolve host: github.com',
     ].join('\n'))
 
-    expect(result.total).toBe(3)
+    expect(result.total).toBe(4)
     expect(result.summaries).toEqual([
       { key: 'autoUpdateErrorSourceMissing', count: 1 },
-      { key: 'autoUpdateErrorNetwork', count: 2 },
+      { key: 'autoUpdateErrorNetwork', count: 3 },
     ])
   })
 
   it('returns no summaries for empty errors', () => {
     expect(summarizeAutoUpdateErrors('').summaries).toEqual([])
+  })
+
+  it('groups an unavailable system git separately from other failures', () => {
+    const duplicated =
+      'system git is required for sparse checkout: system git is required for sparse checkout'
+    const result = summarizeAutoUpdateErrors(
+      [
+        `frontend-design: ${duplicated}`,
+        'gsap-core: 子目录 Skill 需要系统 git 才能做 sparse checkout，但系统 git 无法运行：尚未同意 Xcode 许可协议。',
+      ].join('\n'),
+    )
+    expect(result.summaries).toEqual([
+      { key: 'autoUpdateErrorGitUnavailable', count: 2 },
+    ])
+  })
+})
+
+describe('getAutoUpdateFailureNoticeId', () => {
+  it('identifies a completed failed run', () => {
+    expect(getAutoUpdateFailureNoticeId({
+      last_run_at: 1_000,
+      last_status: 'error',
+      last_failed: 3,
+    })).toBe('1000:3')
+  })
+
+  it('ignores successful and running results', () => {
+    expect(getAutoUpdateFailureNoticeId({
+      last_run_at: 1_000,
+      last_status: 'ok',
+      last_failed: 0,
+    })).toBeNull()
+    expect(getAutoUpdateFailureNoticeId({
+      last_run_at: 1_000,
+      last_status: 'running',
+      last_failed: 2,
+    })).toBeNull()
   })
 })
 

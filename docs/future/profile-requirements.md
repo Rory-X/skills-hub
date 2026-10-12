@@ -1,5 +1,9 @@
 # Skill Profile / 配置方案后续需求记录
 
+> [!IMPORTANT]
+> 本文是早期探索记录，已被 [Skill Templates 需求基线](./skill-template-requirements.md) 取代。
+> 其中 Profile 的全局激活、目标工具集合和配置切换等设想不属于当前 Skill Templates 语义；保留本文仅用于追溯历史决策。
+
 ## 背景
 
 GitHub Issue #23 提到“技能分组”能力：

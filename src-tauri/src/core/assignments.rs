@@ -8,13 +8,16 @@ use uuid::Uuid;
 use super::content_hash::hash_dir;
 use super::projects::{
     add_project_skill_tools_and_scan, assign_project_skill_tools_and_scan,
-    project_issue_fingerprint, ProjectInjectionSummary, ProjectIssue, ProjectToolSpec,
+    project_issue_fingerprint, resolve_project_skills_dir, ProjectInjectionSummary, ProjectIssue,
+    ProjectToolSpec,
 };
 use super::skill_store::{
     IgnoredIssueRecord, ProjectSkillLinkRecord, SkillAssignmentRecord, SkillRecord, SkillStore,
     SkillTargetRecord,
 };
+use super::skill_templates::reconcile_all_project_templates;
 use super::sync_engine::{sync_dir_for_tool_with_overwrite, SyncMode};
+use super::tool_adapters::{adapter_by_key, project_discovery_skills_dirs};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssignmentToolSpec {
@@ -25,6 +28,14 @@ pub struct AssignmentToolSpec {
     pub global_available: bool,
     pub enabled: bool,
     pub supports_project_scope: bool,
+}
+
+fn project_tool_spec(tool: &AssignmentToolSpec, available: bool) -> ProjectToolSpec {
+    let mut spec = ProjectToolSpec::new(&tool.key, &tool.project_skills_dir);
+    if let Some(adapter) = adapter_by_key(&tool.key) {
+        spec = spec.with_discovery_dirs(project_discovery_skills_dirs(&adapter));
+    }
+    spec.with_available(available)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -120,6 +131,13 @@ pub struct SkillAssignmentApplyOutcome {
     pub skill_id: String,
     pub skill_name: String,
     pub summary: AssignmentApplySummary,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SkillEnableOutcome {
+    pub restored: usize,
+    pub failed: usize,
+    pub errors: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -466,9 +484,279 @@ pub fn resume_skill_assignment(
     skill_id: &str,
     tools: &[AssignmentToolSpec],
 ) -> Result<AssignmentApplySummary> {
-    let assignments = store.list_skill_assignments(skill_id)?;
+    let mut assignments = Vec::new();
+    for assignment in store.list_skill_assignments(skill_id)? {
+        if assignment.scope != "project" {
+            assignments.push(assignment);
+            continue;
+        }
+        let Some(project_id) = assignment.project_id.as_deref() else {
+            continue;
+        };
+        let has_manual_origin = store
+            .list_project_skill_origins_for_skill(project_id, skill_id)?
+            .iter()
+            .any(|origin| origin.source_type == "manual");
+        if has_manual_origin {
+            assignments.push(assignment);
+        }
+    }
     let draft = assignment_draft_from_records(&assignments);
     apply_skill_assignment(store, skill_id, &draft, tools, &HashSet::new(), false)
+}
+
+pub fn disable_skill_atomically(
+    store: &SkillStore,
+    skill_id: &str,
+    tools: &[AssignmentToolSpec],
+) -> Result<()> {
+    let skill = require_skill(store, skill_id)?;
+    if !skill.enabled {
+        return Ok(());
+    }
+    let mut targets = store
+        .list_skill_targets(skill_id)?
+        .into_iter()
+        .map(|target| PathBuf::from(target.target_path))
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+
+    let mut moved = Vec::<(PathBuf, PathBuf)>::new();
+    for target in targets {
+        if std::fs::symlink_metadata(&target).is_err() {
+            continue;
+        }
+        let parent = target
+            .parent()
+            .with_context(|| format!("target has no parent: {:?}", target))?;
+        let name = target
+            .file_name()
+            .map(|value| value.to_string_lossy())
+            .unwrap_or_default();
+        let backup = parent.join(format!(".{name}.skillshub-disabled-{}", Uuid::new_v4()));
+        if let Err(err) = std::fs::rename(&target, &backup) {
+            let restore_errors = restore_disabled_target_backups(&moved);
+            let suffix = if restore_errors.is_empty() {
+                String::new()
+            } else {
+                format!("; restore failures: {}", restore_errors.join("; "))
+            };
+            anyhow::bail!("remove Agent-visible target {:?}: {err}{suffix}", target);
+        }
+        moved.push((target, backup));
+    }
+
+    if let Err(err) = store.suspend_skill_atomically(skill_id) {
+        let restore_errors = restore_disabled_target_backups(&moved);
+        if restore_errors.is_empty() {
+            return Err(err);
+        }
+        anyhow::bail!("{err:#}; restore failures: {}", restore_errors.join("; "));
+    }
+    for (_, backup) in moved {
+        if let Err(err) = remove_path(&backup) {
+            log::warn!("remove disabled Skill backup {:?}: {err:#}", backup);
+        }
+    }
+    let project_specs = tools
+        .iter()
+        .filter(|tool| tool.supports_project_scope && !tool.project_skills_dir.is_empty())
+        .map(|tool| project_tool_spec(tool, tool.global_available && tool.enabled))
+        .collect::<Vec<_>>();
+    let _ = reconcile_all_project_templates(store, &project_specs);
+    Ok(())
+}
+
+pub fn enable_skill_and_restore(
+    store: &SkillStore,
+    skill_id: &str,
+    tools: &[AssignmentToolSpec],
+) -> Result<SkillEnableOutcome> {
+    require_skill(store, skill_id)?;
+    store.set_skill_enabled(skill_id, true)?;
+    let assignment = resume_skill_assignment(store, skill_id, tools)?;
+    let project_specs = tools
+        .iter()
+        .filter(|tool| tool.supports_project_scope && !tool.project_skills_dir.is_empty())
+        .map(|tool| project_tool_spec(tool, tool.global_available && tool.enabled))
+        .collect::<Vec<_>>();
+    let (_, failed_projects) = reconcile_all_project_templates(store, &project_specs);
+    let mut errors = assignment.errors;
+    if assignment.skipped > 0 {
+        errors.push(format!(
+            "{} assignment(s) could not be restored because their targets conflict",
+            assignment.skipped
+        ));
+    }
+    if failed_projects > 0 {
+        errors.push(format!(
+            "{failed_projects} project template(s) still need attention"
+        ));
+    }
+    Ok(SkillEnableOutcome {
+        restored: assignment.succeeded,
+        failed: assignment.failed + assignment.skipped + failed_projects,
+        errors,
+    })
+}
+
+pub fn cleanup_orphaned_skill_symlinks(
+    store: &SkillStore,
+    tools: &[AssignmentToolSpec],
+) -> Result<usize> {
+    let skills = store.list_skills()?;
+    let projects = store.list_projects()?;
+    let tools_by_key = tools
+        .iter()
+        .map(|tool| (tool.key.as_str(), tool))
+        .collect::<HashMap<_, _>>();
+    let projects_by_id = projects
+        .iter()
+        .map(|project| (project.id.as_str(), project))
+        .collect::<HashMap<_, _>>();
+
+    let mut known_central_paths = HashMap::<PathBuf, String>::new();
+    let mut central_roots = HashSet::<PathBuf>::new();
+    for skill in &skills {
+        let central_path = Path::new(&skill.central_path);
+        if let Ok(resolved) = std::fs::canonicalize(central_path) {
+            known_central_paths.insert(resolved, skill.id.clone());
+        }
+        if let Some(parent) = central_path.parent() {
+            if let Ok(resolved) = std::fs::canonicalize(parent) {
+                central_roots.insert(resolved);
+            }
+        }
+    }
+
+    let mut expected_targets = HashSet::<(String, PathBuf)>::new();
+    for skill in &skills {
+        if !skill.enabled {
+            continue;
+        }
+        for assignment in store.list_skill_assignments(&skill.id)? {
+            if assignment.state != "active" {
+                continue;
+            }
+            let Some(tool) = tools_by_key.get(assignment.tool.as_str()).copied() else {
+                continue;
+            };
+            let target = match assignment.scope.as_str() {
+                "global" if tool.enabled && tool.global_available => {
+                    Some(tool.global_skills_dir.join(&skill.name))
+                }
+                "project"
+                    if tool.enabled
+                        && tool.global_available
+                        && tool.supports_project_scope
+                        && !tool.project_skills_dir.is_empty() =>
+                {
+                    let Some(project_id) = assignment.project_id.as_deref() else {
+                        continue;
+                    };
+                    let Some(project) = projects_by_id.get(project_id).copied() else {
+                        continue;
+                    };
+                    if !project.enabled_tool_keys.contains(&tool.key) {
+                        continue;
+                    }
+                    resolve_project_skills_dir(project, &tool.project_skills_dir)
+                        .ok()
+                        .map(|directory| directory.join(&skill.name))
+                }
+                _ => None,
+            };
+            if let Some(target) = target {
+                expected_targets.insert((skill.id.clone(), normalized_target_location(&target)));
+            }
+        }
+    }
+
+    let mut scan_directories = HashSet::<PathBuf>::new();
+    for tool in tools {
+        if !tool.global_skills_dir.as_os_str().is_empty() && tool.global_skills_dir.is_dir() {
+            if let Ok(directory) = std::fs::canonicalize(&tool.global_skills_dir) {
+                scan_directories.insert(directory);
+            }
+        }
+        if !tool.supports_project_scope || tool.project_skills_dir.is_empty() {
+            continue;
+        }
+        for project in &projects {
+            if let Ok(directory) = resolve_project_skills_dir(project, &tool.project_skills_dir) {
+                if directory.is_dir() {
+                    if let Ok(directory) = std::fs::canonicalize(directory) {
+                        scan_directories.insert(directory);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut removed = 0;
+    for directory in scan_directories {
+        if central_roots.contains(&directory) {
+            continue;
+        }
+        let entries = std::fs::read_dir(&directory)
+            .with_context(|| format!("read Agent Skill directory {:?}", directory))?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !metadata.file_type().is_symlink() {
+                continue;
+            }
+            let Ok(resolved_target) = std::fs::canonicalize(&path) else {
+                continue;
+            };
+            let Some(skill_id) = known_central_paths.get(&resolved_target) else {
+                continue;
+            };
+            if expected_targets.contains(&(skill_id.clone(), normalized_target_location(&path))) {
+                continue;
+            }
+            std::fs::remove_file(&path)
+                .with_context(|| format!("remove orphaned managed Skill link {:?}", path))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn normalized_target_location(path: &Path) -> PathBuf {
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    let parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    path.file_name()
+        .map(|name| parent.join(name))
+        .unwrap_or(parent)
+}
+
+fn restore_disabled_target_backups(moved: &[(PathBuf, PathBuf)]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (target, backup) in moved.iter().rev() {
+        if let Err(err) = std::fs::rename(backup, target) {
+            errors.push(format!("{:?}: {err}", target));
+        }
+    }
+    errors
+}
+
+fn remove_path(path: &Path) -> Result<()> {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        std::fs::remove_file(path)?;
+    } else {
+        std::fs::remove_dir_all(path)?;
+    }
+    Ok(())
 }
 
 pub fn preview_skill_assignments(
@@ -751,10 +1039,7 @@ fn apply_project_skill_assignment(
     let tool_specs = tools
         .iter()
         .filter(|tool| tool.supports_project_scope && !tool.project_skills_dir.is_empty())
-        .map(|tool| {
-            ProjectToolSpec::new(&tool.key, &tool.project_skills_dir)
-                .with_available(tool.global_available)
-        })
+        .map(|tool| project_tool_spec(tool, tool.global_available))
         .collect::<Vec<_>>();
     let overwrite_tools = requested_tools
         .iter()
@@ -1029,10 +1314,7 @@ fn apply_project_assignments(
     let tool_specs = tools
         .iter()
         .filter(|tool| tool.supports_project_scope && !tool.project_skills_dir.is_empty())
-        .map(|tool| {
-            ProjectToolSpec::new(&tool.key, &tool.project_skills_dir)
-                .with_available(tool.global_available)
-        })
+        .map(|tool| project_tool_spec(tool, tool.global_available))
         .collect::<Vec<_>>();
 
     for project_id in project_ids {
@@ -2044,7 +2326,7 @@ fn restore_existing_assignments(
     let tool_specs = tools
         .iter()
         .filter(|tool| tool.supports_project_scope && !tool.project_skills_dir.is_empty())
-        .map(|tool| ProjectToolSpec::new(&tool.key, &tool.project_skills_dir).with_available(true))
+        .map(|tool| project_tool_spec(tool, true))
         .collect::<Vec<_>>();
     for project in &draft.projects {
         if !skill.enabled {
@@ -2121,9 +2403,7 @@ fn restore_project_assignment(
         let tool_specs = tools
             .iter()
             .filter(|tool| tool.supports_project_scope && !tool.project_skills_dir.is_empty())
-            .map(|tool| {
-                ProjectToolSpec::new(&tool.key, &tool.project_skills_dir).with_available(true)
-            })
+            .map(|tool| project_tool_spec(tool, true))
             .collect::<Vec<_>>();
         assign_project_skill_tools_and_scan(
             store,
@@ -2308,16 +2588,7 @@ fn hash_resolved_dir(path: &Path) -> Result<String> {
 }
 
 fn paths_refer_to_same_location(left: &Path, right: &Path) -> bool {
-    fn normalized(path: &Path) -> PathBuf {
-        let Some(parent) = path.parent() else {
-            return path.to_path_buf();
-        };
-        let parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
-        path.file_name()
-            .map(|name| parent.join(name))
-            .unwrap_or(parent)
-    }
-    normalized(left) == normalized(right)
+    normalized_target_location(left) == normalized_target_location(right)
 }
 
 fn require_skill(store: &SkillStore, skill_id: &str) -> Result<SkillRecord> {

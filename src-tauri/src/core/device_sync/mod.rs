@@ -2880,9 +2880,10 @@ mod tests {
             root.path(),
             root.path().join("app-data"),
         );
-        let err = crate::core::installer::update_managed_skill_from_source_for_paths(&paths, &b, "one")
-            .err()
-            .unwrap();
+        let err =
+            crate::core::installer::update_managed_skill_from_source_for_paths(&paths, &b, "one")
+                .err()
+                .unwrap();
         assert!(err.to_string().starts_with("SKILL_SOURCE_UNBOUND|"));
         assert_eq!(b.get_skill_by_id("one").unwrap().unwrap().status, "ok");
         assert!(b.source_checks().unwrap().get("one").unwrap().0.is_none());

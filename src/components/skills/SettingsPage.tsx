@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import { ArrowLeft, Database, Github, Palette } from 'lucide-react'
 import type { TFunction } from 'i18next'
+import SelectMenu from '../common/SelectMenu'
 import type { GithubProxyConfigDto } from './types'
 
 type SettingsPageProps = {
@@ -129,31 +130,19 @@ const SettingsPage = ({
                   <label className="settings-label" htmlFor="settings-language">
                     {t('interfaceLanguage')}
                   </label>
-                  <div className="settings-select-wrap">
-                    <select
-                      id="settings-language"
-                      className="settings-select"
-                      value={language}
-                      onChange={(event) => {
-                        if (event.target.value !== language) {
-                          onToggleLanguage()
-                        }
-                      }}
-                    >
-                      <option value="en">{t('languageOptions.en')}</option>
-                      <option value="zh">{t('languageOptions.zh')}</option>
-                    </select>
-                    <svg
-                      className="settings-select-caret"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      aria-hidden="true"
-                    >
-                      <path d="M6 9l6 6 6-6" />
-                    </svg>
-                  </div>
+                  <SelectMenu
+                    id="settings-language"
+                    className="settings-select-menu"
+                    value={language}
+                    options={[
+                      { value: 'en', label: t('languageOptions.en') },
+                      { value: 'zh', label: t('languageOptions.zh') },
+                    ]}
+                    onChange={(value) => {
+                      if (value !== language) onToggleLanguage()
+                    }}
+                    ariaLabel={t('interfaceLanguage')}
+                  />
                 </div>
 
                 <div className="settings-field">

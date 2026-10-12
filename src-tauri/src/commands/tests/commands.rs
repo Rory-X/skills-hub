@@ -1,6 +1,10 @@
 use super::*;
 use crate::core::projects::{can_ignore_project_issue, project_issue_fingerprint};
-use crate::core::skill_store::{SkillAssignmentRecord, SkillRecord, SkillTargetRecord};
+use crate::core::skill_store::{
+    ProjectTemplateFailureRecord, SkillAssignmentRecord, SkillRecord, SkillTargetRecord,
+    SkillTemplateRecord,
+};
+use crate::core::skill_templates::{TemplateProjectLink, TemplateSkill};
 
 fn make_store() -> (tempfile::TempDir, SkillStore) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -16,6 +20,9 @@ fn format_anyhow_error_passthrough_prefixes() {
 
     let err = anyhow::anyhow!("HUB_NAME_CONFLICT|skill-id");
     assert_eq!(format_anyhow_error(err), "HUB_NAME_CONFLICT|skill-id");
+
+    let err = anyhow::anyhow!("PROMPT_CONFLICT|hash-a|hash-b");
+    assert_eq!(format_anyhow_error(err), "PROMPT_CONFLICT|hash-a|hash-b");
 }
 
 #[test]
@@ -115,15 +122,112 @@ fn project_runtime_mapping_exposes_installation_and_defaults_to_installed_tools(
             enabled: true,
             is_custom: false,
             skills_dir: "/tmp/cursor".into(),
-            project_skills_dir: ".cursor/skills".to_string(),
+            project_skills_dir: ".agents/skills".to_string(),
+            supports_project_scope: true,
+        },
+        RuntimeTool {
+            key: "custom_agent".to_string(),
+            label: "Custom Agent".to_string(),
+            installed: true,
+            enabled: true,
+            is_custom: true,
+            skills_dir: "/tmp/custom-agent".into(),
+            project_skills_dir: ".custom/skills".to_string(),
             supports_project_scope: true,
         },
     ];
 
-    assert_eq!(default_project_tool_keys(&tools), vec!["codex"]);
+    assert_eq!(
+        default_project_tool_keys(&tools),
+        vec!["codex", "custom_agent"]
+    );
     let specs = project_specs_from_runtime(&tools);
     assert!(specs[0].available);
     assert!(!specs[1].available);
+    assert_eq!(
+        specs[0].discovery_dirs,
+        vec![".agents/skills", ".codex/skills"]
+    );
+    assert_eq!(
+        specs[1].discovery_dirs,
+        vec![".agents/skills", ".cursor/skills"]
+    );
+    assert_eq!(specs[2].discovery_dirs, vec![".custom/skills"]);
+}
+
+#[test]
+fn shared_project_directory_exposes_additional_agent_visibility() {
+    let specs = [
+        ProjectToolSpec::new("codex", ".agents/skills").with_discovery_dirs([".codex/skills"]),
+        ProjectToolSpec::new("cline", ".agents/skills"),
+        ProjectToolSpec::new("claude_code", ".claude/skills"),
+    ];
+
+    assert_eq!(
+        additionally_visible_project_tools(&["cline".to_string()], &specs),
+        vec!["codex"]
+    );
+    assert!(additionally_visible_project_tools(&["claude_code".to_string()], &specs).is_empty());
+}
+
+#[test]
+fn template_command_dtos_preserve_domain_state_and_failures() {
+    let dto = skill_template_dto(SkillTemplateView {
+        template: SkillTemplateRecord {
+            id: "template".to_string(),
+            name: "Workflow".to_string(),
+            description: Some("Review flow".to_string()),
+            mode: "snapshot".to_string(),
+            archived: true,
+            current_revision_id: "revision-2".to_string(),
+            created_at: 10,
+            updated_at: 20,
+        },
+        skills: vec![TemplateSkill {
+            id: "skill".to_string(),
+            name: "Review".to_string(),
+            description: None,
+            enabled: false,
+        }],
+        linked_projects: vec![TemplateProjectLink {
+            project_id: "project".to_string(),
+            project_name: "App".to_string(),
+            project_root: "/project".to_string(),
+            applied_revision_id: "revision-1".to_string(),
+            snapshot_outdated: true,
+            sync_error: Some("failed".to_string()),
+        }],
+        failure_count: 1,
+    });
+
+    assert_eq!(dto.id, "template");
+    assert_eq!(dto.mode, "snapshot");
+    assert!(dto.archived);
+    assert!(!dto.skills[0].enabled);
+    assert!(dto.linked_projects[0].snapshot_outdated);
+    assert_eq!(dto.linked_projects[0].sync_error.as_deref(), Some("failed"));
+    assert_eq!(dto.failure_count, 1);
+
+    let reconcile = template_reconcile_dto(TemplateReconcileResult {
+        project_id: "project".to_string(),
+        template_id: "template".to_string(),
+        applied_revision_id: "revision-2".to_string(),
+        succeeded: 2,
+        failed: vec![ProjectTemplateFailureRecord {
+            project_id: "project".to_string(),
+            template_id: "template".to_string(),
+            skill_id: "skill".to_string(),
+            tool: "codex".to_string(),
+            kind: "content_conflict".to_string(),
+            error: "target exists".to_string(),
+            updated_at: 30,
+        }],
+    });
+    assert_eq!(reconcile.succeeded, 2);
+    assert_eq!(reconcile.failed[0].skill_id, "skill");
+    assert_eq!(reconcile.failed[0].tool, "codex");
+    assert_eq!(reconcile.failed[0].kind, "content_conflict");
+    assert_eq!(reconcile.failed[0].error, "target exists");
 }
 
 #[test]

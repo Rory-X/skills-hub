@@ -1,5 +1,5 @@
 import { memo, useState } from 'react'
-import { ArrowLeft, ChevronDown, Plus, Trash2 } from 'lucide-react'
+import { ArrowLeft, ChevronDown, FileText, Plus, Trash2 } from 'lucide-react'
 import type { TFunction } from 'i18next'
 import type {
   CustomToolConfigDto,
@@ -11,6 +11,7 @@ type ToolsPageProps = {
   toolStatus: ToolStatusDto | null
   toolConfig: ToolConfigDto | null
   onToolConfigChange: (config: ToolConfigDto) => void
+  onOpenPrompts?: (toolKey: string) => void
   embedded?: boolean
   onBack?: () => void
   t: TFunction
@@ -20,6 +21,7 @@ const ToolsPage = ({
   toolStatus,
   toolConfig,
   onToolConfigChange,
+  onOpenPrompts,
   embedded = false,
   onBack,
   t,
@@ -141,6 +143,20 @@ const ToolsPage = ({
             </span>
           </div>
           <div className="tool-management-actions">
+            {onOpenPrompts &&
+            (tool.key === 'codex' ||
+              tool.key === 'claude_code' ||
+              tool.key === 'pi') ? (
+              <button
+                type="button"
+                className="icon-btn"
+                title={t('prompts.openForTool')}
+                aria-label={t('prompts.openForTool')}
+                onClick={() => onOpenPrompts(tool.key)}
+              >
+                <FileText size={16} />
+              </button>
+            ) : null}
             <button
               type="button"
               className={`settings-toggle${enabled ? ' checked' : ''}`}

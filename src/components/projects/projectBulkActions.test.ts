@@ -36,6 +36,8 @@ describe('getManageableProjectSkillIds', () => {
       linked_skill_id: linkedSkillId,
       matched_skill_id: matchedSkillId,
       tool_keys: [],
+      origin_types: source === 'library' ? ['manual'] : [],
+      additionally_visible_tool_keys: [],
       paths: [],
     })
 

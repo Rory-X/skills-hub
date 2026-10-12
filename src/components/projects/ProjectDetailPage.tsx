@@ -8,6 +8,8 @@ import {
   ChevronRight,
   FolderGit2,
   EyeOff,
+  Eye,
+  FileText,
   Library,
   ListChecks,
   Plus,
@@ -15,6 +17,7 @@ import {
   Search,
   Trash2,
   Wrench,
+  Workflow,
   X,
 } from 'lucide-react'
 import type { TFunction } from 'i18next'
@@ -24,6 +27,8 @@ import type {
   ProjectIssueDto,
   ProjectSkillDto,
 } from '../skills/types'
+import Tooltip from '../common/Tooltip'
+import type { SkillPreviewRequest } from '../skills/SkillPreviewDrawer'
 import {
   getAvailableProjectToolKeys,
 } from '../skills/toolAvailability'
@@ -40,6 +45,9 @@ type ProjectDetailPageProps = {
   loading: boolean
   onBack: () => void
   onRefresh: () => void
+  onOpenPrompts: () => void
+  onManageTemplate: () => void
+  onOpenSkillDetail: (request: SkillPreviewRequest) => void
   onToolsChange: (toolKeys: string[]) => void
   onGitExcludeChange: (enabled: boolean) => void
   onAddLibrarySkill: (skillId: string) => void
@@ -63,6 +71,9 @@ const ProjectDetailPage = ({
   loading,
   onBack,
   onRefresh,
+  onOpenPrompts,
+  onManageTemplate,
+  onOpenSkillDetail,
   onToolsChange,
   onGitExcludeChange,
   onAddLibrarySkill,
@@ -113,7 +124,17 @@ const ProjectDetailPage = ({
     [filteredLibrary],
   )
   const manageableCurrentSkillIds = useMemo(
-    () => getManageableProjectSkillIds(detail.current_skills),
+    () => {
+      const manualSkillIds = new Set(
+        detail.current_skills
+          .filter((skill) => skill.origin_types.includes('manual'))
+          .map((skill) => skill.linked_skill_id)
+          .filter((skillId): skillId is string => Boolean(skillId)),
+      )
+      return getManageableProjectSkillIds(detail.current_skills).filter((skillId) =>
+        manualSkillIds.has(skillId),
+      )
+    },
     [detail.current_skills],
   )
   const selectedLibrarySkillIds = useMemo(() => {
@@ -246,6 +267,22 @@ const ProjectDetailPage = ({
     const collectiblePath = skill.paths.find(
       (path) => path.status !== 'invalid_missing_skill_md',
     )
+    const additionallyVisibleTools = skill.additionally_visible_tool_keys.map(
+      (toolKey) => ({ key: toolKey, label: toolLabels[toolKey] ?? toolKey }),
+    )
+    const additionalVisibilityTooltip = t('projects.alsoVisibleTo', {
+      tools: additionallyVisibleTools.map((tool) => tool.label).join(', '),
+    })
+    const managedSkillId = skill.linked_skill_id ?? skill.matched_skill_id
+    const previewSource = managedSkillId
+      ? { kind: 'managed' as const, skillId: managedSkillId }
+      : collectiblePath
+        ? {
+            kind: 'local' as const,
+            basePath: collectiblePath.absolute_path,
+            subpath: '.',
+          }
+        : null
     return (
       <div
         className={`project-skill-row${currentBulkMode ? ' bulk-mode' : ''}${bulkSelected ? ' bulk-selected' : ''}`}
@@ -287,10 +324,31 @@ const ProjectDetailPage = ({
         </button>
         <div className="project-skill-main">
           <div className="project-skill-title-line">
-            <strong>{skill.name}</strong>
+            {previewSource ? (
+              <button
+                className="project-skill-title"
+                type="button"
+                onClick={() =>
+                  onOpenSkillDetail({
+                    title: skill.name,
+                    description: skill.description,
+                    source: previewSource,
+                  })
+                }
+              >
+                {skill.name}
+              </button>
+            ) : (
+              <strong>{skill.name}</strong>
+            )}
             <span className={`project-source-badge source-${skill.source}`}>
               {t(`projects.sources.${skill.source}`)}
             </span>
+            {skill.origin_types.includes('template') ? (
+              <span className="project-source-badge source-template">
+                {t('projects.sources.template')}
+              </span>
+            ) : null}
             {skill.status === 'needs_attention' ? (
               <span className="project-skill-warning">
                 <AlertTriangle size={13} />
@@ -306,6 +364,24 @@ const ProjectDetailPage = ({
               <span key={toolKey}>{toolLabels[toolKey] ?? toolKey}</span>
             ))}
           </div>
+          {additionallyVisibleTools.length > 0 ? (
+            <div className="project-skill-visible-tools">
+              <Tooltip content={additionalVisibilityTooltip}>
+                <button
+                  className="project-skill-visibility-help"
+                  type="button"
+                  aria-label={additionalVisibilityTooltip}
+                >
+                  <Eye size={13} aria-hidden="true" />
+                </button>
+              </Tooltip>
+              <span className="project-skill-visible-list">
+                {additionallyVisibleTools.map((tool) => (
+                  <span key={tool.key}>{tool.label}</span>
+                ))}
+              </span>
+            </div>
+          ) : null}
           {expanded ? (
             <div className="project-skill-paths">
               {skill.paths.length === 0 ? (
@@ -326,7 +402,9 @@ const ProjectDetailPage = ({
           ) : null}
         </div>
         <div className="project-skill-actions">
-          {skill.source === 'library' && skill.linked_skill_id ? (
+          {skill.source === 'library' &&
+          skill.linked_skill_id &&
+          skill.origin_types.includes('manual') ? (
             <button
               className="btn btn-quiet danger"
               type="button"
@@ -374,16 +452,17 @@ const ProjectDetailPage = ({
         </div>
         <div className="project-issue-actions">
           {issue.can_ignore ? (
-            <button
-              className="icon-btn"
-              type="button"
-              onClick={() => onIgnoreIssue(issue.id, issue.fingerprint)}
-              disabled={loading}
-              title={t('projects.ignoreIssue')}
-              aria-label={t('projects.ignoreIssue')}
-            >
-              <EyeOff size={16} />
-            </button>
+            <Tooltip content={t('projects.ignoreIssue')}>
+              <button
+                className="icon-btn"
+                type="button"
+                onClick={() => onIgnoreIssue(issue.id, issue.fingerprint)}
+                disabled={loading}
+                aria-label={t('projects.ignoreIssue')}
+              >
+                <EyeOff size={16} />
+              </button>
+            </Tooltip>
           ) : null}
           {issue.actions.length > 0 ? (
             <button
@@ -416,16 +495,39 @@ const ProjectDetailPage = ({
           <h1>{detail.project.name}</h1>
           <code title={detail.project.root_path}>{detail.project.root_path}</code>
         </div>
-        <button
-          className="icon-btn"
-          type="button"
-          onClick={onRefresh}
-          disabled={loading}
-          title={t('projects.refresh')}
-          aria-label={t('projects.refresh')}
-        >
-          <RefreshCw size={17} />
-        </button>
+        <div className="project-detail-head-actions">
+          <button
+            className="btn btn-secondary"
+            type="button"
+            onClick={onManageTemplate}
+            disabled={loading}
+          >
+            <Workflow size={16} />
+            {detail.template_binding?.template_name ?? t('templates.project.apply')}
+            {detail.template_binding?.sync_error ? (
+              <AlertTriangle size={14} aria-label={t('projects.needsAttention')} />
+            ) : null}
+          </button>
+          <button
+            className="btn btn-secondary"
+            type="button"
+            onClick={onOpenPrompts}
+            disabled={loading}
+          >
+            <FileText size={16} />
+            {t('navPrompts')}
+          </button>
+          <button
+            className="icon-btn"
+            type="button"
+            onClick={onRefresh}
+            disabled={loading}
+            title={t('projects.refresh')}
+            aria-label={t('projects.refresh')}
+          >
+            <RefreshCw size={17} />
+          </button>
+        </div>
       </div>
 
       <div className="project-controls-band">
@@ -691,7 +793,22 @@ const ProjectDetailPage = ({
                         </label>
                       ) : null}
                       <div>
-                        <strong>{skill.name}</strong>
+                        <button
+                          className="project-skill-title"
+                          type="button"
+                          onClick={() =>
+                            onOpenSkillDetail({
+                              title: skill.name,
+                              description: skill.description,
+                              source: {
+                                kind: 'managed',
+                                skillId: skill.skill_id,
+                              },
+                            })
+                          }
+                        >
+                          {skill.name}
+                        </button>
                         {skill.description ? <p>{skill.description}</p> : null}
                       </div>
                     </div>

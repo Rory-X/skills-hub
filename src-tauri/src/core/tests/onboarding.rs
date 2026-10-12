@@ -31,11 +31,13 @@ fn groups_by_name_and_detects_conflicts_by_fingerprint() {
     // Cursor installed
     fs::create_dir_all(home.path().join(".cursor")).unwrap();
     fs::create_dir_all(home.path().join(".cursor/skills/foo")).unwrap();
+    fs::write(home.path().join(".cursor/skills/foo/SKILL.md"), b"# Foo").unwrap();
     fs::write(home.path().join(".cursor/skills/foo/a.txt"), b"cursor").unwrap();
 
     // Codex installed
     fs::create_dir_all(home.path().join(".codex")).unwrap();
     fs::create_dir_all(home.path().join(".codex/skills/foo")).unwrap();
+    fs::write(home.path().join(".codex/skills/foo/SKILL.md"), b"# Foo").unwrap();
     fs::write(home.path().join(".codex/skills/foo/a.txt"), b"codex").unwrap();
 
     // Codex .system should be ignored
@@ -133,6 +135,7 @@ fn excludes_managed_skill_targets() {
     // Cursor installed
     fs::create_dir_all(home.path().join(".cursor")).unwrap();
     fs::create_dir_all(home.path().join(".cursor/skills/foo")).unwrap();
+    fs::write(home.path().join(".cursor/skills/foo/SKILL.md"), b"# Foo").unwrap();
     fs::write(home.path().join(".cursor/skills/foo/a.txt"), b"cursor").unwrap();
 
     let mut exclude = std::collections::HashSet::new();
@@ -143,6 +146,29 @@ fn excludes_managed_skill_targets() {
 
     let plan = build_onboarding_plan_in_home(home.path(), None, Some(&exclude)).unwrap();
     assert_eq!(plan.total_skills_found, 0);
+}
+
+#[test]
+fn ignores_discovered_skill_until_its_content_changes() {
+    let home = tempfile::tempdir().unwrap();
+    let store = crate::core::skill_store::SkillStore::new(home.path().join("store.db"));
+    store.ensure_schema().unwrap();
+
+    fs::create_dir_all(home.path().join(".cursor")).unwrap();
+    let skill_path = home.path().join(".cursor/skills/demo");
+    fs::create_dir_all(&skill_path).unwrap();
+    fs::write(skill_path.join("SKILL.md"), b"# Demo").unwrap();
+
+    let first = build_onboarding_plan_in_home(home.path(), None, None).unwrap();
+    assert_eq!(first.total_skills_found, 1);
+    super::ignore_discovered_skill(&store, &[skill_path.to_string_lossy().to_string()]).unwrap();
+    let ignored = super::filter_ignored_discovered_skills(&store, first).unwrap();
+    assert!(ignored.groups.is_empty());
+
+    fs::write(skill_path.join("SKILL.md"), b"# Demo changed").unwrap();
+    let changed = build_onboarding_plan_in_home(home.path(), None, None).unwrap();
+    let visible = super::filter_ignored_discovered_skills(&store, changed).unwrap();
+    assert_eq!(visible.total_skills_found, 1);
 }
 
 #[test]

@@ -1,5 +1,5 @@
 import { memo } from 'react'
-import { Check } from 'lucide-react'
+import { Check, FolderSearch } from 'lucide-react'
 import type { TFunction } from 'i18next'
 import type { TagWithCountDto } from '../types'
 
@@ -94,6 +94,15 @@ const AddSkillModal = ({
 
           {addModalTab === 'local' ? (
             <>
+              {!reimportSkillName ? (
+                <div className="local-scan-hint">
+                  <FolderSearch size={18} />
+                  <div>
+                    <strong>{t('localScanTitle')}</strong>
+                    <span>{t('localScanBody')}</span>
+                  </div>
+                </div>
+              ) : null}
               <div className="form-group form-row-inline">
                 <div className="form-field">
                   <label className="label">{t('localFolder')}</label>
@@ -116,10 +125,10 @@ const AddSkillModal = ({
                 </div>
                 {!reimportSkillName ? (
                   <div className="form-field">
-                    <label className="label">{t('optionalNamePlaceholder')}</label>
+                    <label className="label">{t('localCustomName')}</label>
                     <input
                       className="input"
-                      placeholder={t('optionalNamePlaceholder')}
+                      placeholder={t('localCustomNamePlaceholder')}
                       value={localName}
                       onChange={(event) => onLocalNameChange(event.target.value)}
                     />
@@ -199,7 +208,7 @@ const AddSkillModal = ({
             {reimportSkillName
               ? t('assignment.reimport')
               : addModalTab === 'local'
-                ? t('create')
+                ? t('scanAndImport')
                 : t('install')}
           </button>
         </div>

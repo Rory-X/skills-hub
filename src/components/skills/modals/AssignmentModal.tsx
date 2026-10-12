@@ -16,6 +16,7 @@ import {
   X,
 } from 'lucide-react'
 import type { TFunction } from 'i18next'
+import SelectMenu from '../../common/SelectMenu'
 import type {
   AssignmentApplyResultDto,
   AssignmentDraftDto,
@@ -817,10 +818,20 @@ const AssignmentModal = ({
                       </button>
                       <label className={bulkOrigin === 'template' ? 'selected' : ''}>
                         <strong>{t('assignment.originTemplate')}</strong>
-                        <select
+                        <SelectMenu
+                          className="bulk-template-select"
                           value={bulkTemplateId}
-                          onChange={(event) => {
-                            const templateId = event.target.value
+                          options={[
+                            {
+                              value: '',
+                              label: t('assignment.selectTemplate'),
+                            },
+                            ...skills.map((skill) => ({
+                              value: skill.id,
+                              label: skill.name,
+                            })),
+                          ]}
+                          onChange={(templateId) => {
                             setBulkTemplateId(templateId)
                             if (!templateId) {
                               setBulkOrigin(null)
@@ -846,14 +857,9 @@ const AssignmentModal = ({
                               ),
                             )
                           }}
-                        >
-                          <option value="">{t('assignment.selectTemplate')}</option>
-                          {skills.map((skill) => (
-                            <option value={skill.id} key={skill.id}>
-                              {skill.name}
-                            </option>
-                          ))}
-                        </select>
+                          ariaLabel={t('assignment.selectTemplate')}
+                          menuMinWidth={260}
+                        />
                         <span>{t('assignment.originTemplateHint')}</span>
                       </label>
                     </div>

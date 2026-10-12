@@ -4,9 +4,9 @@ import {
   Copy,
   Folder,
   Github,
+  ListChecks,
   Power,
   RefreshCw,
-  Share2,
   Tag,
   Trash2,
 } from 'lucide-react'
@@ -85,6 +85,20 @@ const SkillCard = ({
       .map((assignment) => assignment.project_id)
       .filter(Boolean),
   ).size
+  const projectLabels = Array.from(
+    new Map(
+      skill.assignments
+        .filter((assignment) => assignment.scope === 'project')
+        .map((assignment) => {
+          const label = assignment.project_name ?? assignment.project_path
+          const key = assignment.project_id ?? assignment.project_path ?? label
+          return key && label ? [key, label] : null
+        })
+        .filter((entry): entry is [string, string] => entry !== null),
+    ).values(),
+  )
+  const projectLabelSeparator = t('assignment.projectNameSeparator')
+  const projectLabelsText = projectLabels.join(projectLabelSeparator)
   const skillEnabled = skill.enabled !== false
 
   const handleCopy = async () => {
@@ -219,11 +233,26 @@ const SkillCard = ({
             className={`scope-badge ${skillScope}`}
             type="button"
             onClick={() => onOpenScope(skill)}
+            title={
+              projectLabelsText
+                ? `${t('assignment.projectsTitle')}: ${projectLabelsText}`
+                : undefined
+            }
           >
-            {t('assignment.summary', {
-              global: globalAssignmentCount,
-              projects: projectAssignmentCount || projectCount,
-            })}
+            <span className="scope-summary">
+              {t('assignment.summary', {
+                global: globalAssignmentCount,
+                projects: projectAssignmentCount || projectCount,
+              })}
+            </span>
+            {projectLabelsText ? (
+              <>
+                <span className="scope-project-separator" aria-hidden="true">
+                  ·
+                </span>
+                <span className="scope-project-names">{projectLabelsText}</span>
+              </>
+            ) : null}
           </button>
         </div>
         <div className={`tool-matrix${!expanded && needsCollapse ? ' collapsed' : ''}`}>
@@ -275,7 +304,7 @@ const SkillCard = ({
           aria-label={t('assignment.open')}
           title={t('assignment.open')}
         >
-          <Share2 size={16} />
+          <ListChecks size={16} />
         </button>
         <button
           className={`card-btn tag-action${skill.tags.length > 0 ? ' has-tags' : ''}`}
