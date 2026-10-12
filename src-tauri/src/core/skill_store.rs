@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use uuid::Uuid;
 
-use super::device_sync::types::{DeviceSyncConfig, DeviceSyncDevice, SyncConflict, SyncHistoryEntry, TrashEntry};
+use super::device_sync::types::{
+    DeviceSyncConfig, DeviceSyncDevice, SyncConflict, SyncHistoryEntry, TrashEntry,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use tauri::Manager;
 
@@ -11,7 +13,7 @@ const DB_FILE_NAME: &str = "skills_hub.db";
 const LEGACY_APP_IDENTIFIERS: &[&str] = &["com.tauri.dev", "com.tauri.dev.skillshub"];
 
 // Schema versioning: bump when making changes and add a migration step.
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 10;
 
 const DEVICE_SYNC_SCHEMA_VERSION_KEY: &str = "schema.device_sync";
 const DEVICE_SYNC_SCHEMA_VERSION: &str = "1";
@@ -101,7 +103,6 @@ fn prune_device_sync_history(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     )?;
     Ok(())
 }
-
 
 // Minimal schema for MVP: skills, skill_targets, settings, discovered_skills(optional).
 const SCHEMA_V1: &str = r#"
@@ -246,6 +247,22 @@ CREATE TABLE IF NOT EXISTS ignored_issues (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ignored_issues_instance
 ON ignored_issues(scope, COALESCE(scope_id, ''), issue_key, fingerprint);
+
+CREATE TABLE IF NOT EXISTS prompt_revisions (
+  id TEXT PRIMARY KEY,
+  logical_path TEXT NOT NULL,
+  real_path TEXT NULL,
+  tool TEXT NOT NULL,
+  profile_id TEXT NOT NULL,
+  project_id TEXT NULL,
+  operation TEXT NOT NULL,
+  content BLOB NOT NULL,
+  content_hash TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_prompt_revisions_path_created
+ON prompt_revisions(logical_path, created_at DESC);
 "#;
 
 #[derive(Clone, Debug)]
@@ -389,6 +406,92 @@ pub struct ProjectSkillLinkRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptRevisionRecord {
+    pub id: String,
+    pub logical_path: String,
+    pub real_path: Option<String>,
+    pub tool: String,
+    pub profile_id: String,
+    pub project_id: Option<String>,
+    pub operation: String,
+    pub content: Vec<u8>,
+    pub content_hash: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillTemplateRecord {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub mode: String,
+    pub archived: bool,
+    pub current_revision_id: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillTemplateRevisionRecord {
+    pub id: String,
+    pub template_id: String,
+    pub revision_number: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillTemplateRevisionItemRecord {
+    pub revision_id: String,
+    pub skill_id: String,
+    pub skill_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectTemplateBindingRecord {
+    pub project_id: String,
+    pub template_id: String,
+    pub applied_revision_id: String,
+    pub sync_error: Option<String>,
+    pub last_attempt_at: Option<i64>,
+    pub synced_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectSkillOriginRecord {
+    pub project_id: String,
+    pub skill_id: String,
+    pub source_type: String,
+    pub source_id: String,
+    pub desired_tools: Vec<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectTemplateOverrideRecord {
+    pub project_id: String,
+    pub skill_id: String,
+    pub kind: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectTemplateFailureRecord {
+    pub project_id: String,
+    pub template_id: String,
+    pub skill_id: String,
+    pub tool: String,
+    pub kind: String,
+    pub error: String,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectDiscoveredSkillRecord {
     pub id: String,
     pub project_id: String,
@@ -440,6 +543,8 @@ impl SkillStore {
                 conn.execute_batch("ALTER TABLE skills ADD COLUMN source_subpath TEXT NULL;")?;
                 migrate_skill_targets_to_v4(conn)?;
                 migrate_assignments_to_v8(conn)?;
+                migrate_prompt_revisions_to_v9(conn)?;
+                migrate_skill_templates_to_v10(conn)?;
                 conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             } else if user_version < SCHEMA_VERSION {
                 // Incremental migrations
@@ -463,6 +568,12 @@ impl SkillStore {
                 }
                 if user_version < 8 {
                     migrate_assignments_to_v8(conn)?;
+                }
+                if user_version < 9 {
+                    migrate_prompt_revisions_to_v9(conn)?;
+                }
+                if user_version < 10 {
+                    migrate_skill_templates_to_v10(conn)?;
                 }
                 conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             } else if user_version > SCHEMA_VERSION {
@@ -721,6 +832,44 @@ impl SkillStore {
                 anyhow::bail!("skill not found: {}", skill_id);
             }
             Ok(())
+        })
+    }
+
+    pub fn suspend_skill_atomically(&self, skill_id: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let result = (|| -> Result<()> {
+                let changed = conn.execute(
+                    "UPDATE skills SET enabled = 0, updated_at = ?2 WHERE id = ?1",
+                    params![skill_id, now_ms()],
+                )?;
+                if changed == 0 {
+                    anyhow::bail!("skill not found: {skill_id}");
+                }
+                conn.execute(
+                    "UPDATE skill_assignments
+                     SET state = 'suspended', last_error = NULL, updated_at = ?2
+                     WHERE skill_id = ?1",
+                    params![skill_id, now_ms()],
+                )?;
+                conn.execute(
+                    "UPDATE skill_targets
+                     SET status = 'disabled', last_error = NULL
+                     WHERE skill_id = ?1",
+                    params![skill_id],
+                )?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT;")?;
+                    Ok(())
+                }
+                Err(err) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(err)
+                }
+            }
         })
     }
 
@@ -993,28 +1142,6 @@ impl SkillStore {
         })
     }
 
-    pub fn update_skill_target_status(
-        &self,
-        skill_id: &str,
-        tool: &str,
-        scope: &str,
-        project_path: Option<&str>,
-        status: &str,
-    ) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                "UPDATE skill_targets
-                 SET status = ?5
-                 WHERE skill_id = ?1
-                   AND tool = ?2
-                   AND scope = ?3
-                   AND ((?4 IS NULL AND project_path IS NULL) OR project_path = ?4)",
-                params![skill_id, tool, scope, project_path, status],
-            )?;
-            Ok(())
-        })
-    }
-
     pub fn upsert_skill_assignment(&self, record: &SkillAssignmentRecord) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
@@ -1094,17 +1221,6 @@ impl SkillStore {
                  WHERE skill_id = ?1 AND tool = ?2 AND scope = ?3
                    AND ((?4 IS NULL AND project_id IS NULL) OR project_id = ?4)",
                 params![skill_id, tool, scope, project_id],
-            )?;
-            Ok(())
-        })
-    }
-
-    pub fn set_skill_assignments_state(&self, skill_id: &str, state: &str) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                "UPDATE skill_assignments SET state = ?2, updated_at = ?3
-                 WHERE skill_id = ?1 AND state = 'active'",
-                params![skill_id, state, now_ms()],
             )?;
             Ok(())
         })
@@ -1224,6 +1340,34 @@ impl SkillStore {
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    pub fn delete_project(&self, project_id: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let result = (|| -> Result<()> {
+                conn.execute(
+                    "DELETE FROM ignored_issues WHERE scope = 'project' AND scope_id = ?1",
+                    params![project_id],
+                )?;
+                let changed =
+                    conn.execute("DELETE FROM projects WHERE id = ?1", params![project_id])?;
+                if changed == 0 {
+                    anyhow::bail!("project not found: {project_id}");
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT;")?;
+                    Ok(())
+                }
+                Err(err) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(err)
+                }
+            }
         })
     }
 
@@ -2332,6 +2476,26 @@ impl SkillStore {
                     "UPDATE project_discovered_skills SET matched_skill_id = ?1 WHERE matched_skill_id = ?2",
                     params![new_id, old_id],
                 )?;
+                conn.execute(
+                    "UPDATE skill_template_items SET skill_id = ?1 WHERE skill_id = ?2",
+                    params![new_id, old_id],
+                )?;
+                conn.execute(
+                    "UPDATE skill_template_revision_items SET skill_id = ?1 WHERE skill_id = ?2",
+                    params![new_id, old_id],
+                )?;
+                conn.execute(
+                    "UPDATE project_skill_origins SET skill_id = ?1 WHERE skill_id = ?2",
+                    params![new_id, old_id],
+                )?;
+                conn.execute(
+                    "UPDATE project_template_overrides SET skill_id = ?1 WHERE skill_id = ?2",
+                    params![new_id, old_id],
+                )?;
+                conn.execute(
+                    "UPDATE project_template_failures SET skill_id = ?1 WHERE skill_id = ?2",
+                    params![new_id, old_id],
+                )?;
                 conn.execute("DELETE FROM skills WHERE id = ?1", params![old_id])?;
                 Ok(())
             })();
@@ -2433,6 +2597,686 @@ impl SkillStore {
         })
     }
 
+    pub fn prune_prompt_revisions(&self, logical_path: &str, keep: usize) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM prompt_revisions
+                 WHERE logical_path = ?1
+                   AND id NOT IN (
+                     SELECT id FROM prompt_revisions
+                     WHERE logical_path = ?1
+                     ORDER BY created_at DESC, rowid DESC
+                     LIMIT ?2
+                   )",
+                params![logical_path, keep as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_prompt_revision(&self, revision_id: &str) -> Result<Option<PromptRevisionRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, logical_path, real_path, tool, profile_id, project_id,
+                        operation, content, content_hash, created_at
+                 FROM prompt_revisions WHERE id = ?1",
+                params![revision_id],
+                prompt_revision_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn list_prompt_revisions(
+        &self,
+        logical_path: &str,
+        limit: usize,
+    ) -> Result<Vec<PromptRevisionRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, logical_path, real_path, tool, profile_id, project_id,
+                        operation, content, content_hash, created_at
+                 FROM prompt_revisions
+                 WHERE logical_path = ?1
+                 ORDER BY created_at DESC, rowid DESC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                params![logical_path, limit as i64],
+                prompt_revision_from_row,
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn insert_prompt_revision(&self, revision: &PromptRevisionRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO prompt_revisions (
+                   id, logical_path, real_path, tool, profile_id, project_id,
+                   operation, content, content_hash, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    revision.id,
+                    revision.logical_path,
+                    revision.real_path,
+                    revision.tool,
+                    revision.profile_id,
+                    revision.project_id,
+                    revision.operation,
+                    revision.content,
+                    revision.content_hash,
+                    revision.created_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn list_project_names_for_skill_origin(&self, skill_id: &str) -> Result<Vec<String>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT project.name
+                 FROM project_skill_origins origin
+                 JOIN projects project ON project.id = origin.project_id
+                 WHERE origin.skill_id = ?1
+                 ORDER BY project.name COLLATE NOCASE ASC",
+            )?;
+            let rows = stmt.query_map(params![skill_id], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn list_skill_template_names_for_skill(&self, skill_id: &str) -> Result<Vec<String>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT template.name
+                 FROM skill_template_items item
+                 JOIN skill_templates template ON template.id = item.template_id
+                 WHERE item.skill_id = ?1
+                 ORDER BY template.name COLLATE NOCASE ASC",
+            )?;
+            let rows = stmt.query_map(params![skill_id], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn list_template_project_failures(
+        &self,
+        template_id: &str,
+    ) -> Result<Vec<ProjectTemplateFailureRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT project_id, template_id, skill_id, tool, kind, error, updated_at
+                 FROM project_template_failures WHERE template_id = ?1
+                 ORDER BY updated_at DESC, project_id ASC, skill_id ASC, tool ASC",
+            )?;
+            let rows = stmt.query_map(params![template_id], project_template_failure_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn list_project_template_failures(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<ProjectTemplateFailureRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT project_id, template_id, skill_id, tool, kind, error, updated_at
+                 FROM project_template_failures WHERE project_id = ?1
+                 ORDER BY updated_at DESC, skill_id ASC, tool ASC",
+            )?;
+            let rows = stmt.query_map(params![project_id], project_template_failure_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn replace_project_template_failures(
+        &self,
+        project_id: &str,
+        template_id: &str,
+        failures: &[ProjectTemplateFailureRecord],
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let result = (|| -> Result<()> {
+                conn.execute(
+                    "DELETE FROM project_template_failures
+                     WHERE project_id = ?1 AND template_id = ?2",
+                    params![project_id, template_id],
+                )?;
+                for failure in failures {
+                    conn.execute(
+                        "INSERT INTO project_template_failures (
+                           project_id, template_id, skill_id, tool, kind, error, updated_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            failure.project_id,
+                            failure.template_id,
+                            failure.skill_id,
+                            failure.tool,
+                            failure.kind,
+                            failure.error,
+                            failure.updated_at
+                        ],
+                    )?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT;")?;
+                    Ok(())
+                }
+                Err(err) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(err)
+                }
+            }
+        })
+    }
+
+    pub fn delete_project_template_override(&self, project_id: &str, skill_id: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM project_template_overrides WHERE project_id = ?1 AND skill_id = ?2",
+                params![project_id, skill_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_project_template_override(
+        &self,
+        project_id: &str,
+        skill_id: &str,
+    ) -> Result<Option<ProjectTemplateOverrideRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT project_id, skill_id, kind, created_at, updated_at
+                 FROM project_template_overrides WHERE project_id = ?1 AND skill_id = ?2",
+                params![project_id, skill_id],
+                |row| {
+                    Ok(ProjectTemplateOverrideRecord {
+                        project_id: row.get(0)?,
+                        skill_id: row.get(1)?,
+                        kind: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn upsert_project_template_override(
+        &self,
+        record: &ProjectTemplateOverrideRecord,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO project_template_overrides (
+                   project_id, skill_id, kind, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(project_id, skill_id) DO UPDATE SET
+                   kind = excluded.kind, updated_at = excluded.updated_at",
+                params![
+                    record.project_id,
+                    record.skill_id,
+                    record.kind,
+                    record.created_at,
+                    record.updated_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_project_skill_origins_by_source(
+        &self,
+        project_id: &str,
+        source_type: &str,
+        source_id: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM project_skill_origins
+                 WHERE project_id = ?1 AND source_type = ?2 AND source_id = ?3",
+                params![project_id, source_type, source_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_project_skill_origin(
+        &self,
+        project_id: &str,
+        skill_id: &str,
+        source_type: &str,
+        source_id: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM project_skill_origins
+                 WHERE project_id = ?1 AND skill_id = ?2
+                   AND source_type = ?3 AND source_id = ?4",
+                params![project_id, skill_id, source_type, source_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn list_project_skill_origins_filtered(
+        &self,
+        project_id: &str,
+        skill_id: Option<&str>,
+    ) -> Result<Vec<ProjectSkillOriginRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT project_id, skill_id, source_type, source_id, desired_tools,
+                        created_at, updated_at
+                 FROM project_skill_origins
+                 WHERE project_id = ?1 AND (?2 IS NULL OR skill_id = ?2)
+                 ORDER BY skill_id ASC, source_type ASC, source_id ASC",
+            )?;
+            let rows =
+                stmt.query_map(params![project_id, skill_id], project_skill_origin_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn list_project_skill_origins_for_skill(
+        &self,
+        project_id: &str,
+        skill_id: &str,
+    ) -> Result<Vec<ProjectSkillOriginRecord>> {
+        self.list_project_skill_origins_filtered(project_id, Some(skill_id))
+    }
+
+    pub fn list_project_skill_origins(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<ProjectSkillOriginRecord>> {
+        self.list_project_skill_origins_filtered(project_id, None)
+    }
+
+    pub fn upsert_project_skill_origin(&self, origin: &ProjectSkillOriginRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO project_skill_origins (
+                   project_id, skill_id, source_type, source_id, desired_tools,
+                   created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(project_id, skill_id, source_type, source_id) DO UPDATE SET
+                   desired_tools = excluded.desired_tools,
+                   updated_at = excluded.updated_at",
+                params![
+                    origin.project_id,
+                    origin.skill_id,
+                    origin.source_type,
+                    origin.source_id,
+                    string_vec_to_json(&origin.desired_tools)?,
+                    origin.created_at,
+                    origin.updated_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_project_template_binding(&self, project_id: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM project_template_bindings WHERE project_id = ?1",
+                params![project_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn list_all_project_template_bindings(&self) -> Result<Vec<ProjectTemplateBindingRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT project_id, template_id, applied_revision_id, sync_error,
+                        last_attempt_at, synced_at, created_at, updated_at
+                 FROM project_template_bindings ORDER BY updated_at DESC",
+            )?;
+            let rows = stmt.query_map([], project_template_binding_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn list_project_template_bindings(
+        &self,
+        template_id: &str,
+    ) -> Result<Vec<ProjectTemplateBindingRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT project_id, template_id, applied_revision_id, sync_error,
+                        last_attempt_at, synced_at, created_at, updated_at
+                 FROM project_template_bindings WHERE template_id = ?1
+                 ORDER BY updated_at DESC",
+            )?;
+            let rows = stmt.query_map(params![template_id], project_template_binding_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn get_project_template_binding(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<ProjectTemplateBindingRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT project_id, template_id, applied_revision_id, sync_error,
+                        last_attempt_at, synced_at, created_at, updated_at
+                 FROM project_template_bindings WHERE project_id = ?1",
+                params![project_id],
+                project_template_binding_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn upsert_project_template_binding(
+        &self,
+        binding: &ProjectTemplateBindingRecord,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO project_template_bindings (
+                   project_id, template_id, applied_revision_id, sync_error,
+                   last_attempt_at, synced_at, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(project_id) DO UPDATE SET
+                   template_id = excluded.template_id,
+                   applied_revision_id = excluded.applied_revision_id,
+                   sync_error = excluded.sync_error,
+                   last_attempt_at = excluded.last_attempt_at,
+                   synced_at = excluded.synced_at,
+                   updated_at = excluded.updated_at",
+                params![
+                    binding.project_id,
+                    binding.template_id,
+                    binding.applied_revision_id,
+                    binding.sync_error,
+                    binding.last_attempt_at,
+                    binding.synced_at,
+                    binding.created_at,
+                    binding.updated_at
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_skill_template(&self, template_id: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            let binding_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM project_template_bindings WHERE template_id = ?1",
+                params![template_id],
+                |row| row.get(0),
+            )?;
+            if binding_count > 0 {
+                anyhow::bail!("skill template is still linked to {binding_count} project(s)");
+            }
+            conn.execute(
+                "DELETE FROM project_skill_origins
+                 WHERE source_type = 'template' AND source_id = ?1",
+                params![template_id],
+            )?;
+            let changed = conn.execute(
+                "DELETE FROM skill_templates WHERE id = ?1",
+                params![template_id],
+            )?;
+            if changed == 0 {
+                anyhow::bail!("skill template not found: {template_id}");
+            }
+            Ok(())
+        })
+    }
+
+    pub fn set_skill_template_archived(&self, template_id: &str, archived: bool) -> Result<()> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE skill_templates SET archived = ?2, updated_at = ?3 WHERE id = ?1",
+                params![template_id, archived as i32, now_ms()],
+            )?;
+            if changed == 0 {
+                anyhow::bail!("skill template not found: {template_id}");
+            }
+            Ok(())
+        })
+    }
+
+    pub fn list_skill_template_revision_items(
+        &self,
+        revision_id: &str,
+    ) -> Result<Vec<SkillTemplateRevisionItemRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT revision_id, skill_id, skill_name
+                 FROM skill_template_revision_items WHERE revision_id = ?1
+                 ORDER BY skill_name COLLATE NOCASE ASC, skill_id ASC",
+            )?;
+            let rows = stmt.query_map(params![revision_id], |row| {
+                Ok(SkillTemplateRevisionItemRecord {
+                    revision_id: row.get(0)?,
+                    skill_id: row.get(1)?,
+                    skill_name: row.get(2)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn get_skill_template_revision(
+        &self,
+        revision_id: &str,
+    ) -> Result<Option<SkillTemplateRevisionRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, template_id, revision_number, name, description, created_at
+                 FROM skill_template_revisions WHERE id = ?1",
+                params![revision_id],
+                skill_template_revision_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn list_skill_template_revisions(
+        &self,
+        template_id: &str,
+    ) -> Result<Vec<SkillTemplateRevisionRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, template_id, revision_number, name, description, created_at
+                 FROM skill_template_revisions WHERE template_id = ?1
+                 ORDER BY revision_number DESC",
+            )?;
+            let rows = stmt.query_map(params![template_id], skill_template_revision_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn next_skill_template_revision_number(&self, template_id: &str) -> Result<i64> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COALESCE(MAX(revision_number), 0) + 1
+                 FROM skill_template_revisions WHERE template_id = ?1",
+                params![template_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn list_skill_template_item_ids(&self, template_id: &str) -> Result<Vec<String>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT skill_id FROM skill_template_items
+                 WHERE template_id = ?1 ORDER BY skill_id ASC",
+            )?;
+            let rows = stmt.query_map(params![template_id], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn list_skill_templates(&self, include_archived: bool) -> Result<Vec<SkillTemplateRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, description, mode, archived, current_revision_id,
+                        created_at, updated_at
+                 FROM skill_templates
+                 WHERE ?1 = 1 OR archived = 0
+                 ORDER BY archived ASC, updated_at DESC, name COLLATE NOCASE ASC",
+            )?;
+            let rows = stmt.query_map(params![include_archived as i32], skill_template_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn get_skill_template_by_name(&self, name: &str) -> Result<Option<SkillTemplateRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, name, description, mode, archived, current_revision_id,
+                        created_at, updated_at
+                 FROM skill_templates WHERE name = ?1 COLLATE NOCASE",
+                params![name],
+                skill_template_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn get_skill_template(&self, template_id: &str) -> Result<Option<SkillTemplateRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, name, description, mode, archived, current_revision_id,
+                        created_at, updated_at
+                 FROM skill_templates WHERE id = ?1",
+                params![template_id],
+                skill_template_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn save_skill_template_revision(
+        &self,
+        template: &SkillTemplateRecord,
+        revision: &SkillTemplateRevisionRecord,
+        items: &[SkillTemplateRevisionItemRecord],
+    ) -> Result<()> {
+        if items.is_empty() {
+            anyhow::bail!("skill template must contain at least one skill");
+        }
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let result = (|| -> Result<()> {
+                let existing_mode = conn
+                    .query_row(
+                        "SELECT mode FROM skill_templates WHERE id = ?1",
+                        params![template.id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if existing_mode
+                    .as_deref()
+                    .is_some_and(|mode| mode != template.mode)
+                {
+                    anyhow::bail!("skill template mode cannot be changed");
+                }
+
+                conn.execute(
+                    "INSERT INTO skill_templates (
+                       id, name, description, mode, archived, current_revision_id,
+                       created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(id) DO UPDATE SET
+                       name = excluded.name,
+                       description = excluded.description,
+                       archived = excluded.archived,
+                       current_revision_id = excluded.current_revision_id,
+                       updated_at = excluded.updated_at",
+                    params![
+                        template.id,
+                        template.name,
+                        template.description,
+                        template.mode,
+                        template.archived as i32,
+                        template.current_revision_id,
+                        template.created_at,
+                        template.updated_at
+                    ],
+                )?;
+                conn.execute(
+                    "INSERT INTO skill_template_revisions (
+                       id, template_id, revision_number, name, description, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        revision.id,
+                        revision.template_id,
+                        revision.revision_number,
+                        revision.name,
+                        revision.description,
+                        revision.created_at
+                    ],
+                )?;
+                for item in items {
+                    conn.execute(
+                        "INSERT INTO skill_template_revision_items (
+                           revision_id, skill_id, skill_name
+                         ) VALUES (?1, ?2, ?3)",
+                        params![item.revision_id, item.skill_id, item.skill_name],
+                    )?;
+                }
+                conn.execute(
+                    "DELETE FROM skill_template_items WHERE template_id = ?1",
+                    params![template.id],
+                )?;
+                for item in items {
+                    conn.execute(
+                        "INSERT INTO skill_template_items (template_id, skill_id, created_at)
+                         VALUES (?1, ?2, ?3)",
+                        params![template.id, item.skill_id, revision.created_at],
+                    )?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT;")?;
+                    Ok(())
+                }
+                Err(err) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(err)
+                }
+            }
+        })
+    }
+
     fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = Connection::open(&self.db_path)
             .with_context(|| format!("failed to open db at {:?}", self.db_path))?;
@@ -2464,6 +3308,90 @@ fn project_link_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectSki
         status: row.get(4)?,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
+    })
+}
+
+fn prompt_revision_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PromptRevisionRecord> {
+    Ok(PromptRevisionRecord {
+        id: row.get(0)?,
+        logical_path: row.get(1)?,
+        real_path: row.get(2)?,
+        tool: row.get(3)?,
+        profile_id: row.get(4)?,
+        project_id: row.get(5)?,
+        operation: row.get(6)?,
+        content: row.get(7)?,
+        content_hash: row.get(8)?,
+        created_at: row.get(9)?,
+    })
+}
+
+fn project_template_failure_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ProjectTemplateFailureRecord> {
+    Ok(ProjectTemplateFailureRecord {
+        project_id: row.get(0)?,
+        template_id: row.get(1)?,
+        skill_id: row.get(2)?,
+        tool: row.get(3)?,
+        kind: row.get(4)?,
+        error: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+fn project_skill_origin_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ProjectSkillOriginRecord> {
+    Ok(ProjectSkillOriginRecord {
+        project_id: row.get(0)?,
+        skill_id: row.get(1)?,
+        source_type: row.get(2)?,
+        source_id: row.get(3)?,
+        desired_tools: string_vec_from_json(row.get::<_, String>(4)?),
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+fn project_template_binding_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ProjectTemplateBindingRecord> {
+    Ok(ProjectTemplateBindingRecord {
+        project_id: row.get(0)?,
+        template_id: row.get(1)?,
+        applied_revision_id: row.get(2)?,
+        sync_error: row.get(3)?,
+        last_attempt_at: row.get(4)?,
+        synced_at: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+fn skill_template_revision_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SkillTemplateRevisionRecord> {
+    Ok(SkillTemplateRevisionRecord {
+        id: row.get(0)?,
+        template_id: row.get(1)?,
+        revision_number: row.get(2)?,
+        name: row.get(3)?,
+        description: row.get(4)?,
+        created_at: row.get(5)?,
+    })
+}
+
+fn skill_template_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SkillTemplateRecord> {
+    Ok(SkillTemplateRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        description: row.get(2)?,
+        mode: row.get(3)?,
+        archived: row.get::<_, i32>(4)? != 0,
+        current_revision_id: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
@@ -2856,6 +3784,139 @@ fn ensure_recycle_bin_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_skill_templates_to_v10(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN;
+         CREATE TABLE IF NOT EXISTS skill_templates (
+           id TEXT PRIMARY KEY,
+           name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+           description TEXT NULL,
+           mode TEXT NOT NULL CHECK(mode IN ('live', 'snapshot')),
+           archived INTEGER NOT NULL DEFAULT 0,
+           current_revision_id TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL
+         );
+
+         CREATE TABLE IF NOT EXISTS skill_template_items (
+           template_id TEXT NOT NULL,
+           skill_id TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           PRIMARY KEY(template_id, skill_id),
+           FOREIGN KEY(template_id) REFERENCES skill_templates(id) ON DELETE CASCADE,
+           FOREIGN KEY(skill_id) REFERENCES skills(id) ON DELETE RESTRICT
+         );
+
+         CREATE TABLE IF NOT EXISTS skill_template_revisions (
+           id TEXT PRIMARY KEY,
+           template_id TEXT NOT NULL,
+           revision_number INTEGER NOT NULL,
+           name TEXT NOT NULL,
+           description TEXT NULL,
+           created_at INTEGER NOT NULL,
+           UNIQUE(template_id, revision_number),
+           FOREIGN KEY(template_id) REFERENCES skill_templates(id) ON DELETE CASCADE
+         );
+
+         CREATE TABLE IF NOT EXISTS skill_template_revision_items (
+           revision_id TEXT NOT NULL,
+           skill_id TEXT NOT NULL,
+           skill_name TEXT NOT NULL,
+           PRIMARY KEY(revision_id, skill_id),
+           FOREIGN KEY(revision_id) REFERENCES skill_template_revisions(id) ON DELETE CASCADE
+         );
+
+         CREATE TABLE IF NOT EXISTS project_template_bindings (
+           project_id TEXT PRIMARY KEY,
+           template_id TEXT NOT NULL,
+           applied_revision_id TEXT NOT NULL,
+           sync_error TEXT NULL,
+           last_attempt_at INTEGER NULL,
+           synced_at INTEGER NULL,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL,
+           FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+           FOREIGN KEY(template_id) REFERENCES skill_templates(id) ON DELETE RESTRICT,
+           FOREIGN KEY(applied_revision_id) REFERENCES skill_template_revisions(id) ON DELETE RESTRICT
+         );
+
+         CREATE INDEX IF NOT EXISTS idx_project_template_bindings_template
+         ON project_template_bindings(template_id);
+
+         CREATE TABLE IF NOT EXISTS project_skill_origins (
+           project_id TEXT NOT NULL,
+           skill_id TEXT NOT NULL,
+           source_type TEXT NOT NULL CHECK(source_type IN ('manual', 'template')),
+           source_id TEXT NOT NULL,
+           desired_tools TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL,
+           PRIMARY KEY(project_id, skill_id, source_type, source_id),
+           FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+           FOREIGN KEY(skill_id) REFERENCES skills(id) ON DELETE RESTRICT
+         );
+
+         CREATE INDEX IF NOT EXISTS idx_project_skill_origins_skill
+         ON project_skill_origins(skill_id);
+
+         CREATE INDEX IF NOT EXISTS idx_project_skill_origins_source
+         ON project_skill_origins(source_type, source_id);
+
+         CREATE TABLE IF NOT EXISTS project_template_overrides (
+           project_id TEXT NOT NULL,
+           skill_id TEXT NOT NULL,
+           kind TEXT NOT NULL CHECK(kind = 'native'),
+           created_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL,
+           PRIMARY KEY(project_id, skill_id),
+           FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+           FOREIGN KEY(skill_id) REFERENCES skills(id) ON DELETE CASCADE
+         );
+
+         CREATE TABLE IF NOT EXISTS project_template_failures (
+           project_id TEXT NOT NULL,
+           template_id TEXT NOT NULL,
+           skill_id TEXT NOT NULL,
+           tool TEXT NOT NULL,
+           kind TEXT NOT NULL,
+           error TEXT NOT NULL,
+           updated_at INTEGER NOT NULL,
+           PRIMARY KEY(project_id, skill_id, tool, kind),
+           FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+           FOREIGN KEY(template_id) REFERENCES skill_templates(id) ON DELETE CASCADE,
+           FOREIGN KEY(skill_id) REFERENCES skills(id) ON DELETE CASCADE
+         );
+
+         INSERT OR IGNORE INTO project_skill_origins (
+           project_id, skill_id, source_type, source_id, desired_tools, created_at, updated_at
+         )
+         SELECT project_id, skill_id, 'manual', '', desired_tools, created_at, updated_at
+         FROM project_skill_links
+         WHERE enabled = 1;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+fn migrate_prompt_revisions_to_v9(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS prompt_revisions (
+           id TEXT PRIMARY KEY,
+           logical_path TEXT NOT NULL,
+           real_path TEXT NULL,
+           tool TEXT NOT NULL,
+           profile_id TEXT NOT NULL,
+           project_id TEXT NULL,
+           operation TEXT NOT NULL,
+           content BLOB NOT NULL,
+           content_hash TEXT NOT NULL,
+           created_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_prompt_revisions_path_created
+         ON prompt_revisions(logical_path, created_at DESC);",
+    )?;
+    Ok(())
+}
 
 fn normalize_tag_name(name: &str) -> Result<String> {
     let normalized = name.trim().to_string();

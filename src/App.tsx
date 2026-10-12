@@ -9,6 +9,7 @@ import './App.css'
 import { useTranslation } from 'react-i18next'
 import { Toaster, toast } from 'sonner'
 import DeviceSyncPage from './components/skills/DeviceSyncPage'
+import { Workflow } from 'lucide-react'
 import ExplorePage from './components/skills/ExplorePage'
 import FilterBar from './components/skills/FilterBar'
 import SkillPreviewDrawer, {
@@ -34,7 +35,21 @@ import ToolsPage from './components/skills/ToolsPage'
 import UpdatesPage from './components/skills/UpdatesPage'
 import ProjectDetailPage from './components/projects/ProjectDetailPage'
 import ProjectsPage from './components/projects/ProjectsPage'
+import ProjectTemplateModal from './components/templates/ProjectTemplateModal'
+import TemplateEditorModal from './components/templates/TemplateEditorModal'
+import TemplatesPage from './components/templates/TemplatesPage'
+import type { TemplateDraft } from './components/templates/templateState'
+import PromptHistoryModal from './components/prompts/PromptHistoryModal'
+import PromptProfilesModal from './components/prompts/PromptProfilesModal'
+import PromptsPage from './components/prompts/PromptsPage'
 import {
+  choosePromptSource,
+  customPromptProfileDrafts,
+  promptChangeTouchesSource,
+  promptEditorIsDirty,
+} from './components/prompts/promptState'
+import {
+  getAutoUpdateFailureNoticeId,
   getAutoUpdateToastKey,
   shouldKeepWaitingForTriggeredAutoUpdate,
 } from './components/skills/autoUpdateSettings'
@@ -68,11 +83,29 @@ import type {
   InstallResultDto,
   LocalSkillCandidate,
   ManagedSkill,
+  OnboardingGroup,
   OnboardingPlan,
   OnlineSkillDto,
   ProjectDetailDto,
   ProjectIssueActionDto,
   ProjectSummaryDto,
+  SkillEnableResultDto,
+  SkillTemplateDto,
+  SkillTemplateRevisionDto,
+  TemplateDiffDto,
+  TemplateMutationResultDto,
+  TemplateReconcileResultDto,
+  PromptDocumentDto,
+  PromptInstructionChainDto,
+  PromptMutationResultDto,
+  PromptProfileDto,
+  PromptProfileInputDto,
+  PromptRevisionDocumentDto,
+  PromptRevisionSummaryDto,
+  PromptSourceDto,
+  PromptTool,
+  PromptWatchEventDto,
+  PromptWatchStatusDto,
   TagWithCountDto,
   ToolConfigDto,
   ToolOption,
@@ -93,7 +126,9 @@ type ActiveView =
   | 'projects'
   | 'projectDetail'
   | 'myskills'
+  | 'templates'
   | 'explore'
+  | 'prompts'
   | 'settings'
   | 'manage'
 
@@ -102,6 +137,8 @@ type ProjectAssignmentBatch = {
   skillIds: string[]
 }
 type ManagementTab = 'tags' | 'tools' | 'updates' | 'device-sync'
+const AUTO_UPDATE_FAILURE_NOTICE_STORAGE_KEY =
+  'skills-auto-update-failure-notice-v1'
 
 function App() {
   const { t, i18n } = useTranslation()
@@ -155,6 +192,9 @@ function App() {
   const [showAddModal, setShowAddModal] = useState(false)
   const [reimportSkill, setReimportSkill] = useState<ManagedSkill | null>(null)
   const [showImportModal, setShowImportModal] = useState(false)
+  const [ignoringDiscoveredGroup, setIgnoringDiscoveredGroup] = useState<
+    string | null
+  >(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [sortBy, setSortBy] = useState<'updated' | 'name'>('updated')
   const [scopeFilter, setScopeFilter] = useState<'all' | 'global' | 'project'>('all')
@@ -188,8 +228,25 @@ function App() {
     useState<AssignmentDraftDto | null>(null)
   const [projects, setProjects] = useState<ProjectSummaryDto[]>([])
   const [projectImportPath, setProjectImportPath] = useState('')
+  const [pendingDeleteProject, setPendingDeleteProject] =
+    useState<ProjectSummaryDto | null>(null)
   const [selectedProjectDetail, setSelectedProjectDetail] =
     useState<ProjectDetailDto | null>(null)
+  const [skillTemplates, setSkillTemplates] = useState<SkillTemplateDto[]>([])
+  const [selectedTemplateId, setSelectedTemplateId] = useState('')
+  const [templateRevisions, setTemplateRevisions] =
+    useState<SkillTemplateRevisionDto[]>([])
+  const [showArchivedTemplates, setShowArchivedTemplates] = useState(false)
+  const [showTemplateEditor, setShowTemplateEditor] = useState(false)
+  const [editingTemplate, setEditingTemplate] =
+    useState<SkillTemplateDto | null>(null)
+  const [templateEditorInitialSkillIds, setTemplateEditorInitialSkillIds] =
+    useState<string[]>([])
+  const [templateSaving, setTemplateSaving] = useState(false)
+  const [showProjectTemplateModal, setShowProjectTemplateModal] =
+    useState(false)
+  const [projectTemplateImportFlow, setProjectTemplateImportFlow] =
+    useState(false)
   const [skillScopeState, setSkillScopeState] = useState<SkillScopeState>({})
   const [bulkMode, setBulkMode] = useState(false)
   const [bulkSelectedIds, setBulkSelectedIds] = useState<string[]>([])
@@ -197,6 +254,39 @@ function App() {
     useState<ProjectAssignmentBatch | null>(null)
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false)
   const [showBulkTagsModal, setShowBulkTagsModal] = useState(false)
+  const [promptProfiles, setPromptProfiles] = useState<PromptProfileDto[]>([])
+  const [selectedPromptProfileId, setSelectedPromptProfileId] = useState('')
+  const [selectedPromptProjectId, setSelectedPromptProjectId] = useState('')
+  const [promptOriginProjectId, setPromptOriginProjectId] = useState('')
+  const [promptSources, setPromptSources] = useState<PromptSourceDto[]>([])
+  const [selectedPromptSourcePath, setSelectedPromptSourcePath] = useState('')
+  const [promptDocument, setPromptDocument] = useState<PromptDocumentDto | null>(null)
+  const [promptEditorContent, setPromptEditorContent] = useState('')
+  const [promptLoading, setPromptLoading] = useState(false)
+  const [promptSaving, setPromptSaving] = useState(false)
+  const [promptExternalChange, setPromptExternalChange] = useState(false)
+  const [promptConflict, setPromptConflict] = useState(false)
+  const [promptChain, setPromptChain] = useState<PromptInstructionChainDto | null>(null)
+  const [promptChainLoading, setPromptChainLoading] = useState(false)
+  const [promptWatchStatus, setPromptWatchStatus] =
+    useState<PromptWatchStatusDto | null>(null)
+  const [lastDeletedPromptRevisionId, setLastDeletedPromptRevisionId] =
+    useState<string | null>(null)
+  const [showPromptProfilesModal, setShowPromptProfilesModal] = useState(false)
+  const [promptProfileDrafts, setPromptProfileDrafts] =
+    useState<PromptProfileInputDto[]>([])
+  const [promptProfilesSaving, setPromptProfilesSaving] = useState(false)
+  const [showPromptHistoryModal, setShowPromptHistoryModal] = useState(false)
+  const [promptRevisions, setPromptRevisions] =
+    useState<PromptRevisionSummaryDto[]>([])
+  const [selectedPromptRevisionId, setSelectedPromptRevisionId] = useState('')
+  const [promptRevisionDocument, setPromptRevisionDocument] =
+    useState<PromptRevisionDocumentDto | null>(null)
+  const [promptHistoryLoading, setPromptHistoryLoading] = useState(false)
+  const promptPreferredToolRef = useRef<PromptTool | null>(null)
+  const promptWatchIdRef = useRef<string | null>(null)
+  const promptDirtyRef = useRef(false)
+  const promptSelectedSourceRef = useRef<PromptSourceDto | null>(null)
 
   const isTauri =
     typeof window !== 'undefined' &&
@@ -250,6 +340,14 @@ function App() {
       }
       if (raw.startsWith('HUB_NAME_CONFLICT|')) {
         return t('errors.resolveHubConflict')
+      }
+      if (raw.startsWith('SKILL_IN_USE|')) {
+        const [, templates = '', projects = ''] = raw.split('|')
+        if (templates && projects) {
+          return t('errors.skillInUseBoth', { templates, projects })
+        }
+        if (templates) return t('errors.skillInUseTemplates', { templates })
+        return t('errors.skillInUseProjects', { projects })
       }
       if (raw.includes('未在该仓库中发现可导入的 Skills')) {
         return t('errors.noSkillsFoundInRepo')
@@ -395,13 +493,253 @@ function App() {
     }
   }, [invokeTauri])
 
+  const loadSkillTemplates = useCallback(async () => {
+    try {
+      const result = await invokeTauri<SkillTemplateDto[]>('list_skill_templates', {
+        includeArchived: true,
+      })
+      setSkillTemplates(result)
+      setSelectedTemplateId((current) => {
+        if (result.some((template) => template.id === current)) return current
+        return result.find((template) => !template.archived)?.id ?? result[0]?.id ?? ''
+      })
+      return result
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      return null
+    }
+  }, [invokeTauri])
+
+  const selectedPromptSource = useMemo(
+    () =>
+      promptDocument?.source ??
+      promptSources.find((source) => source.path === selectedPromptSourcePath) ??
+      null,
+    [promptDocument?.source, promptSources, selectedPromptSourcePath],
+  )
+  const promptDirty = useMemo(
+    () => promptEditorIsDirty(promptDocument, promptEditorContent),
+    [promptDocument, promptEditorContent],
+  )
+
+  useEffect(() => {
+    promptDirtyRef.current = promptDirty
+    promptSelectedSourceRef.current = selectedPromptSource
+  }, [promptDirty, selectedPromptSource])
+
+  const readPromptDocument = useCallback(
+    async (source: PromptSourceDto) => {
+      const result = await invokeTauri<PromptDocumentDto>('read_prompt_document', {
+        request: {
+          profile_id: source.profile_id,
+          project_id: source.project_id ?? null,
+          path: source.path,
+          allow_external: false,
+        },
+      })
+      setPromptDocument(result)
+      setPromptEditorContent(result.content)
+      setPromptExternalChange(false)
+      setPromptConflict(false)
+      return result
+    },
+    [invokeTauri],
+  )
+
+  const fetchPromptSources = useCallback(
+    async (profileId: string, projectId: string) => {
+      const result = await invokeTauri<PromptSourceDto[]>('list_prompt_sources', {
+        profileId,
+        projectId: projectId || null,
+      })
+      setPromptSources(result)
+      return result
+    },
+    [invokeTauri],
+  )
+
+  const loadPromptWorkspace = useCallback(
+    async (
+      profileId: string,
+      projectId: string,
+      preferredPath?: string | null,
+    ) => {
+      if (!profileId) return
+      setPromptLoading(true)
+      try {
+        const result = await fetchPromptSources(profileId, projectId)
+        const source = choosePromptSource(result, preferredPath)
+        setSelectedPromptSourcePath(source?.path ?? '')
+        setLastDeletedPromptRevisionId(null)
+        if (source) {
+          await readPromptDocument(source)
+        } else {
+          setPromptDocument(null)
+          setPromptEditorContent('')
+          setPromptExternalChange(false)
+          setPromptConflict(false)
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setPromptLoading(false)
+      }
+    },
+    [fetchPromptSources, readPromptDocument],
+  )
+
+  const loadPromptProfiles = useCallback(
+    async (preferredTool?: PromptTool | null) => {
+      setPromptLoading(true)
+      try {
+        const result = await invokeTauri<PromptProfileDto[]>('list_prompt_profiles')
+        setPromptProfiles(result)
+        setSelectedPromptProfileId((current) => {
+          if (!preferredTool && result.some((profile) => profile.id === current)) {
+            return current
+          }
+          return (
+            result.find(
+              (profile) =>
+                profile.tool === preferredTool && profile.is_default,
+            )?.id ??
+            result.find((profile) => profile.tool === preferredTool)?.id ??
+            result.find((profile) => profile.is_default)?.id ??
+            result[0]?.id ??
+            ''
+          )
+        })
+        return result
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+        return []
+      } finally {
+        setPromptLoading(false)
+      }
+    },
+    [invokeTauri],
+  )
+
+  useEffect(() => {
+    if (!isTauri || activeView !== 'prompts') return
+    if (promptProfiles.length > 0 && selectedPromptProfileId) return
+    const preferredTool = promptPreferredToolRef.current
+    promptPreferredToolRef.current = null
+    void loadPromptProfiles(preferredTool)
+  }, [
+    activeView,
+    isTauri,
+    loadPromptProfiles,
+    promptProfiles.length,
+    selectedPromptProfileId,
+  ])
+
+  useEffect(() => {
+    if (!isTauri || activeView !== 'prompts' || !selectedPromptProfileId) return
+    void loadPromptWorkspace(
+      selectedPromptProfileId,
+      selectedPromptProjectId,
+      null,
+    )
+  }, [
+    activeView,
+    isTauri,
+    loadPromptWorkspace,
+    selectedPromptProfileId,
+    selectedPromptProjectId,
+  ])
+
+  useEffect(() => {
+    setPromptChain(null)
+  }, [
+    activeView,
+    selectedPromptProfileId,
+    selectedPromptProjectId,
+  ])
+
+  useEffect(() => {
+    if (!isTauri || activeView !== 'prompts' || !selectedPromptProfileId) return
+    let disposed = false
+    let unlisten: (() => void) | null = null
+    let activeWatchId: string | null = null
+    setPromptWatchStatus(null)
+
+    const refreshFromWatch = async (event: PromptWatchEventDto) => {
+      if (event.watch_id !== promptWatchIdRef.current) return
+      const source = promptSelectedSourceRef.current
+      const touchesSelected = promptChangeTouchesSource(event.paths, source)
+      if (touchesSelected && promptDirtyRef.current) {
+        setPromptExternalChange(true)
+        return
+      }
+      try {
+        const refreshed = await fetchPromptSources(
+          selectedPromptProfileId,
+          selectedPromptProjectId,
+        )
+        if (!touchesSelected || !source) return
+        const nextSource = choosePromptSource(refreshed, source.path)
+        if (!nextSource) return
+        setSelectedPromptSourcePath(nextSource.path)
+        await readPromptDocument(nextSource)
+      } catch {
+        setPromptExternalChange(true)
+      }
+    }
+
+    const start = async () => {
+      const { listen } = await import('@tauri-apps/api/event')
+      unlisten = await listen<PromptWatchEventDto>(
+        'prompt-sources-changed',
+        (event) => void refreshFromWatch(event.payload),
+      )
+      const status = await invokeTauri<PromptWatchStatusDto>(
+        'start_prompt_watch',
+        {
+          profileId: selectedPromptProfileId,
+          projectId: selectedPromptProjectId || null,
+        },
+      )
+      activeWatchId = status.watch_id
+      if (disposed) {
+        void invokeTauri('stop_prompt_watch', { watchId: status.watch_id })
+        return
+      }
+      promptWatchIdRef.current = status.watch_id
+      setPromptWatchStatus(status)
+    }
+
+    void start().catch(() => {
+      if (!disposed) setPromptWatchStatus(null)
+    })
+    return () => {
+      disposed = true
+      unlisten?.()
+      if (activeWatchId) {
+        void invokeTauri('stop_prompt_watch', { watchId: activeWatchId })
+      }
+      if (promptWatchIdRef.current === activeWatchId) {
+        promptWatchIdRef.current = null
+      }
+    }
+  }, [
+    activeView,
+    fetchPromptSources,
+    invokeTauri,
+    isTauri,
+    readPromptDocument,
+    selectedPromptProfileId,
+    selectedPromptProjectId,
+  ])
+
   useEffect(() => {
     if (isTauri) {
       loadManagedSkills()
       loadTags()
       loadProjects()
+      loadSkillTemplates()
     }
-  }, [isTauri, loadManagedSkills, loadProjects, loadTags])
+  }, [isTauri, loadManagedSkills, loadProjects, loadSkillTemplates, loadTags])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -517,15 +855,6 @@ function App() {
     if (!isTauri) return
     invokeTauri<GithubProxyConfigDto>('get_github_proxy_config')
       .then((config) => setGithubProxyConfig(config))
-      .catch((err) => {
-        setError(err instanceof Error ? err.message : String(err))
-      })
-  }, [isTauri, invokeTauri])
-
-  useEffect(() => {
-    if (!isTauri) return
-    invokeTauri<AutoUpdateConfigDto>('get_auto_update_config')
-      .then((config) => setAutoUpdateConfig(config))
       .catch((err) => {
         setError(err instanceof Error ? err.message : String(err))
       })
@@ -696,6 +1025,20 @@ function App() {
     const selectedSet = new Set(bulkSelectedIds)
     return managedSkills.every((skill) => selectedSet.has(skill.id))
   }, [bulkSelectedIds, managedSkills])
+  const visibleSkillTemplates = useMemo(
+    () =>
+      showArchivedTemplates
+        ? skillTemplates
+        : skillTemplates.filter((template) => !template.archived),
+    [showArchivedTemplates, skillTemplates],
+  )
+  const visibleSelectedTemplateId = useMemo(
+    () =>
+      visibleSkillTemplates.some((template) => template.id === selectedTemplateId)
+        ? selectedTemplateId
+        : (visibleSkillTemplates[0]?.id ?? ''),
+    [selectedTemplateId, visibleSkillTemplates],
+  )
 
   useEffect(() => {
     const existingIds = new Set(managedSkills.map((skill) => skill.id))
@@ -717,10 +1060,14 @@ function App() {
     useState<AutoUpdateConfigDto | null>(null)
   const [autoUpdateTriggering, setAutoUpdateTriggering] = useState(false)
   const autoUpdateLastRunRef = useRef<number | null>(null)
+  const autoUpdateFailureNoticeRef = useRef<string | null | undefined>(undefined)
+  const handleOpenAutoUpdateResults = useCallback(() => {
+    setManagementTab('updates')
+    setActiveView('manage')
+  }, [])
 
   useEffect(() => {
     if (!isTauri) return
-    if (activeView !== 'manage' || managementTab !== 'updates') return
 
     let cancelled = false
     const refreshAutoUpdateConfig = async () => {
@@ -731,6 +1078,41 @@ function App() {
       const nextLastRun = config.last_run_at ?? null
       autoUpdateLastRunRef.current = nextLastRun
       setAutoUpdateConfig(config)
+
+      const failureNoticeId = getAutoUpdateFailureNoticeId(config)
+      if (autoUpdateFailureNoticeRef.current === undefined) {
+        try {
+          autoUpdateFailureNoticeRef.current = window.localStorage.getItem(
+            AUTO_UPDATE_FAILURE_NOTICE_STORAGE_KEY,
+          )
+        } catch {
+          autoUpdateFailureNoticeRef.current = null
+        }
+      }
+      if (
+        failureNoticeId &&
+        failureNoticeId !== autoUpdateFailureNoticeRef.current
+      ) {
+        autoUpdateFailureNoticeRef.current = failureNoticeId
+        try {
+          window.localStorage.setItem(
+            AUTO_UPDATE_FAILURE_NOTICE_STORAGE_KEY,
+            failureNoticeId,
+          )
+        } catch {
+          // The navigation badges remain visible when storage is unavailable.
+        }
+        toast.error(
+          t('autoUpdateFailureToast', { count: config.last_failed }),
+          {
+            duration: 10000,
+            action: {
+              label: t('autoUpdateOpenResults'),
+              onClick: handleOpenAutoUpdateResults,
+            },
+          },
+        )
+      }
 
       if (
         previousLastRun !== null &&
@@ -745,19 +1127,19 @@ function App() {
     void refreshAutoUpdateConfig().catch(() => {})
     const timer = window.setInterval(() => {
       void refreshAutoUpdateConfig().catch(() => {})
-    }, autoUpdateConfig?.last_status === 'running' ? 2000 : 10000)
+    }, autoUpdateConfig?.last_status === 'running' ? 2000 : 30000)
 
     return () => {
       cancelled = true
       window.clearInterval(timer)
     }
   }, [
-    activeView,
-    managementTab,
     autoUpdateConfig?.last_status,
+    handleOpenAutoUpdateResults,
     invokeTauri,
     isTauri,
     loadManagedSkills,
+    t,
   ])
 
   const handlePickStoragePath = useCallback(async () => {
@@ -901,6 +1283,7 @@ function App() {
         interval_value: normalizedIntervalValue,
         interval_unit: schedule.intervalUnit,
         daily_time: normalizedDailyTime,
+        eligible_skill_count: prev?.eligible_skill_count ?? 0,
         local_skill_count: prev?.local_skill_count ?? 0,
         protected_local_skill_count: prev?.protected_local_skill_count ?? 0,
         task_registered: prev?.task_registered ?? false,
@@ -1132,15 +1515,50 @@ function App() {
       { projectPath },
       t('projects.imported'),
     ).then((detail) => {
-      if (detail) setProjectImportPath('')
+      if (detail) {
+        setProjectImportPath('')
+        void loadSkillTemplates().then(() => {
+          setProjectTemplateImportFlow(true)
+          setShowProjectTemplateModal(true)
+        })
+      }
     })
-  }, [projectImportPath, runProjectDetailCommand, t])
+  }, [loadSkillTemplates, projectImportPath, runProjectDetailCommand, t])
 
   const handleOpenProject = useCallback(
     (project: ProjectSummaryDto) => {
       void runProjectDetailCommand('scan_project', { projectId: project.id })
     },
     [runProjectDetailCommand],
+  )
+
+  const handleCloseDeleteProject = useCallback(() => {
+    if (!loading) setPendingDeleteProject(null)
+  }, [loading])
+
+  const handleConfirmDeleteProject = useCallback(
+    async () => {
+      if (!pendingDeleteProject) return
+      setLoading(true)
+      setLoadingStartAt(Date.now())
+      try {
+        await invokeTauri('delete_project', {
+          projectId: pendingDeleteProject.id,
+        })
+        setSelectedProjectDetail((current) =>
+          current?.project.id === pendingDeleteProject.id ? null : current,
+        )
+        await loadProjects()
+        setPendingDeleteProject(null)
+        toast.success(t('projects.deleted'))
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setLoading(false)
+        setLoadingStartAt(null)
+      }
+    },
+    [invokeTauri, loadProjects, pendingDeleteProject, t],
   )
 
   const handleRefreshProject = useCallback(() => {
@@ -1371,9 +1789,17 @@ function App() {
           actionValue: action.value ?? null,
         },
         t('projects.issueRepaired'),
-      )
+      ).then((detail) => {
+        if (detail) void Promise.all([loadManagedSkills(), loadSkillTemplates()])
+      })
     },
-    [runProjectDetailCommand, selectedProjectDetail, t],
+    [
+      loadManagedSkills,
+      loadSkillTemplates,
+      runProjectDetailCommand,
+      selectedProjectDetail,
+      t,
+    ],
   )
 
   const handleIgnoreProjectIssue = useCallback(
@@ -1446,9 +1872,844 @@ function App() {
     void loadProjects()
   }, [loadProjects])
 
-  const handleOpenSettings = useCallback(() => {
-    setActiveView('settings')
+  const openTemplateEditor = useCallback(
+    (template: SkillTemplateDto | null, initialSkillIds: string[] = []) => {
+      setEditingTemplate(template)
+      setTemplateEditorInitialSkillIds(initialSkillIds)
+      setShowTemplateEditor(true)
+    },
+    [],
+  )
+
+  const handleCloseTemplateEditor = useCallback(() => {
+    if (templateSaving) return
+    setShowTemplateEditor(false)
+    setEditingTemplate(null)
+    setTemplateEditorInitialSkillIds([])
+  }, [templateSaving])
+
+  const handleOpenProjectTemplate = useCallback(() => {
+    setProjectTemplateImportFlow(false)
+    setShowProjectTemplateModal(true)
+    void loadSkillTemplates()
+  }, [loadSkillTemplates])
+
+  const handleCloseProjectTemplate = useCallback(() => {
+    if (loading) return
+    setShowProjectTemplateModal(false)
+    setProjectTemplateImportFlow(false)
+  }, [loading])
+
+  const handleToggleArchivedTemplates = useCallback(
+    (show: boolean) => {
+      setShowArchivedTemplates(show)
+      if (!show) {
+        setSelectedTemplateId((current) =>
+          skillTemplates.some(
+            (template) => template.id === current && !template.archived,
+          )
+            ? current
+            : (skillTemplates.find((template) => !template.archived)?.id ?? ''),
+        )
+      }
+    },
+    [skillTemplates],
+  )
+
+  const handleCreateTemplateFromBulk = useCallback(() => {
+    const enabledIds = bulkSelectedIds.filter((skillId) =>
+      managedSkills.some((skill) => skill.id === skillId && skill.enabled),
+    )
+    if (enabledIds.length === 0) {
+      toast.error(t('templates.requiresEnabledSkill'))
+      return
+    }
+    openTemplateEditor(null, enabledIds)
+  }, [bulkSelectedIds, managedSkills, openTemplateEditor, t])
+
+  const handleSaveTemplate = useCallback(
+    async (draft: TemplateDraft) => {
+      setTemplateSaving(true)
+      setError(null)
+      try {
+        const result = editingTemplate
+          ? await invokeTauri<TemplateMutationResultDto>('update_skill_template', {
+              templateId: editingTemplate.id,
+              input: {
+                name: draft.name,
+                description: draft.description || null,
+                skill_ids: draft.skillIds,
+              },
+            })
+          : await invokeTauri<TemplateMutationResultDto>('create_skill_template', {
+              input: {
+                name: draft.name,
+                description: draft.description || null,
+                mode: draft.mode,
+                skill_ids: draft.skillIds,
+              },
+            })
+        setShowTemplateEditor(false)
+        setEditingTemplate(null)
+        setTemplateEditorInitialSkillIds([])
+        setBulkMode(false)
+        setBulkSelectedIds([])
+        if (result.template) setSelectedTemplateId(result.template.id)
+        await Promise.all([loadSkillTemplates(), loadProjects()])
+        if (result.failed_projects > 0) {
+          toast.error(
+            t('templates.syncFailedProjects', {
+              count: result.failed_projects,
+            }),
+          )
+        } else {
+          toast.success(t('templates.saved'))
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setTemplateSaving(false)
+      }
+    },
+    [editingTemplate, invokeTauri, loadProjects, loadSkillTemplates, t],
+  )
+
+  const handleArchiveTemplate = useCallback(
+    async (template: SkillTemplateDto, archived: boolean) => {
+      setLoading(true)
+      try {
+        await invokeTauri<SkillTemplateDto>('archive_skill_template', {
+          templateId: template.id,
+          archived,
+        })
+        await loadSkillTemplates()
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setLoading(false)
+      }
+    },
+    [invokeTauri, loadSkillTemplates],
+  )
+
+  const handleDeleteTemplate = useCallback(
+    async (template: SkillTemplateDto) => {
+      if (!window.confirm(t('templates.deleteConfirm', { name: template.name }))) return
+      setLoading(true)
+      try {
+        await invokeTauri('delete_skill_template', { templateId: template.id })
+        setTemplateRevisions([])
+        await loadSkillTemplates()
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setLoading(false)
+      }
+    },
+    [invokeTauri, loadSkillTemplates, t],
+  )
+
+  const handleLoadTemplateHistory = useCallback(
+    async (templateId: string) => {
+      try {
+        const result = await invokeTauri<SkillTemplateRevisionDto[]>(
+          'list_skill_template_revisions',
+          { templateId },
+        )
+        setTemplateRevisions(result)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      }
+    },
+    [invokeTauri],
+  )
+
+  const handleRollbackTemplate = useCallback(
+    async (template: SkillTemplateDto, revisionId: string) => {
+      if (!window.confirm(t('templates.rollbackConfirm'))) return
+      setLoading(true)
+      try {
+        const result = await invokeTauri<TemplateMutationResultDto>(
+          'rollback_skill_template',
+          { templateId: template.id, revisionId },
+        )
+        await Promise.all([
+          loadSkillTemplates(),
+          handleLoadTemplateHistory(template.id),
+          loadProjects(),
+        ])
+        if (result.failed_projects > 0) {
+          toast.error(
+            t('templates.syncFailedProjects', {
+              count: result.failed_projects,
+            }),
+          )
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setLoading(false)
+      }
+    },
+    [handleLoadTemplateHistory, invokeTauri, loadProjects, loadSkillTemplates, t],
+  )
+
+  const handleOpenTemplateProject = useCallback(
+    (projectId: string) => {
+      void runProjectDetailCommand('scan_project', { projectId })
+    },
+    [runProjectDetailCommand],
+  )
+
+  const handleRetryTemplateProject = useCallback(
+    async (projectId: string) => {
+      setLoading(true)
+      try {
+        const result = await invokeTauri<TemplateReconcileResultDto>(
+          'retry_project_template',
+          { projectId },
+        )
+        await Promise.all([loadSkillTemplates(), loadProjects()])
+        if (result.failed.length > 0) {
+          toast.error(
+            t('templates.syncFailures', { count: result.failed.length }),
+          )
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setLoading(false)
+      }
+    },
+    [invokeTauri, loadProjects, loadSkillTemplates, t],
+  )
+
+  const handlePreviewProjectTemplate = useCallback(
+    async (templateId: string) => {
+      if (!selectedProjectDetail) return null
+      try {
+        return await invokeTauri<TemplateDiffDto>(
+          'preview_project_template_change',
+          {
+            projectId: selectedProjectDetail.project.id,
+            templateId,
+          },
+        )
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+        return null
+      }
+    },
+    [invokeTauri, selectedProjectDetail],
+  )
+
+  const refreshProjectTemplateData = useCallback(
+    async (projectId: string) => {
+      const detail = await invokeTauri<ProjectDetailDto>('scan_project', {
+        projectId,
+      })
+      setSelectedProjectDetail(detail)
+      await Promise.all([
+        loadProjects(),
+        loadSkillTemplates(),
+        loadManagedSkills(),
+      ])
+      return detail
+    },
+    [invokeTauri, loadManagedSkills, loadProjects, loadSkillTemplates],
+  )
+
+  const handleApplyProjectTemplate = useCallback(
+    async (templateId: string) => {
+      if (!selectedProjectDetail) return
+      const projectId = selectedProjectDetail.project.id
+      setLoading(true)
+      try {
+        const result = await invokeTauri<TemplateReconcileResultDto>(
+          'apply_project_template',
+          { projectId, templateId },
+        )
+        await refreshProjectTemplateData(projectId)
+        setShowProjectTemplateModal(false)
+        setProjectTemplateImportFlow(false)
+        if (result.failed.length > 0) {
+          toast.error(
+            t('templates.syncFailures', { count: result.failed.length }),
+          )
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setLoading(false)
+      }
+    },
+    [invokeTauri, refreshProjectTemplateData, selectedProjectDetail, t],
+  )
+
+  const handleDetachProjectTemplate = useCallback(
+    async (retainAsManual: boolean) => {
+      if (!selectedProjectDetail) return
+      const projectId = selectedProjectDetail.project.id
+      setLoading(true)
+      try {
+        await invokeTauri('detach_project_template', {
+          projectId,
+          retainAsManual,
+        })
+        await refreshProjectTemplateData(projectId)
+        setShowProjectTemplateModal(false)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setLoading(false)
+      }
+    },
+    [invokeTauri, refreshProjectTemplateData, selectedProjectDetail],
+  )
+
+  const handleUpdateSnapshotTemplate = useCallback(async () => {
+    if (!selectedProjectDetail) return
+    const projectId = selectedProjectDetail.project.id
+    setLoading(true)
+    try {
+      const result = await invokeTauri<TemplateReconcileResultDto>(
+        'update_snapshot_project_template',
+        { projectId },
+      )
+      await refreshProjectTemplateData(projectId)
+      if (result.failed.length > 0) {
+        toast.error(t('templates.syncFailures', { count: result.failed.length }))
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setLoading(false)
+    }
+  }, [invokeTauri, refreshProjectTemplateData, selectedProjectDetail, t])
+
+  const confirmDiscardPromptEdits = useCallback(
+    () => !promptDirty || window.confirm(t('prompts.discardConfirm')),
+    [promptDirty, t],
+  )
+
+  const openPrompts = useCallback(
+    (tool?: PromptTool, projectId = '') => {
+      if (!confirmDiscardPromptEdits()) return
+      setSelectedPromptProjectId(projectId)
+      setPromptOriginProjectId(projectId)
+      setSelectedPromptSourcePath('')
+      setPromptDocument(null)
+      setPromptEditorContent('')
+      setLastDeletedPromptRevisionId(null)
+      if (tool) {
+        const profile =
+          promptProfiles.find(
+            (item) => item.tool === tool && item.is_default,
+          ) ?? promptProfiles.find((item) => item.tool === tool)
+        if (profile) {
+          setSelectedPromptProfileId(profile.id)
+        } else {
+          promptPreferredToolRef.current = tool
+          setSelectedPromptProfileId('')
+        }
+      }
+      setActiveView('prompts')
+    },
+    [confirmDiscardPromptEdits, promptProfiles],
+  )
+
+  const handleBackToPromptProject = useCallback(() => {
+    if (!promptOriginProjectId || !confirmDiscardPromptEdits()) return
+    if (selectedProjectDetail?.project.id === promptOriginProjectId) {
+      setActiveView('projectDetail')
+      return
+    }
+    const project = projects.find((item) => item.id === promptOriginProjectId)
+    if (project) {
+      handleOpenProject(project)
+      return
+    }
+    setActiveView('projects')
+    void loadProjects()
+  }, [
+    confirmDiscardPromptEdits,
+    handleOpenProject,
+    loadProjects,
+    projects,
+    promptOriginProjectId,
+    selectedProjectDetail,
+  ])
+
+  const handlePromptProfileChange = useCallback(
+    (profileId: string) => {
+      if (!confirmDiscardPromptEdits()) return
+      setSelectedPromptProfileId(profileId)
+      setSelectedPromptSourcePath('')
+      setPromptDocument(null)
+      setPromptEditorContent('')
+      setLastDeletedPromptRevisionId(null)
+    },
+    [confirmDiscardPromptEdits],
+  )
+
+  const handlePromptProjectChange = useCallback(
+    (projectId: string) => {
+      if (!confirmDiscardPromptEdits()) return
+      setSelectedPromptProjectId(projectId)
+      setSelectedPromptSourcePath('')
+      setPromptDocument(null)
+      setPromptEditorContent('')
+      setLastDeletedPromptRevisionId(null)
+    },
+    [confirmDiscardPromptEdits],
+  )
+
+  const handleSelectPromptSource = useCallback(
+    async (source: PromptSourceDto) => {
+      if (source.path === selectedPromptSourcePath) return
+      if (!confirmDiscardPromptEdits()) return
+      setPromptLoading(true)
+      setSelectedPromptSourcePath(source.path)
+      setLastDeletedPromptRevisionId(null)
+      try {
+        await readPromptDocument(source)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setPromptLoading(false)
+      }
+    },
+    [
+      confirmDiscardPromptEdits,
+      readPromptDocument,
+      selectedPromptSourcePath,
+    ],
+  )
+
+  const handleReloadPrompt = useCallback(async () => {
+    if (!selectedPromptProfileId || !selectedPromptSource) return
+    if (promptDirty && !window.confirm(t('prompts.reloadConfirm'))) return
+    setPromptLoading(true)
+    try {
+      const refreshed = await fetchPromptSources(
+        selectedPromptProfileId,
+        selectedPromptProjectId,
+      )
+      const source = choosePromptSource(refreshed, selectedPromptSource.path)
+      if (!source) {
+        setPromptDocument(null)
+        setPromptEditorContent('')
+        setSelectedPromptSourcePath('')
+        return
+      }
+      setSelectedPromptSourcePath(source.path)
+      setLastDeletedPromptRevisionId(null)
+      await readPromptDocument(source)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setPromptLoading(false)
+    }
+  }, [
+    fetchPromptSources,
+    promptDirty,
+    readPromptDocument,
+    selectedPromptProfileId,
+    selectedPromptProjectId,
+    selectedPromptSource,
+    t,
+  ])
+
+  const handleSavePrompt = useCallback(
+    async (force: boolean) => {
+      if (!promptDocument || !selectedPromptProfileId) return
+      const source = promptDocument.source
+      const execute = async (allowExternal: boolean): Promise<void> => {
+        if (
+          source.is_symlink &&
+          !allowExternal &&
+          !window.confirm(
+            t('prompts.symlinkConfirm', {
+              path: source.real_path ?? source.link_target ?? source.path,
+            }),
+          )
+        ) {
+          return
+        }
+        setPromptSaving(true)
+        try {
+          const result = await invokeTauri<PromptMutationResultDto>(
+            'save_prompt_document',
+            {
+              request: {
+                profile_id: source.profile_id,
+                project_id: source.project_id ?? null,
+                path: source.path,
+                content: promptEditorContent,
+                expected_hash: promptDocument.content_hash ?? null,
+                line_ending: promptDocument.line_ending,
+                has_bom: promptDocument.has_bom,
+                allow_external: allowExternal,
+                force,
+              },
+            },
+          )
+          const refreshed = await fetchPromptSources(
+            selectedPromptProfileId,
+            selectedPromptProjectId,
+          )
+          const updated =
+            refreshed.find((item) => item.path === result.source.path) ??
+            result.source
+          setPromptSources(
+            refreshed.some((item) => item.path === updated.path)
+              ? refreshed
+              : [...refreshed, updated],
+          )
+          setSelectedPromptSourcePath(updated.path)
+          setLastDeletedPromptRevisionId(null)
+          await readPromptDocument(updated)
+          toast.success(t('prompts.saved'))
+        } catch (err) {
+          const raw = err instanceof Error ? err.message : String(err)
+          if (
+            raw.startsWith('PROMPT_EXTERNAL_CONFIRMATION_REQUIRED|') &&
+            !allowExternal
+          ) {
+            const path = raw.split('|').slice(1).join('|')
+            if (window.confirm(t('prompts.externalConfirm', { path }))) {
+              await execute(true)
+            }
+            return
+          }
+          if (raw.startsWith('PROMPT_CONFLICT|')) {
+            setPromptConflict(true)
+            setPromptExternalChange(true)
+            return
+          }
+          setError(raw)
+        } finally {
+          setPromptSaving(false)
+        }
+      }
+      await execute(false)
+    },
+    [
+      fetchPromptSources,
+      invokeTauri,
+      promptDocument,
+      promptEditorContent,
+      readPromptDocument,
+      selectedPromptProfileId,
+      selectedPromptProjectId,
+      t,
+    ],
+  )
+
+  const handleDeletePromptDocument = useCallback(async () => {
+    if (!promptDocument?.source.exists || !promptDocument.source.can_delete) return
+    if (!window.confirm(t('prompts.deleteConfirm'))) return
+    const source = promptDocument.source
+    const execute = async (allowExternal: boolean): Promise<void> => {
+      setPromptSaving(true)
+      try {
+        const result = await invokeTauri<PromptMutationResultDto>(
+          'delete_prompt_document',
+          {
+            request: {
+              profile_id: source.profile_id,
+              project_id: source.project_id ?? null,
+              path: source.path,
+              expected_hash: promptDocument.content_hash ?? null,
+              allow_external: allowExternal,
+              force: false,
+            },
+          },
+        )
+        const refreshed = await fetchPromptSources(
+          selectedPromptProfileId,
+          selectedPromptProjectId,
+        )
+        const deletedDocument: PromptDocumentDto = {
+          ...promptDocument,
+          source: result.source,
+          content: '',
+          content_hash: null,
+          read_only: false,
+          warnings: [],
+        }
+        setPromptSources(
+          refreshed.some((item) => item.path === result.source.path)
+            ? refreshed
+            : [result.source, ...refreshed],
+        )
+        setSelectedPromptSourcePath(result.source.path)
+        setPromptDocument(deletedDocument)
+        setPromptEditorContent('')
+        setPromptExternalChange(false)
+        setPromptConflict(false)
+        setLastDeletedPromptRevisionId(result.revision_id)
+        toast.success(t('prompts.deleted'))
+      } catch (err) {
+        const raw = err instanceof Error ? err.message : String(err)
+        if (
+          raw.startsWith('PROMPT_EXTERNAL_CONFIRMATION_REQUIRED|') &&
+          !allowExternal
+        ) {
+          const path = raw.split('|').slice(1).join('|')
+          if (window.confirm(t('prompts.externalConfirm', { path }))) {
+            await execute(true)
+          }
+          return
+        }
+        if (raw.startsWith('PROMPT_CONFLICT|')) {
+          setPromptConflict(true)
+          setPromptExternalChange(true)
+          return
+        }
+        setError(raw)
+      } finally {
+        setPromptSaving(false)
+      }
+    }
+    await execute(false)
+  }, [
+    fetchPromptSources,
+    invokeTauri,
+    promptDocument,
+    selectedPromptProfileId,
+    selectedPromptProjectId,
+    t,
+  ])
+
+  const restorePromptRevision = useCallback(
+    async (revisionId: string, closeHistory: boolean) => {
+      if (!revisionId) return
+      const execute = async (
+        allowExternal: boolean,
+        force: boolean,
+      ): Promise<void> => {
+        setPromptHistoryLoading(true)
+        try {
+          const result = await invokeTauri<PromptMutationResultDto>(
+            'restore_prompt_revision',
+            {
+              request: {
+                revision_id: revisionId,
+                expected_hash: promptDocument?.content_hash ?? null,
+                allow_external: allowExternal,
+                force,
+              },
+            },
+          )
+          const refreshed = await fetchPromptSources(
+            result.source.profile_id,
+            result.source.project_id ?? '',
+          )
+          const restored =
+            refreshed.find((item) => item.path === result.source.path) ??
+            result.source
+          setPromptSources(
+            refreshed.some((item) => item.path === restored.path)
+              ? refreshed
+              : [...refreshed, restored],
+          )
+          setSelectedPromptSourcePath(restored.path)
+          setLastDeletedPromptRevisionId(null)
+          await readPromptDocument(restored)
+          if (closeHistory) setShowPromptHistoryModal(false)
+          toast.success(t('prompts.historyModal.restored'))
+        } catch (err) {
+          const raw = err instanceof Error ? err.message : String(err)
+          if (
+            raw.startsWith('PROMPT_EXTERNAL_CONFIRMATION_REQUIRED|') &&
+            !allowExternal
+          ) {
+            const path = raw.split('|').slice(1).join('|')
+            if (window.confirm(t('prompts.externalConfirm', { path }))) {
+              await execute(true, force)
+            }
+            return
+          }
+          if (
+            raw.startsWith('PROMPT_CONFLICT|') &&
+            !force &&
+            window.confirm(t('prompts.historyModal.conflictConfirm'))
+          ) {
+            await execute(allowExternal, true)
+            return
+          }
+          setError(raw)
+        } finally {
+          setPromptHistoryLoading(false)
+        }
+      }
+      await execute(false, false)
+    },
+    [
+      fetchPromptSources,
+      invokeTauri,
+      promptDocument?.content_hash,
+      readPromptDocument,
+      t,
+    ],
+  )
+
+  const handleOpenPromptHistory = useCallback(async () => {
+    if (!promptDocument) return
+    setShowPromptHistoryModal(true)
+    setPromptHistoryLoading(true)
+    try {
+      const revisions = await invokeTauri<PromptRevisionSummaryDto[]>(
+        'list_prompt_revisions',
+        { logicalPath: promptDocument.source.path },
+      )
+      setPromptRevisions(revisions)
+      const first = revisions[0]
+      setSelectedPromptRevisionId(first?.id ?? '')
+      if (first) {
+        const revision = await invokeTauri<PromptRevisionDocumentDto>(
+          'read_prompt_revision',
+          { revisionId: first.id },
+        )
+        setPromptRevisionDocument(revision)
+      } else {
+        setPromptRevisionDocument(null)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setPromptHistoryLoading(false)
+    }
+  }, [invokeTauri, promptDocument])
+
+  const handleSelectPromptRevision = useCallback(
+    async (revisionId: string) => {
+      setSelectedPromptRevisionId(revisionId)
+      setPromptHistoryLoading(true)
+      try {
+        const revision = await invokeTauri<PromptRevisionDocumentDto>(
+          'read_prompt_revision',
+          { revisionId },
+        )
+        setPromptRevisionDocument(revision)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setPromptHistoryLoading(false)
+      }
+    },
+    [invokeTauri],
+  )
+
+  const handleResolvePromptChain = useCallback(async () => {
+    if (!selectedPromptProfileId) return
+    setPromptChainLoading(true)
+    setPromptChain(null)
+    try {
+      const result = await invokeTauri<PromptInstructionChainDto>(
+        'resolve_prompt_instruction_chain',
+        {
+          scenario: {
+            profile_id: selectedPromptProfileId,
+            project_id: selectedPromptProjectId || null,
+            working_directory: null,
+            target_path: null,
+          },
+        },
+      )
+      setPromptChain(result)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setPromptChainLoading(false)
+    }
+  }, [
+    invokeTauri,
+    selectedPromptProfileId,
+    selectedPromptProjectId,
+  ])
+
+  const handleOpenPromptProfiles = useCallback(() => {
+    setPromptProfileDrafts(customPromptProfileDrafts(promptProfiles))
+    setShowPromptProfilesModal(true)
+  }, [promptProfiles])
+
+  const handleAddPromptProfile = useCallback((tool: PromptTool) => {
+    setPromptProfileDrafts((current) => [
+      ...current,
+      {
+        id: '',
+        tool,
+        label:
+          tool === 'codex' ? 'Codex' : tool === 'pi' ? 'Pi' : 'Claude Code',
+        config_root: '',
+      },
+    ])
   }, [])
+
+  const handlePickPromptProfileRoot = useCallback(
+    async (index: number) => {
+      try {
+        if (!isTauri) throw new Error(t('errors.notTauri'))
+        const { open } = await import('@tauri-apps/plugin-dialog')
+        const selected = await open({
+          directory: true,
+          multiple: false,
+          title: t('prompts.profilesModal.chooseRoot'),
+        })
+        if (!selected || Array.isArray(selected)) return
+        setPromptProfileDrafts((current) =>
+          current.map((draft, itemIndex) =>
+            itemIndex === index
+              ? { ...draft, config_root: selected }
+              : draft,
+          ),
+        )
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      }
+    },
+    [isTauri, t],
+  )
+
+  const handleSavePromptProfiles = useCallback(async () => {
+    setPromptProfilesSaving(true)
+    try {
+      const saved = await invokeTauri<PromptProfileDto[]>('save_prompt_profiles', {
+        profiles: promptProfileDrafts,
+      })
+      setPromptProfiles(saved)
+      setSelectedPromptProfileId((current) =>
+        saved.some((profile) => profile.id === current)
+          ? current
+          : saved.find((profile) => profile.is_default)?.id ?? saved[0]?.id ?? '',
+      )
+      setShowPromptProfilesModal(false)
+      toast.success(t('prompts.profilesModal.saved'))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setPromptProfilesSaving(false)
+    }
+  }, [invokeTauri, promptProfileDrafts, t])
+
+  const formatPromptTimestamp = useCallback(
+    (value?: number | null) => {
+      if (!value) return t('relative.empty')
+      const milliseconds = value < 1_000_000_000_000 ? value * 1000 : value
+      return new Intl.DateTimeFormat(language === 'zh' ? 'zh-CN' : 'en', {
+        dateStyle: 'medium',
+        timeStyle: 'short',
+      }).format(new Date(milliseconds))
+    },
+    [language, t],
+  )
+
+  const handleOpenSettings = useCallback(() => {
+    if (!confirmDiscardPromptEdits()) return
+    setActiveView('settings')
+  }, [confirmDiscardPromptEdits])
 
   const loadFeaturedSkills = useCallback(async () => {
     if (featuredSkills.length > 0) return
@@ -1464,7 +2725,20 @@ function App() {
   }, [featuredSkills.length, invokeTauri])
 
   const handleViewChange = useCallback(
-    (view: 'projects' | 'myskills' | 'explore' | 'manage') => {
+    (
+      view:
+        | 'projects'
+        | 'myskills'
+        | 'templates'
+        | 'explore'
+        | 'prompts'
+        | 'manage',
+    ) => {
+      if (view === 'prompts') {
+        openPrompts()
+        return
+      }
+      if (activeView === 'prompts' && !confirmDiscardPromptEdits()) return
       setActiveView(view)
       if (view !== 'myskills') {
         setBulkMode(false)
@@ -1485,8 +2759,18 @@ function App() {
         setSelectedProjectDetail(null)
         void loadProjects()
       }
+      if (view === 'templates') {
+        void loadSkillTemplates()
+      }
     },
-    [loadFeaturedSkills, loadProjects],
+    [
+      activeView,
+      confirmDiscardPromptEdits,
+      loadFeaturedSkills,
+      loadProjects,
+      loadSkillTemplates,
+      openPrompts,
+    ],
   )
 
   const handleOpenDetail = useCallback((skill: ManagedSkill) => {
@@ -1895,13 +3179,6 @@ function App() {
     ],
   )
 
-  const restoreSkillSavedTargets = useCallback(
-    async (skill: ManagedSkill) => {
-      await invokeTauri('resume_skill_assignments', { skillId: skill.id })
-    },
-    [invokeTauri],
-  )
-
   const handleToggleSkillEnabled = useCallback(
     async (skill: ManagedSkill) => {
       const nextEnabled = skill.enabled === false
@@ -1914,19 +3191,26 @@ function App() {
           : t('bulk.disableProgress', { current: 1, total: 1, name: skill.name }),
       )
       try {
-        await invokeTauri('set_skill_enabled', {
+        const result = await invokeTauri<SkillEnableResultDto>('set_skill_enabled', {
           skillId: skill.id,
           enabled: nextEnabled,
         })
-        if (nextEnabled) {
-          await restoreSkillSavedTargets(skill)
+        await Promise.all([
+          loadManagedSkills(),
+          loadProjects(),
+          loadSkillTemplates(),
+        ])
+        if (result.failed > 0) {
+          toast.error(
+            result.errors[0] ?? t('templates.syncFailures', { count: result.failed }),
+          )
+        } else {
+          setSuccessToastMessage(
+            nextEnabled
+              ? t('skillEnabled', { name: skill.name })
+              : t('skillDisabled', { name: skill.name }),
+          )
         }
-        await loadManagedSkills()
-        setSuccessToastMessage(
-          nextEnabled
-            ? t('skillEnabled', { name: skill.name })
-            : t('skillDisabled', { name: skill.name }),
-        )
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err))
       } finally {
@@ -1935,7 +3219,7 @@ function App() {
         setActionMessage(null)
       }
     },
-    [invokeTauri, loadManagedSkills, restoreSkillSavedTargets, t],
+    [invokeTauri, loadManagedSkills, loadProjects, loadSkillTemplates, t],
   )
 
   const handleToggleBulkEnabled = useCallback(async () => {
@@ -1967,12 +3251,17 @@ function App() {
               }),
         )
         try {
-          await invokeTauri('set_skill_enabled', {
+          const result = await invokeTauri<SkillEnableResultDto>('set_skill_enabled', {
             skillId: skill.id,
             enabled: nextEnabled,
           })
-          if (nextEnabled) {
-            await restoreSkillSavedTargets(skill)
+          if (result.failed > 0) {
+            errors.push({
+              title: t('bulk.enableFailedTitle', { name: skill.name }),
+              message:
+                result.errors[0] ??
+                t('templates.syncFailures', { count: result.failed }),
+            })
           }
         } catch (err) {
           errors.push({
@@ -1983,7 +3272,11 @@ function App() {
           })
         }
       }
-      await loadManagedSkills()
+      await Promise.all([
+        loadManagedSkills(),
+        loadProjects(),
+        loadSkillTemplates(),
+      ])
       if (errors.length > 0) {
         showActionErrors(errors)
       } else {
@@ -2005,7 +3298,8 @@ function App() {
     bulkShouldEnable,
     invokeTauri,
     loadManagedSkills,
-    restoreSkillSavedTargets,
+    loadProjects,
+    loadSkillTemplates,
     showActionErrors,
     t,
   ])
@@ -2208,6 +3502,28 @@ function App() {
       }))
     },
     [],
+  )
+
+  const handleIgnoreDiscoveredGroup = useCallback(
+    async (group: OnboardingGroup) => {
+      if (ignoringDiscoveredGroup) return
+      setIgnoringDiscoveredGroup(group.name)
+      setError(null)
+      try {
+        await invokeTauri<number>('ignore_discovered_skill', {
+          paths: group.variants.map((variant) => variant.path),
+        })
+        const refreshed = await loadPlan()
+        if (refreshed) {
+          setSuccessToastMessage(t('discoveredIgnored'))
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setIgnoringDiscoveredGroup(null)
+      }
+    },
+    [ignoringDiscoveredGroup, invokeTauri, loadPlan, t],
   )
 
   const handleReviewImport = useCallback(async () => {
@@ -3360,6 +4676,10 @@ function App() {
     activeView === 'projectDetail'
       ? selectedProjectDetail?.project.id
       : undefined
+  const promptOriginProjectName =
+    selectedProjectDetail?.project.id === promptOriginProjectId
+      ? selectedProjectDetail.project.name
+      : projects.find((project) => project.id === promptOriginProjectId)?.name
 
   return (
     <div className="skills-app">
@@ -3380,8 +4700,10 @@ function App() {
         language={language}
         loading={loading}
         activeView={activeView}
+        updateFailureCount={autoUpdateConfig?.last_failed ?? 0}
         onToggleLanguage={toggleLanguage}
         onOpenSettings={handleOpenSettings}
+        onOpenUpdates={handleOpenAutoUpdateResults}
         onViewChange={handleViewChange}
         t={t}
       />
@@ -3394,6 +4716,18 @@ function App() {
             loading={loading}
             onBack={handleBackToProjects}
             onRefresh={handleRefreshProject}
+            onOpenPrompts={() => {
+              const tool = selectedProjectDetail.project.enabled_tool_keys.includes('codex')
+                ? 'codex'
+                : selectedProjectDetail.project.enabled_tool_keys.includes('claude_code')
+                  ? 'claude_code'
+                  : selectedProjectDetail.project.enabled_tool_keys.includes('pi')
+                    ? 'pi'
+                    : undefined
+              openPrompts(tool, selectedProjectDetail.project.id)
+            }}
+            onManageTemplate={handleOpenProjectTemplate}
+            onOpenSkillDetail={setPreviewRequest}
             onToolsChange={handleProjectToolsChange}
             onGitExcludeChange={handleProjectGitExcludeChange}
             onAddLibrarySkill={handleAddProjectLibrarySkill}
@@ -3419,6 +4753,7 @@ function App() {
             onPickProject={() => void handlePickProjectRoot()}
             onImportProject={handleImportProject}
             onOpenProject={handleOpenProject}
+            onDeleteProject={setPendingDeleteProject}
             formatRelative={formatRelative}
             t={t}
           />
@@ -3517,6 +4852,15 @@ function App() {
                   <button
                     className="btn btn-secondary"
                     type="button"
+                    onClick={handleCreateTemplateFromBulk}
+                    disabled={loading || bulkSelectedIds.length === 0}
+                  >
+                    <Workflow size={15} />
+                    {t('templates.createFromSelection')}
+                  </button>
+                  <button
+                    className="btn btn-secondary"
+                    type="button"
                     onClick={handleOpenBatchAssignment}
                     disabled={loading || bulkSelectedIds.length === 0}
                   >
@@ -3542,6 +4886,76 @@ function App() {
               </div>
             ) : null}
           </div>
+        ) : activeView === 'templates' ? (
+          <TemplatesPage
+            key={visibleSelectedTemplateId || 'templates'}
+            templates={visibleSkillTemplates}
+            selectedTemplateId={visibleSelectedTemplateId}
+            revisions={templateRevisions}
+            showArchived={showArchivedTemplates}
+            loading={loading}
+            onSelect={setSelectedTemplateId}
+            onCreate={() => openTemplateEditor(null)}
+            onEdit={(template) => openTemplateEditor(template)}
+            onArchive={(template, archived) =>
+              void handleArchiveTemplate(template, archived)
+            }
+            onDelete={(template) => void handleDeleteTemplate(template)}
+            onToggleArchived={handleToggleArchivedTemplates}
+            onLoadHistory={(templateId) =>
+              void handleLoadTemplateHistory(templateId)
+            }
+            onRollback={(template, revisionId) =>
+              void handleRollbackTemplate(template, revisionId)
+            }
+            onOpenProject={handleOpenTemplateProject}
+            onRetryProject={(projectId) =>
+              void handleRetryTemplateProject(projectId)
+            }
+            formatRelative={formatRelative}
+            t={t}
+          />
+        ) : activeView === 'prompts' ? (
+          <PromptsPage
+            profiles={promptProfiles}
+            projects={projects}
+            returnProjectName={promptOriginProjectName}
+            selectedProfileId={selectedPromptProfileId}
+            selectedProjectId={selectedPromptProjectId}
+            sources={promptSources}
+            selectedSourcePath={selectedPromptSourcePath}
+            document={promptDocument}
+            editorContent={promptEditorContent}
+            dirty={promptDirty}
+            loading={promptLoading}
+            saving={promptSaving}
+            externalChange={promptExternalChange}
+            conflict={promptConflict}
+            watchStatus={promptWatchStatus}
+            chain={promptChain}
+            chainLoading={promptChainLoading}
+            lastDeletedRevisionId={lastDeletedPromptRevisionId}
+            onBackToProject={handleBackToPromptProject}
+            onProfileChange={handlePromptProfileChange}
+            onProjectChange={handlePromptProjectChange}
+            onOpenProfiles={handleOpenPromptProfiles}
+            onSelectSource={(source) => void handleSelectPromptSource(source)}
+            onContentChange={(content) => {
+              setPromptEditorContent(content)
+              setPromptConflict(false)
+            }}
+            onSave={() => void handleSavePrompt(false)}
+            onForceSave={() => void handleSavePrompt(true)}
+            onReload={() => void handleReloadPrompt()}
+            onDelete={() => void handleDeletePromptDocument()}
+            onOpenHistory={() => void handleOpenPromptHistory()}
+            onOpenPromptChain={() => void handleResolvePromptChain()}
+            onRestoreLastDelete={() =>
+              void restorePromptRevision(lastDeletedPromptRevisionId ?? '', false)
+            }
+            formatTimestamp={formatPromptTimestamp}
+            t={t}
+          />
         ) : activeView === 'manage' ? (
           <div className="management-page">
             <div className="management-header">
@@ -3575,7 +4989,14 @@ function App() {
                   aria-selected={managementTab === 'updates'}
                   onClick={() => setManagementTab('updates')}
                 >
-                  {t('manageTabs.updates')}
+                  <span>{t('manageTabs.updates')}</span>
+                  {(autoUpdateConfig?.last_failed ?? 0) > 0 ? (
+                    <span className="management-tab-badge">
+                      {(autoUpdateConfig?.last_failed ?? 0) > 99
+                        ? '99+'
+                        : autoUpdateConfig?.last_failed}
+                    </span>
+                  ) : null}
                 </button>
                 <button
                   className={`management-tab${managementTab === 'device-sync' ? ' active' : ''}`}
@@ -3621,6 +5042,15 @@ function App() {
                   toolStatus={toolStatus}
                   toolConfig={toolConfig}
                   onToolConfigChange={handleToolConfigChange}
+                  onOpenPrompts={(toolKey) => {
+                    if (
+                      toolKey === 'codex' ||
+                      toolKey === 'claude_code' ||
+                      toolKey === 'pi'
+                    ) {
+                      openPrompts(toolKey)
+                    }
+                  }}
                   t={t}
                 />
               ) : (
@@ -3676,6 +5106,82 @@ function App() {
           />
         )}
       </main>
+
+      {showTemplateEditor ? (
+        <TemplateEditorModal
+          key={editingTemplate?.id ?? templateEditorInitialSkillIds.join('-')}
+          open
+          template={editingTemplate}
+          initialSkillIds={templateEditorInitialSkillIds}
+          skills={managedSkills}
+          saving={templateSaving}
+          onClose={handleCloseTemplateEditor}
+          onSave={(draft) => void handleSaveTemplate(draft)}
+          t={t}
+        />
+      ) : null}
+
+      {showProjectTemplateModal && selectedProjectDetail ? (
+        <ProjectTemplateModal
+          key={`${selectedProjectDetail.project.id}-${selectedProjectDetail.template_binding?.template_id ?? 'none'}-${projectTemplateImportFlow}`}
+          open
+          projectName={selectedProjectDetail.project.name}
+          binding={selectedProjectDetail.template_binding}
+          templates={skillTemplates}
+          loading={loading}
+          importFlow={projectTemplateImportFlow}
+          onPreview={handlePreviewProjectTemplate}
+          onApply={(templateId) => void handleApplyProjectTemplate(templateId)}
+          onDetach={(retainAsManual) =>
+            void handleDetachProjectTemplate(retainAsManual)
+          }
+          onUpdateSnapshot={() => void handleUpdateSnapshotTemplate()}
+          onClose={handleCloseProjectTemplate}
+          t={t}
+        />
+      ) : null}
+
+      <PromptProfilesModal
+        open={showPromptProfilesModal}
+        drafts={promptProfileDrafts}
+        saving={promptProfilesSaving}
+        onChange={(index, draft) =>
+          setPromptProfileDrafts((current) =>
+            current.map((item, itemIndex) =>
+              itemIndex === index ? draft : item,
+            ),
+          )
+        }
+        onAdd={handleAddPromptProfile}
+        onRemove={(index) =>
+          setPromptProfileDrafts((current) =>
+            current.filter((_, itemIndex) => itemIndex !== index),
+          )
+        }
+        onPickRoot={(index) => void handlePickPromptProfileRoot(index)}
+        onSave={() => void handleSavePromptProfiles()}
+        onRequestClose={() => {
+          if (!promptProfilesSaving) setShowPromptProfilesModal(false)
+        }}
+        t={t}
+      />
+
+      <PromptHistoryModal
+        open={showPromptHistoryModal}
+        revisions={promptRevisions}
+        selectedRevisionId={selectedPromptRevisionId}
+        revisionDocument={promptRevisionDocument}
+        loading={promptHistoryLoading}
+        onSelect={(revisionId) => void handleSelectPromptRevision(revisionId)}
+        onRestore={() =>
+          void restorePromptRevision(selectedPromptRevisionId, true)
+        }
+        onRequestClose={() => {
+          if (!promptHistoryLoading) setShowPromptHistoryModal(false)
+        }}
+        formatTimestamp={formatPromptTimestamp}
+        t={t}
+      />
 
       <AddSkillModal
         open={showAddModal}
@@ -3748,10 +5254,12 @@ function App() {
           variantChoice={variantChoice}
           hubResolutions={hubResolutions}
           reservedSkillNames={managedSkills.map((skill) => skill.name)}
+          ignoringGroupName={ignoringDiscoveredGroup}
           onRequestClose={handleCloseImport}
           onToggleGroup={handleToggleGroup}
           onSelectVariant={handleSelectVariant}
           onResolveHubConflict={handleResolveHubConflict}
+          onIgnoreGroup={(group) => void handleIgnoreDiscoveredGroup(group)}
           onImport={handleImport}
           t={t}
         />
@@ -3811,6 +5319,24 @@ function App() {
         onConfirm={() => {
           if (pendingDeleteSkill) void handleDeleteManaged(pendingDeleteSkill)
         }}
+        t={t}
+      />
+
+      <DeleteModal
+        open={Boolean(pendingDeleteProject)}
+        loading={loading}
+        skillName={null}
+        title={t('projects.deleteModalTitle')}
+        description={t('projects.deleteModalBody', {
+          name: pendingDeleteProject?.name ?? '',
+        })}
+        warnings={[
+          t('projects.deleteWarningRecords'),
+          t('projects.deleteWarningFiles'),
+        ]}
+        confirmLabel={t('projects.deleteConfirmButton')}
+        onRequestClose={handleCloseDeleteProject}
+        onConfirm={() => void handleConfirmDeleteProject()}
         t={t}
       />
 

@@ -4,6 +4,7 @@ import {
   FolderKanban,
   FolderOpen,
   FolderPlus,
+  Trash2,
 } from 'lucide-react'
 import type { TFunction } from 'i18next'
 import type { ProjectSummaryDto } from '../skills/types'
@@ -16,6 +17,7 @@ type ProjectsPageProps = {
   onPickProject: () => void
   onImportProject: () => void
   onOpenProject: (project: ProjectSummaryDto) => void
+  onDeleteProject: (project: ProjectSummaryDto) => void
   formatRelative: (value?: number | null) => string
   t: TFunction
 }
@@ -28,6 +30,7 @@ const ProjectsPage = ({
   onPickProject,
   onImportProject,
   onOpenProject,
+  onDeleteProject,
   formatRelative,
   t,
 }: ProjectsPageProps) => {
@@ -41,26 +44,28 @@ const ProjectsPage = ({
           </span>
         </div>
         <div className="project-import-control">
-          <input
-            value={importPath}
-            onChange={(event) => onImportPathChange(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') onImportProject()
-            }}
-            placeholder={t('projects.absolutePathPlaceholder')}
-            aria-label={t('projects.absolutePathPlaceholder')}
-            disabled={loading}
-          />
-          <button
-            className="icon-btn"
-            type="button"
-            onClick={onPickProject}
-            title={t('projects.chooseFolder')}
-            aria-label={t('projects.chooseFolder')}
-            disabled={loading}
-          >
-            <FolderOpen size={17} />
-          </button>
+          <div className="project-path-field">
+            <input
+              value={importPath}
+              onChange={(event) => onImportPathChange(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') onImportProject()
+              }}
+              placeholder={t('projects.absolutePathPlaceholder')}
+              aria-label={t('projects.absolutePathPlaceholder')}
+              disabled={loading}
+            />
+            <button
+              className="project-path-picker"
+              type="button"
+              onClick={onPickProject}
+              title={t('projects.chooseFolder')}
+              aria-label={t('projects.chooseFolder')}
+              disabled={loading}
+            >
+              <FolderOpen size={17} />
+            </button>
+          </div>
           <button
             className="btn btn-primary"
             type="button"
@@ -82,37 +87,51 @@ const ProjectsPage = ({
       ) : (
         <div className="projects-grid">
           {projects.map((project) => (
-            <button
+            <div
               className="project-card"
-              type="button"
               key={project.id}
-              onClick={() => onOpenProject(project)}
             >
-              <span className="project-card-icon" aria-hidden="true">
-                <FolderKanban size={20} />
-              </span>
-              <span className="project-card-main">
-                <strong>{project.name}</strong>
-                <span className="project-card-path mono" title={project.root_path}>
-                  {project.root_path}
+              <button
+                className="project-card-open"
+                type="button"
+                onClick={() => onOpenProject(project)}
+              >
+                <span className="project-card-icon" aria-hidden="true">
+                  <FolderKanban size={20} />
                 </span>
-                <span className="project-card-meta">
-                  {t('projects.skillCount', { count: project.skill_count })}
-                  <span aria-hidden="true">·</span>
-                  {t('projects.toolCount', {
-                    count: project.enabled_tool_keys.length,
-                  })}
-                  <span aria-hidden="true">·</span>
-                  {formatRelative(project.last_scanned_at)}
+                <span className="project-card-main">
+                  <strong>{project.name}</strong>
+                  <span className="project-card-path mono" title={project.root_path}>
+                    {project.root_path}
+                  </span>
+                  <span className="project-card-meta">
+                    {t('projects.skillCount', { count: project.skill_count })}
+                    <span aria-hidden="true">·</span>
+                    {t('projects.toolCount', {
+                      count: project.enabled_tool_keys.length,
+                    })}
+                    <span aria-hidden="true">·</span>
+                    {formatRelative(project.last_scanned_at)}
+                  </span>
                 </span>
-              </span>
-              {project.attention_count > 0 ? (
-                <span className="project-attention-count">
-                  <AlertTriangle size={14} />
-                  {project.attention_count}
-                </span>
-              ) : null}
-            </button>
+                {project.attention_count > 0 ? (
+                  <span className="project-attention-count">
+                    <AlertTriangle size={14} />
+                    {project.attention_count}
+                  </span>
+                ) : null}
+              </button>
+              <button
+                className="project-card-delete"
+                type="button"
+                onClick={() => onDeleteProject(project)}
+                title={t('projects.delete')}
+                aria-label={t('projects.delete')}
+                disabled={loading}
+              >
+                <Trash2 size={16} />
+              </button>
+            </div>
           ))}
         </div>
       )}

@@ -5,7 +5,7 @@ use super::installer::{
     update_managed_skill_from_source, update_managed_skill_from_source_with_lock_held,
 };
 use super::runtime_paths::{RuntimePaths, RuntimeProfile};
-use super::skill_store::SkillStore;
+use super::skill_store::{SkillRecord, SkillStore};
 
 pub const AUTO_UPDATE_ENABLED_KEY: &str = "skill_auto_update_enabled";
 pub const AUTO_UPDATE_INTERVAL_HOURS_KEY: &str = "skill_auto_update_interval_hours";
@@ -66,6 +66,7 @@ pub struct AutoUpdateConfig {
     pub enabled: bool,
     pub interval_hours: i64,
     pub schedule: AutoUpdateSchedule,
+    pub eligible_skill_count: usize,
     pub local_skill_count: usize,
     pub protected_local_skill_count: usize,
     pub last_run_at: Option<i64>,
@@ -129,29 +130,97 @@ pub fn get_auto_update_config(store: &SkillStore) -> Result<AutoUpdateConfig> {
         .get_setting(AUTO_UPDATE_LAST_STARTED_AT_KEY)?
         .and_then(|v| v.parse::<i64>().ok())
         .or(last_run_at);
-    let last_status = store.get_setting(AUTO_UPDATE_LAST_STATUS_KEY)?;
+    let mut last_status = store.get_setting(AUTO_UPDATE_LAST_STATUS_KEY)?;
     let mut last_finished_at = store
         .get_setting(AUTO_UPDATE_LAST_FINISHED_AT_KEY)?
         .and_then(|v| v.parse::<i64>().ok());
     if last_finished_at.is_none() && last_status.as_deref() != Some("running") {
         last_finished_at = last_run_at;
     }
-    let last_error = store.get_setting(AUTO_UPDATE_LAST_ERROR_KEY)?;
-    let last_checked = parse_usize_setting(store, AUTO_UPDATE_LAST_CHECKED_KEY)?;
-    let last_updated = parse_usize_setting(store, AUTO_UPDATE_LAST_UPDATED_KEY)?;
-    let last_failed = parse_usize_setting(store, AUTO_UPDATE_LAST_FAILED_KEY)?;
+    let mut last_error = store.get_setting(AUTO_UPDATE_LAST_ERROR_KEY)?;
+    let mut last_checked = parse_usize_setting(store, AUTO_UPDATE_LAST_CHECKED_KEY)?;
+    let mut last_updated = parse_usize_setting(store, AUTO_UPDATE_LAST_UPDATED_KEY)?;
+    let mut last_failed = parse_usize_setting(store, AUTO_UPDATE_LAST_FAILED_KEY)?;
     let mut progress = parse_progress_setting(store)?;
-    if progress_is_empty(&progress) {
+    let had_structured_progress = !progress_is_empty(&progress);
+    if !had_structured_progress {
         progress = legacy_error_progress(store, last_checked, last_error.as_deref())?;
     }
-    let (local_skill_count, protected_local_skill_count) = count_local_auto_update_skills(store)?;
+    let selection = select_auto_update_skills(store)?;
+    let eligible_skill_ids = selection
+        .entries
+        .iter()
+        .map(|entry| entry.skill_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let excluded_skill_ids = store
+        .list_skills()?
+        .into_iter()
+        .map(|skill| skill.id)
+        .filter(|skill_id| !eligible_skill_ids.contains(skill_id.as_str()))
+        .collect::<std::collections::HashSet<_>>();
+    let original_item_count = progress.succeeded.len()
+        + progress.failed.len()
+        + progress.pending.len()
+        + usize::from(progress.running.is_some());
+    if !progress_is_empty(&progress) && !excluded_skill_ids.is_empty() {
+        progress
+            .succeeded
+            .retain(|item| !excluded_skill_ids.contains(&item.skill_id));
+        progress
+            .failed
+            .retain(|item| !excluded_skill_ids.contains(&item.skill_id));
+        progress
+            .pending
+            .retain(|item| !excluded_skill_ids.contains(&item.skill_id));
+        if progress
+            .running
+            .as_ref()
+            .is_some_and(|item| excluded_skill_ids.contains(&item.skill_id))
+        {
+            progress.running = None;
+        }
+    }
+    let filtered_item_count = progress.succeeded.len()
+        + progress.failed.len()
+        + progress.pending.len()
+        + usize::from(progress.running.is_some());
+    if filtered_item_count < original_item_count {
+        progress.total = progress
+            .total
+            .saturating_sub(original_item_count - filtered_item_count);
+        last_checked = progress.total;
+        last_failed = progress.failed.len();
+        last_updated = if had_structured_progress {
+            progress.succeeded.len()
+        } else {
+            last_updated.min(last_checked.saturating_sub(last_failed))
+        };
+        last_error = Some(
+            progress
+                .failed
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{}: {}",
+                        item.skill_id,
+                        item.reason.as_deref().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        if last_status.as_deref() == Some("error") && last_failed == 0 {
+            last_status = Some("ok".to_string());
+        }
+    }
 
     Ok(AutoUpdateConfig {
         enabled,
         interval_hours,
         schedule,
-        local_skill_count,
-        protected_local_skill_count,
+        eligible_skill_count: selection.entries.len(),
+        local_skill_count: selection.local_skill_count,
+        protected_local_skill_count: selection.protected_local_skill_count,
         last_run_at,
         last_started_at,
         last_finished_at,
@@ -457,41 +526,67 @@ fn update_auto_managed_skill<R: tauri::Runtime>(
 }
 
 fn list_auto_update_skill_entries(store: &SkillStore) -> Result<Vec<AutoUpdateSkillProgress>> {
-    let mut skills = store
-        .list_skills()?
-        .into_iter()
-        .filter(|skill| {
-            skill.source_type == "git"
-                || (skill.source_type == "local" && !skill.has_unbound_local_source())
-        })
-        .map(|skill| AutoUpdateSkillProgress {
+    Ok(select_auto_update_skills(store)?.entries)
+}
+
+struct AutoUpdateSkillSelection {
+    entries: Vec<AutoUpdateSkillProgress>,
+    local_skill_count: usize,
+    protected_local_skill_count: usize,
+}
+
+fn select_auto_update_skills(store: &SkillStore) -> Result<AutoUpdateSkillSelection> {
+    let mut entries = Vec::new();
+    let mut local_skill_count = 0;
+    let mut protected_local_skill_count = 0;
+    for skill in store.list_skills()? {
+        if !is_auto_update_eligible(store, &skill)? {
+            continue;
+        }
+        if skill.source_type == "local" {
+            local_skill_count += 1;
+            if skill
+                .source_ref
+                .as_deref()
+                .map(is_macos_protected_user_path)
+                .unwrap_or(false)
+            {
+                protected_local_skill_count += 1;
+            }
+        }
+        entries.push(AutoUpdateSkillProgress {
             skill_id: skill.id,
             name: skill.name,
             reason: None,
-        })
-        .collect::<Vec<_>>();
-    skills.sort_by(|a, b| a.skill_id.cmp(&b.skill_id));
-    Ok(skills)
+        });
+    }
+    entries.sort_by(|a, b| a.skill_id.cmp(&b.skill_id));
+    Ok(AutoUpdateSkillSelection {
+        entries,
+        local_skill_count,
+        protected_local_skill_count,
+    })
 }
 
-fn count_local_auto_update_skills(store: &SkillStore) -> Result<(usize, usize)> {
-    let mut local_count = 0;
-    let mut protected_count = 0;
-    for skill in store.list_skills()? {
-        if skill.source_type != "local" {
-            continue;
-        }
-        local_count += 1;
-        if skill
-            .source_ref
-            .as_deref()
-            .map(is_macos_protected_user_path)
-            .unwrap_or(false)
-        {
-            protected_count += 1;
-        }
+fn is_auto_update_eligible(store: &SkillStore, skill: &SkillRecord) -> Result<bool> {
+    if !skill.enabled || (skill.source_type != "git" && skill.source_type != "local") {
+        return Ok(false);
     }
-    Ok((local_count, protected_count))
+    if skill.has_unbound_local_source() {
+        return Ok(false);
+    }
+    if skill.source_type != "local" {
+        return Ok(true);
+    }
+    let Some(source_ref) = skill.source_ref.as_deref() else {
+        return Ok(true);
+    };
+    let source_path = std::path::Path::new(source_ref);
+    let source_is_managed_target = store
+        .list_skill_targets(&skill.id)?
+        .iter()
+        .any(|target| std::path::Path::new(&target.target_path) == source_path);
+    Ok(!source_is_managed_target)
 }
 
 fn is_macos_protected_user_path(path: &str) -> bool {

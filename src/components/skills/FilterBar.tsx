@@ -1,6 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowUpDown, Check, CheckSquare, ChevronDown, Search, Tags } from 'lucide-react'
 import type { TFunction } from 'i18next'
+import SelectMenu from '../common/SelectMenu'
 import type { SkillListMode } from './skillListMode'
 import type { TagWithCountDto } from './types'
 
@@ -61,6 +62,10 @@ const FilterBar = ({
     { value: 'global', label: t('scope.global') },
     { value: 'project', label: t('scope.project') },
   ]
+  const sortOptions: { value: 'updated' | 'name'; label: string }[] = [
+    { value: 'updated', label: t('sortUpdated') },
+    { value: 'name', label: t('sortName') },
+  ]
   const selectedTagSet = useMemo(() => new Set(selectedTagIds), [selectedTagIds])
   const selectedCount = selectedTagIds.length + (includeUntagged ? 1 : 0)
   const filteredTags = useMemo(() => {
@@ -105,35 +110,25 @@ const FilterBar = ({
         </button>
       </div>
       <div className="filter-actions">
-        <button className="btn btn-secondary sort-btn" type="button">
-          {scopeOptions.find((option) => option.value === scopeFilter)?.label ?? t('scope.all')}
-          <ChevronDown size={12} />
-          <select
-            aria-label={t('scope.filterLabel')}
-            value={scopeFilter}
-            onChange={(event) =>
-              onScopeFilterChange(event.target.value as 'all' | 'global' | 'project')
-            }
-          >
-            {scopeOptions.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </button>
-        <button className="btn btn-secondary sort-btn" type="button">
-          {sortBy === 'updated' ? t('sortUpdated') : t('sortName')}
-          <ArrowUpDown size={12} />
-          <select
-            aria-label={t('filterSort')}
-            value={sortBy}
-            onChange={(event) => onSortChange(event.target.value as 'updated' | 'name')}
-          >
-            <option value="updated">{t('sortUpdated')}</option>
-            <option value="name">{t('sortName')}</option>
-          </select>
-        </button>
+        <SelectMenu
+          className="filter-select-menu"
+          value={scopeFilter}
+          options={scopeOptions}
+          onChange={(value) =>
+            onScopeFilterChange(value as 'all' | 'global' | 'project')
+          }
+          ariaLabel={t('scope.filterLabel')}
+          menuMinWidth={150}
+        />
+        <SelectMenu
+          className="filter-select-menu"
+          value={sortBy}
+          options={sortOptions}
+          onChange={(value) => onSortChange(value as 'updated' | 'name')}
+          ariaLabel={t('filterSort')}
+          leadingIcon={<ArrowUpDown size={13} />}
+          menuMinWidth={140}
+        />
         <button
           className={`btn btn-secondary bulk-mode-btn${bulkMode ? ' active' : ''}`}
           type="button"

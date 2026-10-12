@@ -5,11 +5,13 @@ import {
   RefreshCw,
 } from 'lucide-react'
 import type { TFunction } from 'i18next'
+import SelectMenu from '../common/SelectMenu'
 import type { AutoUpdateConfigDto, ManagedSkill } from './types'
 import {
   getAutoUpdateTaskStatusKey,
   isAutoUpdatePossiblyStalled,
   parseAutoUpdateFailureItems,
+  summarizeAutoUpdateErrors,
 } from './autoUpdateSettings'
 
 type AutoUpdateScheduleType = 'interval' | 'daily'
@@ -64,14 +66,14 @@ const UpdatesPage = ({
   const autoUpdateHasProtectedLocalSkills =
     (autoUpdateConfig?.protected_local_skill_count ?? 0) > 0
   const autoUpdateRunning = autoUpdateConfig?.last_status === 'running'
-  const updateableSkills = skills.filter(
+  const sourceSkills = skills.filter(
     (skill) => skill.source_type === 'git' || skill.source_type === 'local',
   )
-  const gitSkillCount = updateableSkills.filter(
-    (skill) => skill.source_type === 'git',
-  ).length
-  const localSkillCount = updateableSkills.length - gitSkillCount
-  const disabledSkillCount = updateableSkills.filter(
+  const eligibleSkillCount = autoUpdateConfig?.eligible_skill_count ??
+    sourceSkills.filter((skill) => skill.enabled !== false).length
+  const localSkillCount = autoUpdateConfig?.local_skill_count ?? 0
+  const gitSkillCount = Math.max(0, eligibleSkillCount - localSkillCount)
+  const disabledSkillCount = sourceSkills.filter(
     (skill) => skill.enabled === false,
   ).length
 
@@ -134,6 +136,11 @@ const UpdatesPage = ({
           running: null,
           pending: [],
         }
+  const autoUpdateErrorText = autoUpdateConfig?.last_error ||
+    autoUpdateProgressForDisplay.failed
+      .map((item) => `${item.skill_id}: ${item.reason ?? ''}`)
+      .join('\n')
+  const autoUpdateErrorSummary = summarizeAutoUpdateErrors(autoUpdateErrorText)
   const autoUpdateStatusClass =
     autoUpdateConfig?.last_status === 'error'
       ? 'error'
@@ -162,8 +169,8 @@ const UpdatesPage = ({
         : ''
 
   const handleCopyAutoUpdateError = async () => {
-    if (!autoUpdateConfig?.last_error) return
-    await navigator.clipboard.writeText(autoUpdateConfig.last_error)
+    if (!autoUpdateErrorText) return
+    await navigator.clipboard.writeText(autoUpdateErrorText)
   }
 
   return (
@@ -263,20 +270,29 @@ const UpdatesPage = ({
                       }
                     }}
                   />
-                  <select
-                    className="settings-select settings-unit-select"
+                  <SelectMenu
+                    className="settings-unit-select"
                     value={autoUpdateIntervalUnit}
-                    onChange={(event) => {
-                      const nextUnit = event.target.value as AutoUpdateIntervalUnit
+                    options={[
+                      {
+                        value: 'minutes',
+                        label: t('autoUpdateIntervalUnitMinutes'),
+                      },
+                      {
+                        value: 'hours',
+                        label: t('autoUpdateIntervalUnitHours'),
+                      },
+                    ]}
+                    onChange={(value) => {
+                      const nextUnit = value as AutoUpdateIntervalUnit
                       onAutoUpdateConfigChange(autoUpdateEnabled, {
                         ...autoUpdateSchedule,
                         intervalUnit: nextUnit,
                       })
                     }}
-                  >
-                    <option value="minutes">{t('autoUpdateIntervalUnitMinutes')}</option>
-                    <option value="hours">{t('autoUpdateIntervalUnitHours')}</option>
-                  </select>
+                    ariaLabel={t('autoUpdateIntervalUnitLabel')}
+                    menuMinWidth={140}
+                  />
                 </>
               ) : (
                 <input
@@ -296,7 +312,7 @@ const UpdatesPage = ({
               <button
                 className="btn btn-primary updates-run-btn"
                 type="button"
-                disabled={autoUpdateButtonBusy || updateableSkills.length === 0}
+                disabled={autoUpdateButtonBusy || eligibleSkillCount === 0}
                 onClick={() => setConfirmUpdateOpen(true)}
               >
                 <RefreshCw size={15} />
@@ -304,7 +320,7 @@ const UpdatesPage = ({
                   ? t('autoUpdateRunningButton')
                   : autoUpdateStalled
                     ? t('autoUpdateRetryUpdate')
-                    : t('autoUpdateRunAll', { count: updateableSkills.length })}
+                    : t('autoUpdateRunAll', { count: eligibleSkillCount })}
               </button>
             </div>
             <div className="updates-schedule-hint">{autoUpdateScheduleHint}</div>
@@ -371,42 +387,66 @@ const UpdatesPage = ({
         ) : null}
         {autoUpdateProgressForDisplay.failed.length > 0 ? (
           <div className="updates-issue-block">
-            <div className="updates-section-label">
-              <AlertTriangle size={15} />
-              {t('autoUpdateIssuesTitle')}
+            <div className="updates-issue-head">
+              <div className="updates-section-label">
+                <AlertTriangle size={15} />
+                {t('autoUpdateIssuesTitle')}
+              </div>
+              <strong>
+                {t('autoUpdateErrorSummary', {
+                  count: autoUpdateProgressForDisplay.failed.length,
+                })}
+              </strong>
             </div>
-            <div className="updates-issue-list">
-              {autoUpdateProgressForDisplay.failed.map((item) => (
-                <div className="updates-issue-item" key={item.skill_id}>
-                  <strong>{item.name || item.skill_id}</strong>
-                  {item.reason ? <code>{item.reason}</code> : null}
+            <div className="updates-error-summary-list">
+              {autoUpdateErrorSummary.summaries.map((summary) => (
+                <div key={summary.key}>
+                  <span>{t(summary.key, { count: summary.count })}</span>
+                  <strong>{summary.count}</strong>
                 </div>
               ))}
             </div>
-            {autoUpdateConfig?.last_error ? (
+            <details className="updates-error-details">
+              <summary>
+                {t('autoUpdateFailedItems', {
+                  count: autoUpdateProgressForDisplay.failed.length,
+                })}
+              </summary>
+              <div className="updates-issue-list">
+                {autoUpdateProgressForDisplay.failed.map((item) => (
+                  <div className="updates-issue-item" key={item.skill_id}>
+                    <strong>{item.name || item.skill_id}</strong>
+                    {item.reason ? <code>{item.reason}</code> : null}
+                  </div>
+                ))}
+              </div>
+            </details>
+            <div className="updates-issue-actions">
+              {autoUpdateErrorText ? (
+                <button
+                  className="btn btn-secondary btn-sm"
+                  type="button"
+                  onClick={() => {
+                    void handleCopyAutoUpdateError()
+                  }}
+                >
+                  {t('copyDetails')}
+                </button>
+              ) : null}
               <button
                 className="btn btn-secondary btn-sm"
                 type="button"
-                onClick={() => {
-                  void handleCopyAutoUpdateError()
-                }}
+                disabled={autoUpdateButtonBusy}
+                onClick={() =>
+                  onRetrySkills(
+                    autoUpdateProgressForDisplay.failed.map((item) => item.skill_id),
+                  )
+                }
               >
-                {t('copyDetails')}
+                <RefreshCw size={14} />
+                {t('autoUpdateRetryFailed')}
               </button>
-            ) : null}
-            <button
-              className="btn btn-secondary btn-sm"
-              type="button"
-              disabled={autoUpdateButtonBusy}
-              onClick={() =>
-                onRetrySkills(
-                  autoUpdateProgressForDisplay.failed.map((item) => item.skill_id),
-                )
-              }
-            >
-              <RefreshCw size={14} />
-              {t('autoUpdateRetryFailed')}
-            </button>
+            </div>
           </div>
         ) : null}
         {autoUpdateHasLocalSkills ? (
@@ -433,7 +473,7 @@ const UpdatesPage = ({
           >
             <div className="modal-header">
               <div className="modal-title" id="auto-update-confirm-title">
-                {t('autoUpdateConfirmTitle', { count: updateableSkills.length })}
+                {t('autoUpdateConfirmTitle', { count: eligibleSkillCount })}
               </div>
             </div>
             <div className="modal-body">
@@ -456,14 +496,14 @@ const UpdatesPage = ({
               <button
                 className="btn btn-primary"
                 type="button"
-                disabled={updateableSkills.length === 0}
+                disabled={eligibleSkillCount === 0}
                 onClick={() => {
                   setConfirmUpdateOpen(false)
                   onRunAutoUpdateNow()
                 }}
               >
                 <RefreshCw size={15} />
-                {t('autoUpdateConfirmAction', { count: updateableSkills.length })}
+                {t('autoUpdateConfirmAction', { count: eligibleSkillCount })}
               </button>
             </div>
           </div>

@@ -1,12 +1,19 @@
 import { memo, useMemo, useState } from 'react'
-import { AlertTriangle, CheckCircle2, Download, Search, Wrench } from 'lucide-react'
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Download,
+  EyeOff,
+  Search,
+  Wrench,
+} from 'lucide-react'
 import type { TFunction } from 'i18next'
 import {
   getDiscoveredHubResolutionKey,
   getDiscoveredImportDecision,
   type DiscoveredHubResolution,
 } from '../discoveredImportResolution'
-import type { OnboardingPlan } from '../types'
+import type { OnboardingGroup, OnboardingPlan } from '../types'
 
 type ImportModalProps = {
   open: boolean
@@ -16,6 +23,7 @@ type ImportModalProps = {
   variantChoice: Record<string, string>
   hubResolutions: Record<string, DiscoveredHubResolution | undefined>
   reservedSkillNames: string[]
+  ignoringGroupName: string | null
   onRequestClose: () => void
   onToggleGroup: (groupName: string, checked: boolean) => void
   onSelectVariant: (groupName: string, path: string) => void
@@ -23,6 +31,7 @@ type ImportModalProps = {
     groupName: string,
     resolution: DiscoveredHubResolution,
   ) => void
+  onIgnoreGroup: (group: OnboardingGroup) => void
   onImport: () => void
   t: TFunction
 }
@@ -35,10 +44,12 @@ const ImportModal = ({
   variantChoice,
   hubResolutions,
   reservedSkillNames,
+  ignoringGroupName,
   onRequestClose,
   onToggleGroup,
   onSelectVariant,
   onResolveHubConflict,
+  onIgnoreGroup,
   onImport,
   t,
 }: ImportModalProps) => {
@@ -227,6 +238,16 @@ const ImportModal = ({
                     {group.hub_skill && group.has_conflict ? (
                       <span className="badge danger">{t('sourcesConflict')}</span>
                     ) : null}
+                    <button
+                      className="icon-btn discovered-ignore-btn"
+                      type="button"
+                      onClick={() => onIgnoreGroup(group)}
+                      disabled={loading || ignoringGroupName === group.name}
+                      title={t('ignoreDiscovered')}
+                      aria-label={t('ignoreDiscovered')}
+                    >
+                      <EyeOff size={15} />
+                    </button>
                   </div>
                 </div>
                 <div className="group-variants">

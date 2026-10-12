@@ -1232,3 +1232,38 @@ fn collect_skill_dirs_deduplicates_known_root_containers() {
     assert_eq!(dirs.len(), 1);
     assert!(dirs[0].ends_with("skills/technical-writer"));
 }
+
+#[test]
+fn clone_retry_does_not_duplicate_the_same_error() {
+    let message = "system git is required for sparse checkout";
+    let combined =
+        super::combine_clone_retry_error(anyhow::anyhow!(message), anyhow::anyhow!(message));
+    let text = format!("{:#}", combined);
+    assert_eq!(text, message);
+    assert_eq!(text.matches(message).count(), 1);
+}
+
+#[test]
+fn clone_retry_keeps_a_distinct_first_cause_once() {
+    let combined = super::combine_clone_retry_error(
+        anyhow::anyhow!("git clone failed: corrupt index"),
+        anyhow::anyhow!("git fetch failed: connection reset"),
+    );
+    let text = format!("{:#}", combined);
+    assert!(text.contains("首次拉取失败：git clone failed: corrupt index"));
+    assert!(text.contains("git fetch failed: connection reset"));
+    assert_eq!(text.matches("corrupt index").count(), 1);
+    assert_eq!(text.matches("connection reset").count(), 1);
+}
+
+#[test]
+fn deterministic_git_failure_is_not_retried() {
+    let missing = anyhow::anyhow!("子目录 Skill 需要系统 git 才能做 sparse checkout");
+    assert!(!super::git_cache_retry_could_help(&missing));
+    let legacy = anyhow::anyhow!("system git is required for sparse checkout");
+    assert!(!super::git_cache_retry_could_help(&legacy));
+    let cancelled = anyhow::anyhow!("CANCELLED|操作已被用户取消。");
+    assert!(!super::git_cache_retry_could_help(&cancelled));
+    let transient = anyhow::anyhow!("git fetch failed: connection reset");
+    assert!(super::git_cache_retry_could_help(&transient));
+}

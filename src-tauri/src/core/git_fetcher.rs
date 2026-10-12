@@ -111,7 +111,10 @@ pub fn clone_or_pull_sparse(
     }
 
     if resolve_git_bin().is_none() {
-        anyhow::bail!("system git is required for sparse checkout");
+        anyhow::bail!(
+            "{}",
+            format_sparse_checkout_git_required(git_resolution().unavailable_detail.as_deref())
+        );
     }
 
     // Ensure parent exists so `git clone` can create dest.
@@ -289,55 +292,126 @@ fn git_fetch_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-static GIT_BIN: OnceLock<Option<String>> = OnceLock::new();
-
-fn resolve_git_bin() -> Option<String> {
-    GIT_BIN
-        .get_or_init(|| {
-            // Allow overriding from environment for debugging / enterprise setups.
-            for key in ["SKILLS_HUB_GIT_BIN", "SKILLS_HUB_GIT_PATH"] {
-                if let Ok(v) = std::env::var(key) {
-                    let v = v.trim().to_string();
-                    if !v.is_empty() && git_bin_works(&v) {
-                        log::info!("[git_fetcher] using git bin from {}: {}", key, v);
-                        return Some(v);
-                    }
-                }
-            }
-
-            // Try PATH lookup first (works in dev; sometimes missing in macOS bundles).
-            if git_bin_works("git") {
-                log::info!("[git_fetcher] using git bin from PATH: git");
-                return Some("git".to_string());
-            }
-
-            // Common macOS locations (system git and Homebrew).
-            for cand in [
-                "/usr/bin/git",
-                "/opt/homebrew/bin/git",
-                "/usr/local/bin/git",
-            ] {
-                if git_bin_works(cand) {
-                    log::info!("[git_fetcher] using git bin: {}", cand);
-                    return Some(cand.to_string());
-                }
-            }
-
-            log::warn!("[git_fetcher] no usable git binary found");
-            None
-        })
-        .clone()
+struct GitResolution {
+    bin: Option<String>,
+    unavailable_detail: Option<String>,
 }
 
-fn git_bin_works(bin: &str) -> bool {
-    Command::new(bin)
+enum GitProbe {
+    Ok,
+    Missing,
+    Failed(String),
+}
+
+static GIT_BIN: OnceLock<GitResolution> = OnceLock::new();
+
+fn git_resolution() -> &'static GitResolution {
+    GIT_BIN.get_or_init(detect_git_bin)
+}
+
+fn resolve_git_bin() -> Option<String> {
+    git_resolution().bin.clone()
+}
+
+fn detect_git_bin() -> GitResolution {
+    let mut failure: Option<String> = None;
+    let mut try_bin = |bin: &str| -> bool {
+        match probe_git_bin(bin) {
+            GitProbe::Ok => true,
+            GitProbe::Missing => false,
+            GitProbe::Failed(detail) => {
+                if failure.is_none() {
+                    failure = Some(detail);
+                }
+                false
+            }
+        }
+    };
+
+    // Allow overriding from environment for debugging / enterprise setups.
+    for key in ["SKILLS_HUB_GIT_BIN", "SKILLS_HUB_GIT_PATH"] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim();
+            if !v.is_empty() && try_bin(v) {
+                log::info!("[git_fetcher] using git bin from {}: {}", key, v);
+                return GitResolution {
+                    bin: Some(v.to_string()),
+                    unavailable_detail: None,
+                };
+            }
+        }
+    }
+
+    // Try PATH lookup first (works in dev; sometimes missing in macOS bundles).
+    if try_bin("git") {
+        log::info!("[git_fetcher] using git bin from PATH: git");
+        return GitResolution {
+            bin: Some("git".to_string()),
+            unavailable_detail: None,
+        };
+    }
+
+    // Common macOS locations (system git and Homebrew).
+    for cand in [
+        "/usr/bin/git",
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git",
+    ] {
+        if try_bin(cand) {
+            log::info!("[git_fetcher] using git bin: {}", cand);
+            return GitResolution {
+                bin: Some(cand.to_string()),
+                unavailable_detail: None,
+            };
+        }
+    }
+
+    log::warn!("[git_fetcher] no usable git binary found");
+    GitResolution {
+        bin: None,
+        unavailable_detail: failure,
+    }
+}
+
+fn probe_git_bin(bin: &str) -> GitProbe {
+    match Command::new(bin)
         .arg("--version")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    {
+        Ok(output) if output.status.success() => GitProbe::Ok,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                format!("exit status {}", output.status)
+            };
+            GitProbe::Failed(format!("{bin}: {detail}"))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => GitProbe::Missing,
+        Err(err) => GitProbe::Failed(format!("{bin}: {err}")),
+    }
+}
+
+fn format_sparse_checkout_git_required(detail: Option<&str>) -> String {
+    let detail = detail.unwrap_or("").trim();
+    let lower = detail.to_lowercase();
+    if lower.contains("xcode") && lower.contains("license") {
+        format!(
+            "子目录 Skill 需要系统 git 才能做 sparse checkout，但系统 git 无法运行：尚未同意 Xcode 许可协议。请在终端执行 `sudo xcodebuild -license` 同意后再重试。详细：{detail}"
+        )
+    } else if detail.is_empty() {
+        "子目录 Skill 需要系统 git 才能做 sparse checkout，但没有找到可用的 git。请安装 Git，或设置环境变量 SKILLS_HUB_GIT_BIN 指向 git 可执行文件。"
+            .to_string()
+    } else {
+        format!(
+            "子目录 Skill 需要系统 git 才能做 sparse checkout，但当前 git 无法使用。详细：{detail}"
+        )
+    }
 }
 
 fn git_cmd(proxy_url: Option<&str>) -> Command {

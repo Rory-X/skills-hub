@@ -5,6 +5,7 @@ mod services;
 use std::sync::Arc;
 
 use core::cancel_token::CancelToken;
+use core::prompt_watch::PromptWatchService;
 use core::runtime_paths::{RuntimePaths, RuntimeProfile};
 use core::skill_store::{default_db_path, migrate_legacy_db_if_needed, SkillStore};
 use tauri::Manager;
@@ -99,6 +100,7 @@ pub fn run() {
             app.manage(paths.clone());
             app.manage(store.clone());
             app.manage(Arc::new(CancelToken::new()));
+            app.manage(Arc::new(PromptWatchService::default()));
 
             let repair_store = store.clone();
             let repair_paths = paths.clone();
@@ -127,6 +129,31 @@ pub fn run() {
             let backfilled_hashes = core::installer::backfill_skill_content_hashes(&store);
             if backfilled_hashes > 0 {
                 log::info!("backfilled content hashes for {backfilled_hashes} skills");
+            }
+
+            match commands::runtime_project_tool_specs(&store) {
+                Ok(specs) => {
+                    let (reconciled, failed) =
+                        core::skill_templates::reconcile_all_project_templates(&store, &specs);
+                    if reconciled > 0 || failed > 0 {
+                        log::info!(
+                            "reconciled project Skill templates at startup: reconciled={reconciled}, failed={failed}"
+                        );
+                    }
+                }
+                Err(err) => log::warn!("prepare startup Skill template reconciliation: {err:#}"),
+            }
+            match commands::assignment_tool_specs(&store) {
+                Ok(tools) => match core::assignments::cleanup_orphaned_skill_symlinks(
+                    &store, &tools,
+                ) {
+                    Ok(removed) if removed > 0 => {
+                        log::info!("removed {removed} orphaned managed Skill link(s) at startup")
+                    }
+                    Ok(_) => {}
+                    Err(err) => log::warn!("clean orphaned Skill links at startup: {err:#}"),
+                },
+                Err(err) => log::warn!("prepare startup Skill link cleanup: {err:#}"),
             }
 
             // Best-effort cleanup of our own old git temp directories.
@@ -182,6 +209,7 @@ pub fn run() {
             commands::get_recent_projects,
             commands::save_recent_project,
             commands::list_projects,
+            commands::delete_project,
             commands::import_project,
             commands::scan_project,
             commands::update_project_settings,
@@ -191,6 +219,20 @@ pub fn run() {
             commands::ignore_project_issue,
             commands::ignore_all_project_issues,
             commands::collect_project_skill,
+            commands::list_skill_templates,
+            commands::get_skill_template,
+            commands::create_skill_template,
+            commands::update_skill_template,
+            commands::archive_skill_template,
+            commands::delete_skill_template,
+            commands::list_skill_template_revisions,
+            commands::rollback_skill_template,
+            commands::preview_project_template_change,
+            commands::apply_project_template,
+            commands::detach_project_template,
+            commands::update_snapshot_project_template,
+            commands::retry_project_template,
+            commands::resolve_project_template_conflict,
             commands::get_tool_config,
             commands::set_tool_config,
             commands::get_tool_status,
@@ -205,6 +247,7 @@ pub fn run() {
             commands::retry_auto_update_skills,
             commands::trigger_auto_update_task_now_cmd,
             commands::get_onboarding_plan,
+            commands::ignore_discovered_skill,
             commands::install_local,
             commands::list_local_skills_cmd,
             commands::install_local_selection,
@@ -244,6 +287,18 @@ pub fn run() {
             commands::read_skill_file,
             commands::list_skill_preview,
             commands::read_skill_preview_file,
+            commands::list_prompt_profiles,
+            commands::save_prompt_profiles,
+            commands::list_prompt_sources,
+            commands::read_prompt_document,
+            commands::save_prompt_document,
+            commands::delete_prompt_document,
+            commands::list_prompt_revisions,
+            commands::read_prompt_revision,
+            commands::restore_prompt_revision,
+            commands::resolve_prompt_instruction_chain,
+            commands::start_prompt_watch,
+            commands::stop_prompt_watch,
             commands::cancel_current_operation,
             commands::get_device_sync_config,
             commands::save_device_sync_config,

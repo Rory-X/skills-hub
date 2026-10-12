@@ -9,7 +9,10 @@ use super::skill_store::SkillStore;
 
 const CENTRAL_DIR_NAME: &str = ".skillshub";
 
-pub fn resolve_central_repo_from_runtime(paths: &RuntimePaths, store: &SkillStore) -> Result<PathBuf> {
+pub fn resolve_central_repo_from_runtime(
+    paths: &RuntimePaths,
+    store: &SkillStore,
+) -> Result<PathBuf> {
     if let Some(path) = store.get_setting("central_repo_path")? {
         return Ok(PathBuf::from(path));
     }

@@ -1,12 +1,15 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::core::assignments::{
     apply_project_skill_assignments as apply_project_skill_assignments_core,
-    apply_skill_assignments as apply_skill_assignments_core,
+    apply_skill_assignments as apply_skill_assignments_core, cleanup_orphaned_skill_symlinks,
+    disable_skill_atomically as disable_skill_atomically_core,
+    enable_skill_and_restore as enable_skill_and_restore_core,
     ignore_all_assignment_issues as ignore_all_assignment_issues_core,
     ignore_assignment_issue as ignore_assignment_issue_core, managed_skill_projections,
     preview_project_skill_assignments as preview_project_skill_assignments_core,
@@ -29,7 +32,9 @@ use crate::core::cache_cleanup::{
     set_git_cache_ttl_secs as set_git_cache_ttl_secs_core,
 };
 use crate::core::cancel_token::CancelToken;
-use crate::core::central_repo::{ensure_central_repo, resolve_central_repo_from_runtime, resolve_central_repo_path};
+use crate::core::central_repo::{
+    ensure_central_repo, resolve_central_repo_from_runtime, resolve_central_repo_path,
+};
 use crate::core::featured_skills::{fetch_featured_skills, FeaturedSkill};
 use crate::core::github_search::{search_github_repos, RepoSummary};
 use crate::core::installer::{
@@ -44,7 +49,9 @@ use crate::core::network_proxy::{
     set_github_proxy_config as set_github_proxy_config_core,
     set_github_proxy_url as set_github_proxy_url_core, GithubProxyConfig,
 };
-use crate::core::onboarding::{build_onboarding_plan, OnboardingPlan};
+use crate::core::onboarding::{
+    build_onboarding_plan, ignore_discovered_skill as ignore_discovered_skill_core, OnboardingPlan,
+};
 use crate::core::projects::{
     build_project_detail_data, build_project_summary_data, collect_project_skill_and_scan,
     ignore_all_project_issues_and_scan, ignore_project_issue_and_scan, import_project_and_scan,
@@ -52,11 +59,45 @@ use crate::core::projects::{
     repair_project_issue_and_scan, update_project_and_scan, visible_project_issue_projections,
     ProjectIssue, ProjectIssueProjection, ProjectToolSpec,
 };
+use crate::core::prompt_adapters::{
+    list_prompt_profiles as list_prompt_profiles_core,
+    save_custom_prompt_profiles as save_prompt_profiles_core, PromptProfile, PromptProfileInput,
+};
+use crate::core::prompt_watch::{build_prompt_watch_plan, PromptWatchService, PromptWatchStatus};
+use crate::core::prompts::{
+    delete_prompt_document as delete_prompt_document_core,
+    list_prompt_revision_summaries as list_prompt_revisions_core,
+    list_prompt_sources as list_prompt_sources_core,
+    read_authorized_prompt_document as read_prompt_document_core,
+    read_prompt_revision as read_prompt_revision_core,
+    resolve_prompt_instruction_chain as resolve_prompt_instruction_chain_core,
+    restore_prompt_revision as restore_prompt_revision_core,
+    save_prompt_document as save_prompt_document_core, PromptDeleteRequest, PromptDocument,
+    PromptFileRequest, PromptInstructionChain, PromptMutationResult, PromptRestoreRequest,
+    PromptRevisionDocument, PromptRevisionSummary, PromptSaveRequest, PromptScenario, PromptSource,
+};
 use crate::core::skill_files::FileContent;
 use crate::core::skill_preview::{
     list_preview_files, read_preview_file, resolve_preview_root, PreviewSource,
 };
 use crate::core::skill_store::{ProjectRecord, SkillStore};
+use crate::core::skill_templates::{
+    apply_project_template as apply_project_template_core,
+    create_skill_template as create_skill_template_core,
+    delete_skill_template as delete_skill_template_core,
+    detach_project_template as detach_project_template_core,
+    get_skill_template as get_skill_template_core,
+    list_skill_template_revisions as list_skill_template_revisions_core,
+    list_skill_templates as list_skill_templates_core,
+    preview_project_template_change as preview_project_template_change_core,
+    resolve_project_template_conflict as resolve_project_template_conflict_core,
+    retry_project_template as retry_project_template_core,
+    rollback_skill_template as rollback_skill_template_core,
+    set_skill_template_archived as set_skill_template_archived_core,
+    update_skill_template as update_skill_template_core,
+    update_snapshot_project_template as update_snapshot_project_template_core, SkillTemplateView,
+    TemplateDiff, TemplateMutationResult, TemplateReconcileResult,
+};
 use crate::core::skills_search::{
     search_skills_online as search_skills_online_core, OnlineSkillResult,
 };
@@ -66,10 +107,10 @@ use crate::core::system_scheduler::{
     trigger_auto_update_task_now, uninstall_auto_update_task,
 };
 use crate::core::tool_adapters::{
-    is_builtin_tool_enabled, is_tool_installed, load_tool_config, project_relative_skills_dir,
-    resolve_default_path, save_tool_config, supports_project_scope, CustomToolConfig, ToolConfig,
+    adapter_by_key, is_builtin_tool_enabled, is_tool_installed, load_tool_config,
+    project_discovery_skills_dirs, project_relative_skills_dir, resolve_default_path,
+    save_tool_config, supports_project_scope, CustomToolConfig, ToolConfig,
 };
-
 
 use crate::core::device_sync::credentials::{
     resolve_access_token_with_proxy, save_personal_access_token, CredentialStore,
@@ -94,7 +135,6 @@ const DEVICE_SYNC_PENDING_OAUTH_SETTING: &str = "device_sync_pending_oauth_v1";
 const DEVICE_SYNC_CREDENTIAL_CLEANUP_QUEUE_SETTING: &str =
     "device_sync_credential_cleanup_queue_v1";
 
-
 fn acquire_operation_lock<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     kind: OperationKind,
@@ -115,6 +155,13 @@ fn format_anyhow_error(err: anyhow::Error) -> String {
         || first.starts_with("TOOL_NOT_INSTALLED|")
         || first.starts_with("PROJECT_LIBRARY_NAME_REQUIRED|")
         || first.starts_with("HUB_NAME_CONFLICT|")
+        || first.starts_with("PROMPT_CONFLICT|")
+        || first.starts_with("PROMPT_EXTERNAL_CONFIRMATION_REQUIRED|")
+        || first.starts_with("PROMPT_NOT_FOUND|")
+        || first.starts_with("PROMPT_PATH_OUTSIDE_PROJECT|")
+        || first.starts_with("PROMPT_READ_ONLY|")
+        || first.starts_with("PROMPT_TOO_LARGE|")
+        || first.starts_with("SKILL_IN_USE|")
     {
         return first;
     }
@@ -322,7 +369,23 @@ pub async fn set_tool_config(
 ) -> Result<ToolConfigDto, String> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        save_tool_config(&store, config.into()).map(ToolConfigDto::from)
+        let saved = save_tool_config(&store, config.into())?;
+        match runtime_project_tool_specs(&store) {
+            Ok(specs) => {
+                let _ =
+                    crate::core::skill_templates::reconcile_all_project_templates(&store, &specs);
+            }
+            Err(err) => log::warn!("prepare template reconciliation after tool change: {err:#}"),
+        }
+        match assignment_tool_specs(&store) {
+            Ok(tools) => {
+                if let Err(err) = cleanup_orphaned_skill_symlinks(&store, &tools) {
+                    log::warn!("clean orphaned Skill links after tool change: {err:#}");
+                }
+            }
+            Err(err) => log::warn!("prepare Skill link cleanup after tool change: {err:#}"),
+        }
+        Ok::<_, anyhow::Error>(ToolConfigDto::from(saved))
     })
     .await
     .map_err(|err| err.to_string())?
@@ -396,6 +459,18 @@ pub async fn get_onboarding_plan(
 }
 
 #[tauri::command]
+pub async fn ignore_discovered_skill(
+    store: State<'_, SkillStore>,
+    paths: Vec<String>,
+) -> Result<usize, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || ignore_discovered_skill_core(&store, &paths))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
 pub async fn get_git_cache_cleanup_days(store: State<'_, SkillStore>) -> Result<i64, String> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -459,6 +534,7 @@ pub struct AutoUpdateConfigDto {
     pub interval_value: i64,
     pub interval_unit: String,
     pub daily_time: String,
+    pub eligible_skill_count: usize,
     pub local_skill_count: usize,
     pub protected_local_skill_count: usize,
     pub task_registered: bool,
@@ -545,6 +621,7 @@ pub async fn set_auto_update_config(
                 enabled,
                 interval_hours: intervalHours,
                 schedule,
+                eligible_skill_count: existing.eligible_skill_count,
                 local_skill_count: existing.local_skill_count,
                 protected_local_skill_count: existing.protected_local_skill_count,
                 last_run_at: existing.last_run_at,
@@ -698,6 +775,114 @@ pub struct ProjectSummaryDto {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct TemplateSkillDto {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TemplateProjectLinkDto {
+    pub project_id: String,
+    pub project_name: String,
+    pub project_root: String,
+    pub applied_revision_id: String,
+    pub snapshot_outdated: bool,
+    pub sync_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SkillTemplateDto {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub mode: String,
+    pub archived: bool,
+    pub current_revision_id: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub skills: Vec<TemplateSkillDto>,
+    pub linked_projects: Vec<TemplateProjectLinkDto>,
+    pub failure_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SkillTemplateRevisionDto {
+    pub id: String,
+    pub template_id: String,
+    pub revision_number: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub created_at: i64,
+    pub skills: Vec<TemplateRevisionSkillDto>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TemplateRevisionSkillDto {
+    pub skill_id: String,
+    pub skill_name: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TemplateDiffDto {
+    pub added: Vec<TemplateSkillDto>,
+    pub removed: Vec<TemplateSkillDto>,
+    pub retained: Vec<TemplateSkillDto>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TemplateMutationResultDto {
+    pub template: Option<SkillTemplateDto>,
+    pub membership_changed: bool,
+    pub reconciled_projects: usize,
+    pub failed_projects: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TemplateReconcileResultDto {
+    pub project_id: String,
+    pub template_id: String,
+    pub applied_revision_id: String,
+    pub succeeded: usize,
+    pub failed: Vec<TemplateFailureDto>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TemplateFailureDto {
+    pub skill_id: String,
+    pub tool: String,
+    pub kind: String,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CreateSkillTemplateDto {
+    pub name: String,
+    pub description: Option<String>,
+    pub mode: String,
+    pub skill_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct UpdateSkillTemplateDto {
+    pub name: String,
+    pub description: Option<String>,
+    pub skill_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProjectTemplateBindingDto {
+    pub template_id: String,
+    pub template_name: String,
+    pub mode: String,
+    pub applied_revision_id: String,
+    pub current_revision_id: String,
+    pub snapshot_outdated: bool,
+    pub sync_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct ProjectToolDto {
     pub key: String,
     pub label: String,
@@ -725,6 +910,8 @@ pub struct ProjectSkillDto {
     pub linked_skill_id: Option<String>,
     pub matched_skill_id: Option<String>,
     pub tool_keys: Vec<String>,
+    pub origin_types: Vec<String>,
+    pub additionally_visible_tool_keys: Vec<String>,
     pub paths: Vec<ProjectSkillPathDto>,
 }
 
@@ -761,10 +948,359 @@ pub struct ProjectIssueDto {
 #[derive(Clone, Debug, Serialize)]
 pub struct ProjectDetailDto {
     pub project: ProjectSummaryDto,
+    pub template_binding: Option<ProjectTemplateBindingDto>,
     pub tools: Vec<ProjectToolDto>,
     pub current_skills: Vec<ProjectSkillDto>,
     pub library_skills: Vec<ProjectLibrarySkillDto>,
     pub issues: Vec<ProjectIssueDto>,
+}
+
+fn skill_template_dto(view: SkillTemplateView) -> SkillTemplateDto {
+    let template = view.template;
+    SkillTemplateDto {
+        id: template.id,
+        name: template.name,
+        description: template.description,
+        mode: template.mode,
+        archived: template.archived,
+        current_revision_id: template.current_revision_id,
+        created_at: template.created_at,
+        updated_at: template.updated_at,
+        skills: view
+            .skills
+            .into_iter()
+            .map(|skill| TemplateSkillDto {
+                id: skill.id,
+                name: skill.name,
+                description: skill.description,
+                enabled: skill.enabled,
+            })
+            .collect(),
+        linked_projects: view
+            .linked_projects
+            .into_iter()
+            .map(|project| TemplateProjectLinkDto {
+                project_id: project.project_id,
+                project_name: project.project_name,
+                project_root: project.project_root,
+                applied_revision_id: project.applied_revision_id,
+                snapshot_outdated: project.snapshot_outdated,
+                sync_error: project.sync_error,
+            })
+            .collect(),
+        failure_count: view.failure_count,
+    }
+}
+
+fn template_mutation_dto(result: TemplateMutationResult) -> TemplateMutationResultDto {
+    TemplateMutationResultDto {
+        template: result.template.map(skill_template_dto),
+        membership_changed: result.membership_changed,
+        reconciled_projects: result.reconciled_projects,
+        failed_projects: result.failed_projects,
+    }
+}
+
+fn template_reconcile_dto(result: TemplateReconcileResult) -> TemplateReconcileResultDto {
+    TemplateReconcileResultDto {
+        project_id: result.project_id,
+        template_id: result.template_id,
+        applied_revision_id: result.applied_revision_id,
+        succeeded: result.succeeded,
+        failed: result
+            .failed
+            .into_iter()
+            .map(|failure| TemplateFailureDto {
+                skill_id: failure.skill_id,
+                tool: failure.tool,
+                kind: failure.kind,
+                error: failure.error,
+            })
+            .collect(),
+    }
+}
+
+fn template_diff_dto(diff: TemplateDiff) -> TemplateDiffDto {
+    let map = |skill: crate::core::skill_templates::TemplateSkill| TemplateSkillDto {
+        id: skill.id,
+        name: skill.name,
+        description: skill.description,
+        enabled: skill.enabled,
+    };
+    TemplateDiffDto {
+        added: diff.added.into_iter().map(map).collect(),
+        removed: diff.removed.into_iter().map(map).collect(),
+        retained: diff.retained.into_iter().map(map).collect(),
+    }
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn list_skill_templates(
+    store: State<'_, SkillStore>,
+    includeArchived: bool,
+) -> Result<Vec<SkillTemplateDto>, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        list_skill_templates_core(&store, includeArchived)
+            .map(|templates| templates.into_iter().map(skill_template_dto).collect())
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn get_skill_template(
+    store: State<'_, SkillStore>,
+    templateId: String,
+) -> Result<SkillTemplateDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        get_skill_template_core(&store, &templateId).map(skill_template_dto)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub async fn create_skill_template(
+    store: State<'_, SkillStore>,
+    input: CreateSkillTemplateDto,
+) -> Result<TemplateMutationResultDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        create_skill_template_core(
+            &store,
+            &input.name,
+            input.description.as_deref(),
+            &input.mode,
+            &input.skill_ids,
+        )
+        .map(template_mutation_dto)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn update_skill_template(
+    store: State<'_, SkillStore>,
+    templateId: String,
+    input: UpdateSkillTemplateDto,
+) -> Result<TemplateMutationResultDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let specs = runtime_project_tool_specs(&store)?;
+        update_skill_template_core(
+            &store,
+            &templateId,
+            &input.name,
+            input.description.as_deref(),
+            &input.skill_ids,
+            &specs,
+        )
+        .map(template_mutation_dto)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn archive_skill_template(
+    store: State<'_, SkillStore>,
+    templateId: String,
+    archived: bool,
+) -> Result<SkillTemplateDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        set_skill_template_archived_core(&store, &templateId, archived).map(skill_template_dto)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn delete_skill_template(
+    store: State<'_, SkillStore>,
+    templateId: String,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || delete_skill_template_core(&store, &templateId))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn list_skill_template_revisions(
+    store: State<'_, SkillStore>,
+    templateId: String,
+) -> Result<Vec<SkillTemplateRevisionDto>, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        list_skill_template_revisions_core(&store, &templateId).map(|revisions| {
+            revisions
+                .into_iter()
+                .map(|view| SkillTemplateRevisionDto {
+                    id: view.revision.id,
+                    template_id: view.revision.template_id,
+                    revision_number: view.revision.revision_number,
+                    name: view.revision.name,
+                    description: view.revision.description,
+                    created_at: view.revision.created_at,
+                    skills: view
+                        .skills
+                        .into_iter()
+                        .map(|skill| TemplateRevisionSkillDto {
+                            skill_id: skill.skill_id,
+                            skill_name: skill.skill_name,
+                        })
+                        .collect(),
+                })
+                .collect()
+        })
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn rollback_skill_template(
+    store: State<'_, SkillStore>,
+    templateId: String,
+    revisionId: String,
+) -> Result<TemplateMutationResultDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let specs = runtime_project_tool_specs(&store)?;
+        rollback_skill_template_core(&store, &templateId, &revisionId, &specs)
+            .map(template_mutation_dto)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn preview_project_template_change(
+    store: State<'_, SkillStore>,
+    projectId: String,
+    templateId: Option<String>,
+) -> Result<TemplateDiffDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        preview_project_template_change_core(&store, &projectId, templateId.as_deref())
+            .map(template_diff_dto)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn apply_project_template(
+    store: State<'_, SkillStore>,
+    projectId: String,
+    templateId: String,
+) -> Result<TemplateReconcileResultDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let specs = runtime_project_tool_specs(&store)?;
+        apply_project_template_core(&store, &projectId, &templateId, &specs)
+            .map(template_reconcile_dto)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn detach_project_template(
+    store: State<'_, SkillStore>,
+    projectId: String,
+    retainAsManual: bool,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let specs = runtime_project_tool_specs(&store)?;
+        detach_project_template_core(&store, &projectId, retainAsManual, &specs)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn update_snapshot_project_template(
+    store: State<'_, SkillStore>,
+    projectId: String,
+) -> Result<TemplateReconcileResultDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let specs = runtime_project_tool_specs(&store)?;
+        update_snapshot_project_template_core(&store, &projectId, &specs)
+            .map(template_reconcile_dto)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn retry_project_template(
+    store: State<'_, SkillStore>,
+    projectId: String,
+) -> Result<TemplateReconcileResultDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let specs = runtime_project_tool_specs(&store)?;
+        retry_project_template_core(&store, &projectId, &specs).map(template_reconcile_dto)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn resolve_project_template_conflict(
+    store: State<'_, SkillStore>,
+    projectId: String,
+    skillId: String,
+    useLibraryVersion: bool,
+) -> Result<TemplateReconcileResultDto, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let specs = runtime_project_tool_specs(&store)?;
+        resolve_project_template_conflict_core(
+            &store,
+            &projectId,
+            &skillId,
+            useLibraryVersion,
+            &specs,
+        )
+        .map(template_reconcile_dto)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
 }
 
 #[tauri::command]
@@ -781,6 +1317,16 @@ pub async fn list_projects(store: State<'_, SkillStore>) -> Result<Vec<ProjectSu
     .await
     .map_err(|err| err.to_string())?
     .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn delete_project(store: State<'_, SkillStore>, projectId: String) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.delete_project(&projectId))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(format_anyhow_error)
 }
 
 #[tauri::command]
@@ -904,6 +1450,46 @@ pub async fn repair_project_issue(
     tauri::async_runtime::spawn_blocking(move || {
         let runtime_tools = runtime_project_tools(&store)?;
         let specs = project_specs_from_runtime(&runtime_tools);
+        if issueId.starts_with("template_sync_failed:") {
+            let failure = store
+                .list_project_template_failures(&projectId)?
+                .into_iter()
+                .find(|failure| {
+                    format!(
+                        "template_sync_failed:{}:{}:{}",
+                        failure.skill_id, failure.tool, failure.kind
+                    ) == issueId
+                })
+                .with_context(|| format!("project template issue no longer exists: {issueId}"))?;
+            match actionKind.as_str() {
+                "retry_template" => {
+                    retry_project_template_core(&store, &projectId, &specs)?;
+                }
+                "keep_project_version" => {
+                    resolve_project_template_conflict_core(
+                        &store,
+                        &projectId,
+                        &failure.skill_id,
+                        false,
+                        &specs,
+                    )?;
+                }
+                "replace_with_library" => {
+                    resolve_project_template_conflict_core(
+                        &store,
+                        &projectId,
+                        &failure.skill_id,
+                        true,
+                        &specs,
+                    )?;
+                }
+                _ => anyhow::bail!("unsupported project template action: {actionKind}"),
+            }
+            let project = store
+                .get_project(&projectId)?
+                .with_context(|| format!("project not found: {projectId}"))?;
+            return build_project_detail(&store, &project, &runtime_tools);
+        }
         let project = repair_project_issue_and_scan(
             &store,
             &projectId,
@@ -954,7 +1540,9 @@ fn runtime_project_tools(store: &SkillStore) -> anyhow::Result<Vec<RuntimeTool>>
         .collect())
 }
 
-fn runtime_project_tool_specs(store: &SkillStore) -> anyhow::Result<Vec<ProjectToolSpec>> {
+pub(crate) fn runtime_project_tool_specs(
+    store: &SkillStore,
+) -> anyhow::Result<Vec<ProjectToolSpec>> {
     runtime_project_tools(store).map(|tools| project_specs_from_runtime(&tools))
 }
 
@@ -962,7 +1550,13 @@ fn project_specs_from_runtime(tools: &[RuntimeTool]) -> Vec<ProjectToolSpec> {
     tools
         .iter()
         .map(|tool| {
-            ProjectToolSpec::new(&tool.key, &tool.project_skills_dir).with_available(tool.installed)
+            let mut spec = ProjectToolSpec::new(&tool.key, &tool.project_skills_dir);
+            if !tool.is_custom {
+                if let Some(adapter) = adapter_by_key(&tool.key) {
+                    spec = spec.with_discovery_dirs(project_discovery_skills_dirs(&adapter));
+                }
+            }
+            spec.with_available(tool.installed)
         })
         .collect()
 }
@@ -1005,6 +1599,20 @@ fn build_project_detail(
     let data = build_project_detail_data(store, project, &specs)?;
     let issues = visible_project_issues(store, project, data.issues)?;
     let summary = build_project_summary(store, project, &specs)?;
+    let template_binding = project_template_binding_dto(store, project)?;
+    let origins_by_skill = store
+        .list_project_skill_origins(&project.id)?
+        .into_iter()
+        .fold(
+            HashMap::<String, BTreeSet<String>>::new(),
+            |mut grouped, origin| {
+                grouped
+                    .entry(origin.skill_id)
+                    .or_default()
+                    .insert(origin.source_type);
+                grouped
+            },
+        );
     let tools = runtime_tools
         .iter()
         .map(|tool| ProjectToolDto {
@@ -1017,30 +1625,43 @@ fn build_project_detail(
         .collect::<Vec<_>>();
     Ok(ProjectDetailDto {
         project: summary,
+        template_binding,
         tools,
         current_skills: data
             .current_skills
             .into_iter()
-            .map(|skill| ProjectSkillDto {
-                name: skill.name,
-                description: skill.description,
-                source: skill.source,
-                status: skill.status,
-                linked_skill_id: skill.linked_skill_id,
-                matched_skill_id: skill.matched_skill_id,
-                tool_keys: skill.tool_keys,
-                paths: skill
-                    .paths
-                    .into_iter()
-                    .map(|path| ProjectSkillPathDto {
-                        discovered_skill_id: path.discovered_skill_id,
-                        relative_path: path.relative_path,
-                        absolute_path: path.absolute_path,
-                        tool_keys: path.tool_keys,
-                        content_hash: path.content_hash,
-                        status: path.status,
-                    })
-                    .collect(),
+            .map(|skill| {
+                let origin_types = skill
+                    .linked_skill_id
+                    .as_ref()
+                    .and_then(|skill_id| origins_by_skill.get(skill_id))
+                    .map(|origins| origins.iter().cloned().collect())
+                    .unwrap_or_default();
+                let additionally_visible_tool_keys =
+                    additionally_visible_project_tools(&skill.tool_keys, &specs);
+                ProjectSkillDto {
+                    name: skill.name,
+                    description: skill.description,
+                    source: skill.source,
+                    status: skill.status,
+                    linked_skill_id: skill.linked_skill_id,
+                    matched_skill_id: skill.matched_skill_id,
+                    tool_keys: skill.tool_keys,
+                    origin_types,
+                    additionally_visible_tool_keys,
+                    paths: skill
+                        .paths
+                        .into_iter()
+                        .map(|path| ProjectSkillPathDto {
+                            discovered_skill_id: path.discovered_skill_id,
+                            relative_path: path.relative_path,
+                            absolute_path: path.absolute_path,
+                            tool_keys: path.tool_keys,
+                            content_hash: path.content_hash,
+                            status: path.status,
+                        })
+                        .collect(),
+                }
             })
             .collect(),
         library_skills: data
@@ -1055,6 +1676,56 @@ fn build_project_detail(
             .collect(),
         issues,
     })
+}
+
+fn project_template_binding_dto(
+    store: &SkillStore,
+    project: &ProjectRecord,
+) -> anyhow::Result<Option<ProjectTemplateBindingDto>> {
+    let Some(binding) = store.get_project_template_binding(&project.id)? else {
+        return Ok(None);
+    };
+    let template = store
+        .get_skill_template(&binding.template_id)?
+        .with_context(|| format!("skill template not found: {}", binding.template_id))?;
+    Ok(Some(ProjectTemplateBindingDto {
+        template_id: template.id,
+        template_name: template.name,
+        mode: template.mode.clone(),
+        applied_revision_id: binding.applied_revision_id.clone(),
+        current_revision_id: template.current_revision_id.clone(),
+        snapshot_outdated: template.mode == "snapshot"
+            && binding.applied_revision_id != template.current_revision_id,
+        sync_error: binding.sync_error,
+    }))
+}
+
+fn additionally_visible_project_tools(
+    active_tool_keys: &[String],
+    specs: &[ProjectToolSpec],
+) -> Vec<String> {
+    let active = active_tool_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let active_dirs = specs
+        .iter()
+        .filter(|spec| active.contains(spec.key.as_str()))
+        .map(|spec| spec.relative_skills_dir.as_str())
+        .collect::<HashSet<_>>();
+    let mut visible = specs
+        .iter()
+        .filter(|spec| !active.contains(spec.key.as_str()))
+        .filter(|spec| {
+            spec.discovery_dirs
+                .iter()
+                .any(|directory| active_dirs.contains(directory.as_str()))
+        })
+        .map(|spec| spec.key.clone())
+        .collect::<Vec<_>>();
+    visible.sort();
+    visible.dedup();
+    visible
 }
 
 fn project_issue_dto(projection: ProjectIssueProjection) -> ProjectIssueDto {
@@ -1476,7 +2147,7 @@ impl From<AssignmentDraftDto> for AssignmentDraft {
     }
 }
 
-fn assignment_tool_specs(store: &SkillStore) -> anyhow::Result<Vec<AssignmentToolSpec>> {
+pub(crate) fn assignment_tool_specs(store: &SkillStore) -> anyhow::Result<Vec<AssignmentToolSpec>> {
     Ok(runtime_tools(store, true)?
         .into_iter()
         .map(|tool| AssignmentToolSpec {
@@ -1610,9 +2281,13 @@ pub async fn apply_skill_assignments(
             errors: outcome.summary.errors,
         })
         .collect::<Vec<_>>();
+        let project_specs = runtime_project_tool_specs(&store)?;
+        let (_, template_failed_projects) =
+            crate::core::skill_templates::reconcile_all_project_templates(&store, &project_specs);
         Ok::<_, anyhow::Error>(AssignmentApplyResultDto {
             succeeded: results.iter().map(|result| result.succeeded).sum(),
-            failed: results.iter().map(|result| result.failed).sum(),
+            failed: results.iter().map(|result| result.failed).sum::<usize>()
+                + template_failed_projects,
             skipped: results.iter().map(|result| result.skipped).sum(),
             skills: results,
         })
@@ -1635,6 +2310,9 @@ pub async fn resume_skill_assignments(
             .with_context(|| format!("skill not found: {skillId}"))?;
         let tools = assignment_tool_specs(&store)?;
         let summary = resume_skill_assignment_core(&store, &skill.id, &tools)?;
+        let project_specs = runtime_project_tool_specs(&store)?;
+        let _ =
+            crate::core::skill_templates::reconcile_all_project_templates(&store, &project_specs);
         Ok::<_, anyhow::Error>(SkillAssignmentApplyResultDto {
             skill_id: skill.id,
             skill_name: skill.name,
@@ -1712,43 +2390,36 @@ pub async fn set_skill_enabled(
     store: State<'_, SkillStore>,
     skillId: String,
     enabled: bool,
-) -> Result<(), String> {
+) -> Result<SkillEnableResultDto, String> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let tools = assignment_tool_specs(&store)?;
         if !enabled {
-            let targets = store.list_skill_targets(&skillId)?;
-            let mut remove_failures: Vec<String> = Vec::new();
-            for target in targets {
-                if target.status != "disabled" {
-                    if let Err(err) = remove_path_any(&target.target_path) {
-                        remove_failures.push(format!("{}: {}", target.target_path, err));
-                    }
-                }
-                store.update_skill_target_status(
-                    &skillId,
-                    &target.tool,
-                    &target.scope,
-                    target.project_path.as_deref(),
-                    "disabled",
-                )?;
-            }
-            store.set_skill_assignments_state(&skillId, "suspended")?;
-            store.set_skill_enabled(&skillId, false)?;
-            if !remove_failures.is_empty() {
-                anyhow::bail!(
-                    "已停用 Skill，但清理部分工具目录失败：\n- {}",
-                    remove_failures.join("\n- ")
-                );
-            }
-            return Ok::<_, anyhow::Error>(());
+            disable_skill_atomically_core(&store, &skillId, &tools)?;
+            return Ok::<_, anyhow::Error>(SkillEnableResultDto {
+                restored: 0,
+                failed: 0,
+                errors: Vec::new(),
+            });
         }
 
-        store.set_skill_enabled(&skillId, true)?;
-        Ok::<_, anyhow::Error>(())
+        let outcome = enable_skill_and_restore_core(&store, &skillId, &tools)?;
+        Ok::<_, anyhow::Error>(SkillEnableResultDto {
+            restored: outcome.restored,
+            failed: outcome.failed,
+            errors: outcome.errors,
+        })
     })
     .await
     .map_err(|err| err.to_string())?
     .map_err(format_anyhow_error)
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillEnableResultDto {
+    pub restored: usize,
+    pub failed: usize,
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1770,6 +2441,9 @@ pub async fn update_managed_skill(
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let res = update_managed_skill_from_source(&app, &store, &skillId)?;
+        let project_specs = runtime_project_tool_specs(&store)?;
+        let _ =
+            crate::core::skill_templates::reconcile_all_project_templates(&store, &project_specs);
         Ok::<_, anyhow::Error>(UpdateResultDto {
             skill_id: res.skill_id,
             name: res.name,
@@ -2087,6 +2761,15 @@ pub async fn delete_managed_skill(
 ) -> Result<(), String> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let template_names = store.list_skill_template_names_for_skill(&skillId)?;
+        let project_names = store.list_project_names_for_skill_origin(&skillId)?;
+        if !template_names.is_empty() || !project_names.is_empty() {
+            anyhow::bail!(
+                "SKILL_IN_USE|{}|{}",
+                template_names.join(", "),
+                project_names.join(", ")
+            );
+        }
         // 便于排查“按钮点了没反应”：确认前端确实触发了命令
         println!("[delete_managed_skill] skillId={}", skillId);
 
@@ -2177,6 +2860,7 @@ fn to_auto_update_config_dto(mut config: AutoUpdateConfig) -> AutoUpdateConfigDt
             AutoUpdateIntervalUnit::Hours => "hours".to_string(),
         },
         daily_time: config.schedule.daily_time,
+        eligible_skill_count: config.eligible_skill_count,
         local_skill_count: config.local_skill_count,
         protected_local_skill_count: config.protected_local_skill_count,
         task_registered: task_status.registered,
@@ -2555,6 +3239,168 @@ pub async fn read_skill_preview_file(
     .await
     .map_err(|err| err.to_string())?
     .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub async fn list_prompt_profiles(
+    store: State<'_, SkillStore>,
+) -> Result<Vec<PromptProfile>, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || list_prompt_profiles_core(&store))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub async fn save_prompt_profiles(
+    store: State<'_, SkillStore>,
+    profiles: Vec<PromptProfileInput>,
+) -> Result<Vec<PromptProfile>, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || save_prompt_profiles_core(&store, profiles))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn list_prompt_sources(
+    store: State<'_, SkillStore>,
+    profileId: String,
+    projectId: Option<String>,
+) -> Result<Vec<PromptSource>, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        list_prompt_sources_core(&store, &profileId, projectId.as_deref())
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub async fn read_prompt_document(
+    store: State<'_, SkillStore>,
+    request: PromptFileRequest,
+) -> Result<PromptDocument, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || read_prompt_document_core(&store, &request))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub async fn save_prompt_document(
+    store: State<'_, SkillStore>,
+    request: PromptSaveRequest,
+) -> Result<PromptMutationResult, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || save_prompt_document_core(&store, &request))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub async fn delete_prompt_document(
+    store: State<'_, SkillStore>,
+    request: PromptDeleteRequest,
+) -> Result<PromptMutationResult, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || delete_prompt_document_core(&store, &request))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn list_prompt_revisions(
+    store: State<'_, SkillStore>,
+    logicalPath: String,
+) -> Result<Vec<PromptRevisionSummary>, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || list_prompt_revisions_core(&store, &logicalPath))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn read_prompt_revision(
+    store: State<'_, SkillStore>,
+    revisionId: String,
+) -> Result<PromptRevisionDocument, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || read_prompt_revision_core(&store, &revisionId))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub async fn restore_prompt_revision(
+    store: State<'_, SkillStore>,
+    request: PromptRestoreRequest,
+) -> Result<PromptMutationResult, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || restore_prompt_revision_core(&store, &request))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+pub async fn resolve_prompt_instruction_chain(
+    store: State<'_, SkillStore>,
+    scenario: PromptScenario,
+) -> Result<PromptInstructionChain, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        resolve_prompt_instruction_chain_core(&store, &scenario)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn start_prompt_watch(
+    app: tauri::AppHandle,
+    store: State<'_, SkillStore>,
+    watcher: State<'_, Arc<PromptWatchService>>,
+    profileId: String,
+    projectId: Option<String>,
+) -> Result<PromptWatchStatus, String> {
+    let store = store.inner().clone();
+    let watcher = watcher.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let plan = build_prompt_watch_plan(&store, &profileId, projectId.as_deref())?;
+        watcher.start(plan, move |event| {
+            if let Err(error) = app.emit("prompt-sources-changed", event) {
+                log::warn!("failed to emit prompt source change: {error}");
+            }
+        })
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(format_anyhow_error)
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+pub fn stop_prompt_watch(
+    watcher: State<'_, Arc<PromptWatchService>>,
+    watchId: Option<String>,
+) -> Result<bool, String> {
+    watcher
+        .stop(watchId.as_deref())
+        .map_err(format_anyhow_error)
 }
 
 #[tauri::command]

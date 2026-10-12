@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
 use crate::core::skill_store::{
-    IgnoredIssueRecord, ProjectRecord, ProjectSkillLinkRecord, SkillAssignmentRecord, SkillRecord,
-    SkillStore, SkillTargetRecord,
+    IgnoredIssueRecord, ProjectRecord, ProjectSkillLinkRecord, ProjectSkillOriginRecord,
+    SkillAssignmentRecord, SkillRecord, SkillStore, SkillTargetRecord, SkillTemplateRecord,
+    SkillTemplateRevisionItemRecord, SkillTemplateRevisionRecord,
 };
 use rusqlite::Connection;
 
@@ -38,6 +39,205 @@ fn make_skill(id: &str, name: &str, central_path: &str, updated_at: i64) -> Skil
 fn schema_is_idempotent() {
     let (_dir, store) = make_store();
     store.ensure_schema().expect("ensure_schema again");
+}
+
+#[test]
+fn deleting_project_cascades_project_records_without_deleting_skill() {
+    let (_dir, store) = make_store();
+    let skill = make_skill("skill", "Skill", "/central/skill", 1);
+    store.upsert_skill(&skill).unwrap();
+    let project = ProjectRecord {
+        id: "project".to_string(),
+        name: "Project".to_string(),
+        root_path: "/projects/project".to_string(),
+        enabled_tool_keys: vec!["codex".to_string()],
+        local_git_exclude_enabled: false,
+        created_at: 1,
+        updated_at: 1,
+        last_scanned_at: None,
+    };
+    store.insert_project(&project).unwrap();
+    store
+        .upsert_project_skill_link(&ProjectSkillLinkRecord {
+            project_id: project.id.clone(),
+            skill_id: skill.id.clone(),
+            enabled: true,
+            desired_tools: vec!["codex".to_string()],
+            status: "ok".to_string(),
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+    store
+        .upsert_skill_assignment(&SkillAssignmentRecord {
+            id: "assignment".to_string(),
+            skill_id: skill.id.clone(),
+            tool: "codex".to_string(),
+            scope: "project".to_string(),
+            project_id: Some(project.id.clone()),
+            ownership: "hub".to_string(),
+            state: "active".to_string(),
+            last_error: None,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+    store
+        .upsert_ignored_issue(&IgnoredIssueRecord {
+            id: "ignored".to_string(),
+            scope: "project".to_string(),
+            scope_id: Some(project.id.clone()),
+            issue_key: "issue".to_string(),
+            fingerprint: "fingerprint".to_string(),
+            ignored_at: 1,
+        })
+        .unwrap();
+
+    store.delete_project(&project.id).unwrap();
+
+    assert!(store.get_project(&project.id).unwrap().is_none());
+    assert!(store
+        .list_project_skill_links(&project.id)
+        .unwrap()
+        .is_empty());
+    assert!(store.list_skill_assignments(&skill.id).unwrap().is_empty());
+    assert!(!store
+        .is_issue_ignored("project", Some(&project.id), "issue", "fingerprint",)
+        .unwrap());
+    assert!(store.get_skill_by_id(&skill.id).unwrap().is_some());
+}
+
+#[test]
+fn migrates_v9_project_links_into_manual_origins() {
+    let (_dir, store) = make_store();
+    let skill = make_skill("origin-skill", "Origin", "/central/origin", 1);
+    store.upsert_skill(&skill).unwrap();
+    let project = ProjectRecord {
+        id: "origin-project".to_string(),
+        name: "Origin project".to_string(),
+        root_path: "/project/origin".to_string(),
+        enabled_tool_keys: vec!["codex".to_string()],
+        local_git_exclude_enabled: false,
+        created_at: 1,
+        updated_at: 1,
+        last_scanned_at: None,
+    };
+    store.insert_project(&project).unwrap();
+    store
+        .upsert_project_skill_link(&ProjectSkillLinkRecord {
+            project_id: project.id.clone(),
+            skill_id: skill.id.clone(),
+            enabled: true,
+            desired_tools: vec!["codex".to_string()],
+            status: "ok".to_string(),
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+
+    let conn = Connection::open(store.db_path()).unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         DROP TABLE project_template_failures;
+         DROP TABLE project_template_overrides;
+         DROP TABLE project_skill_origins;
+         DROP TABLE project_template_bindings;
+         DROP TABLE skill_template_revision_items;
+         DROP TABLE skill_template_revisions;
+         DROP TABLE skill_template_items;
+         DROP TABLE skill_templates;
+         PRAGMA user_version = 9;",
+    )
+    .unwrap();
+    drop(conn);
+
+    store.ensure_schema().unwrap();
+    assert_eq!(
+        store.list_project_skill_origins(&project.id).unwrap(),
+        vec![ProjectSkillOriginRecord {
+            project_id: project.id,
+            skill_id: skill.id,
+            source_type: "manual".to_string(),
+            source_id: String::new(),
+            desired_tools: vec!["codex".to_string()],
+            created_at: 1,
+            updated_at: 1,
+        }]
+    );
+}
+
+#[test]
+fn current_template_and_project_origins_block_skill_deletion() {
+    let (_dir, store) = make_store();
+    let skill = make_skill("protected", "Protected", "/central/protected", 1);
+    store.upsert_skill(&skill).unwrap();
+    let template = SkillTemplateRecord {
+        id: "template".to_string(),
+        name: "Template".to_string(),
+        description: None,
+        mode: "live".to_string(),
+        archived: false,
+        current_revision_id: "revision".to_string(),
+        created_at: 1,
+        updated_at: 1,
+    };
+    let revision = SkillTemplateRevisionRecord {
+        id: "revision".to_string(),
+        template_id: template.id.clone(),
+        revision_number: 1,
+        name: template.name.clone(),
+        description: None,
+        created_at: 1,
+    };
+    store
+        .save_skill_template_revision(
+            &template,
+            &revision,
+            &[SkillTemplateRevisionItemRecord {
+                revision_id: revision.id.clone(),
+                skill_id: skill.id.clone(),
+                skill_name: skill.name.clone(),
+            }],
+        )
+        .unwrap();
+    assert!(store.delete_skill(&skill.id).is_err());
+    assert_eq!(
+        store
+            .list_skill_template_names_for_skill(&skill.id)
+            .unwrap(),
+        vec!["Template"]
+    );
+
+    store.delete_skill_template(&template.id).unwrap();
+    let project = ProjectRecord {
+        id: "protected-project".to_string(),
+        name: "Protected project".to_string(),
+        root_path: "/project/protected".to_string(),
+        enabled_tool_keys: vec!["codex".to_string()],
+        local_git_exclude_enabled: false,
+        created_at: 1,
+        updated_at: 1,
+        last_scanned_at: None,
+    };
+    store.insert_project(&project).unwrap();
+    store
+        .upsert_project_skill_origin(&ProjectSkillOriginRecord {
+            project_id: project.id.clone(),
+            skill_id: skill.id.clone(),
+            source_type: "manual".to_string(),
+            source_id: String::new(),
+            desired_tools: vec!["codex".to_string()],
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+    assert!(store.delete_skill(&skill.id).is_err());
+    assert_eq!(
+        store
+            .list_project_names_for_skill_origin(&skill.id)
+            .unwrap(),
+        vec!["Protected project"]
+    );
 }
 
 #[test]

@@ -4,11 +4,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::central_repo::resolve_central_repo_path;
 use super::content_hash::hash_dir;
-use super::skill_store::{SkillRecord, SkillStore};
+use super::skill_store::{IgnoredIssueRecord, SkillRecord, SkillStore};
 use super::tool_adapters::{default_tool_adapters, scan_tool_dir, DetectedSkill};
+
+const ONBOARDING_IGNORE_SCOPE: &str = "onboarding";
+const ONBOARDING_IGNORE_ISSUE_KEY: &str = "discovered_skill";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct OnboardingVariant {
@@ -69,13 +73,86 @@ pub fn build_onboarding_plan<R: tauri::Runtime>(
         }
     }
     let claude_config_dir = resolve_claude_config_dir(&home);
-    build_onboarding_plan_with_claude_dir(
+    let plan = build_onboarding_plan_with_claude_dir(
         &home,
         &claude_config_dir,
         Some(&central),
         Some(&managed_targets),
         &managed_skills,
+    )?;
+    filter_ignored_discovered_skills(store, plan)
+}
+
+pub fn ignore_discovered_skill(store: &SkillStore, paths: &[String]) -> Result<usize> {
+    let mut ignored = 0;
+    let mut seen = HashSet::new();
+    for raw_path in paths {
+        let path = Path::new(raw_path);
+        let issue_key = discovered_issue_key(path);
+        if !seen.insert(issue_key.clone()) {
+            continue;
+        }
+        store.upsert_ignored_issue(&IgnoredIssueRecord {
+            id: Uuid::new_v4().to_string(),
+            scope: ONBOARDING_IGNORE_SCOPE.to_string(),
+            scope_id: None,
+            issue_key,
+            fingerprint: discovered_issue_fingerprint(path),
+            ignored_at: now_ms(),
+        })?;
+        ignored += 1;
+    }
+    Ok(ignored)
+}
+
+fn filter_ignored_discovered_skills(
+    store: &SkillStore,
+    plan: OnboardingPlan,
+) -> Result<OnboardingPlan> {
+    let mut groups = Vec::new();
+    for mut group in plan.groups {
+        let mut variants = Vec::with_capacity(group.variants.len());
+        for variant in group.variants {
+            if !store.is_issue_ignored(
+                ONBOARDING_IGNORE_SCOPE,
+                None,
+                &discovered_issue_key(&variant.path),
+                &discovered_issue_fingerprint(&variant.path),
+            )? {
+                variants.push(variant);
+            }
+        }
+        if variants.is_empty() {
+            continue;
+        }
+        group.has_conflict = variants
+            .iter()
+            .filter_map(|variant| variant.fingerprint.as_ref())
+            .collect::<HashSet<_>>()
+            .len()
+            > 1;
+        group.variants = variants;
+        groups.push(group);
+    }
+
+    let total_skills_found = groups.iter().map(|group| group.variants.len()).sum();
+    Ok(OnboardingPlan {
+        total_tools_scanned: plan.total_tools_scanned,
+        total_skills_found,
+        groups,
+    })
+}
+
+fn discovered_issue_key(path: &Path) -> String {
+    format!(
+        "{}\n{}",
+        ONBOARDING_IGNORE_ISSUE_KEY,
+        normalize_path_for_key(path)
     )
+}
+
+fn discovered_issue_fingerprint(path: &Path) -> String {
+    hash_dir(path).unwrap_or_else(|_| "missing".to_string())
 }
 
 #[cfg(test)]
@@ -475,6 +552,13 @@ fn normalize_path_for_key(path: &Path) -> String {
     {
         s
     }
+}
+
+fn now_ms() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    now.as_millis() as i64
 }
 
 #[cfg(test)]

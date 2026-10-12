@@ -77,7 +77,19 @@ fn sparse_clone_only_materializes_requested_subpath() {
         None,
     ) {
         Ok(head) => head,
-        Err(err) if format!("{:#}", err).contains("system git is required") => return,
+        Err(err)
+            if format!("{:#}", err).contains("需要系统 git")
+                || format!("{:#}", err).contains("system git is required") =>
+        {
+            let text = format!("{:#}", err);
+            assert_eq!(
+                text.matches("system git is required for sparse checkout")
+                    .count(),
+                0,
+                "缺失 git 时不应把同一句英文错误拼两次: {text}"
+            );
+            return;
+        }
         Err(err) => panic!("sparse clone failed: {:#}", err),
     };
 
@@ -106,4 +118,28 @@ fn git_command_injects_configured_proxy() {
             .map(|value| value.to_string_lossy().to_string()),
         Some("http://127.0.0.1:7890".to_string())
     );
+}
+
+#[test]
+fn sparse_checkout_explains_xcode_license_once() {
+    let detail = "/usr/bin/git: You have not agreed to the Xcode license agreements. Please run 'sudo xcodebuild -license' from within a Terminal window to review and agree to the Xcode and Apple SDKs license.";
+    let msg = super::format_sparse_checkout_git_required(Some(detail));
+    assert!(msg.contains("尚未同意 Xcode 许可协议"));
+    assert!(msg.contains("sudo xcodebuild -license"));
+    assert_eq!(msg.matches("尚未同意 Xcode 许可协议").count(), 1);
+    assert_eq!(msg.matches(detail).count(), 1);
+    assert!(!msg.contains('\n'));
+}
+
+#[test]
+fn sparse_checkout_explains_missing_git_once() {
+    let msg = super::format_sparse_checkout_git_required(None);
+    assert!(msg.contains("没有找到可用的 git"));
+    assert!(msg.contains("SKILLS_HUB_GIT_BIN"));
+    assert_eq!(msg.matches("没有找到可用的 git").count(), 1);
+
+    let failed =
+        super::format_sparse_checkout_git_required(Some("/usr/bin/git: permission denied"));
+    assert!(failed.contains("当前 git 无法使用"));
+    assert_eq!(failed.matches("permission denied").count(), 1);
 }

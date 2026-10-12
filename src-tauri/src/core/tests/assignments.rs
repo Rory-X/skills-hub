@@ -5,6 +5,7 @@ use crate::core::skill_store::{ProjectRecord, SkillAssignmentRecord, SkillRecord
 
 use super::{
     apply_project_skill_assignments, apply_skill_assignment, apply_skill_assignments,
+    cleanup_orphaned_skill_symlinks, disable_skill_atomically, enable_skill_and_restore,
     ignore_assignment_issue, managed_skill_projections, preview_project_skill_assignments,
     preview_skill_assignment, project_skill_assignments, AssignmentConflictKey, AssignmentDraft,
     AssignmentToolSpec, ProjectAssignmentDraft,
@@ -82,6 +83,197 @@ fn tool(global: &Path) -> AssignmentToolSpec {
         enabled: true,
         supports_project_scope: true,
     }
+}
+
+#[test]
+fn disabling_hides_targets_and_enabling_restores_saved_assignments() {
+    let (_db, store) = make_store();
+    let central = tempfile::tempdir().expect("central");
+    write_skill(central.path(), "library");
+    let skill = add_skill(&store, central.path());
+    let global = tempfile::tempdir().expect("global");
+    let tools = [tool(global.path())];
+    let target = global.path().join(&skill.name);
+
+    apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft {
+            global_tools: vec!["codex".to_string()],
+            projects: Vec::new(),
+        },
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("assign skill");
+    disable_skill_atomically(&store, &skill.id, &tools).expect("disable skill");
+
+    assert!(std::fs::symlink_metadata(&target).is_err());
+    assert!(!store.get_skill_by_id(&skill.id).unwrap().unwrap().enabled);
+    assert_eq!(
+        store.list_skill_assignments(&skill.id).unwrap()[0].state,
+        "suspended"
+    );
+
+    let outcome = enable_skill_and_restore(&store, &skill.id, &tools).expect("enable skill");
+    assert_eq!(outcome.restored, 1);
+    assert_eq!(outcome.failed, 0);
+    assert!(std::fs::symlink_metadata(&target).is_ok());
+    assert!(store.get_skill_by_id(&skill.id).unwrap().unwrap().enabled);
+    assert_eq!(
+        store.list_skill_assignments(&skill.id).unwrap()[0].state,
+        "active"
+    );
+}
+
+#[test]
+fn enabling_reports_a_target_conflict_as_a_restore_failure() {
+    let (_db, store) = make_store();
+    let central = tempfile::tempdir().expect("central");
+    write_skill(central.path(), "library");
+    let skill = add_skill(&store, central.path());
+    let global = tempfile::tempdir().expect("global");
+    let tools = [tool(global.path())];
+    let target = global.path().join(&skill.name);
+
+    apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft {
+            global_tools: vec!["codex".to_string()],
+            projects: Vec::new(),
+        },
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("assign skill");
+    disable_skill_atomically(&store, &skill.id, &tools).expect("disable skill");
+    write_skill(&target, "unmanaged conflict");
+
+    let outcome = enable_skill_and_restore(&store, &skill.id, &tools).expect("enable skill");
+    assert_eq!(outcome.restored, 0);
+    assert_eq!(outcome.failed, 1);
+    assert!(outcome.errors[0].contains("could not be restored"));
+    assert!(store.get_skill_by_id(&skill.id).unwrap().unwrap().enabled);
+    assert_eq!(
+        store.list_skill_assignments(&skill.id).unwrap()[0].state,
+        "suspended"
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("SKILL.md")).unwrap(),
+        "unmanaged conflict"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_disable_restores_moved_targets_and_keeps_database_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_db, store) = make_store();
+    let central = tempfile::tempdir().expect("central");
+    write_skill(central.path(), "library");
+    let skill = add_skill(&store, central.path());
+    let roots = tempfile::tempdir().expect("tool roots");
+    let first_root = roots.path().join("a-writable");
+    let second_root = roots.path().join("z-read-only");
+    std::fs::create_dir_all(&first_root).unwrap();
+    std::fs::create_dir_all(&second_root).unwrap();
+    let mut first = tool(&first_root);
+    first.key = "first".to_string();
+    let mut second = tool(&second_root);
+    second.key = "second".to_string();
+    let tools = [first, second];
+
+    apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft {
+            global_tools: vec!["first".to_string(), "second".to_string()],
+            projects: Vec::new(),
+        },
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("assign both targets");
+    std::fs::set_permissions(&second_root, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let result = disable_skill_atomically(&store, &skill.id, &tools);
+    std::fs::set_permissions(&second_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(result.is_err());
+    assert!(std::fs::symlink_metadata(first_root.join(&skill.name)).is_ok());
+    assert!(std::fs::symlink_metadata(second_root.join(&skill.name)).is_ok());
+    assert!(store.get_skill_by_id(&skill.id).unwrap().unwrap().enabled);
+    assert!(store
+        .list_skill_assignments(&skill.id)
+        .unwrap()
+        .iter()
+        .all(|assignment| assignment.state == "active"));
+}
+
+#[cfg(unix)]
+#[test]
+fn orphan_cleanup_only_removes_direct_known_unassigned_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let (_db, store) = make_store();
+    let central_repo = tempfile::tempdir().expect("central repo");
+    let central = central_repo.path().join("review");
+    write_skill(&central, "library");
+    let skill = add_skill(&store, &central);
+    let assigned_root = tempfile::tempdir().expect("assigned root");
+    let orphan_root = tempfile::tempdir().expect("orphan root");
+    let external = tempfile::tempdir().expect("external");
+    write_skill(external.path(), "external");
+    let mut assigned_tool = tool(assigned_root.path());
+    assigned_tool.key = "assigned".to_string();
+    let mut orphan_tool = tool(orphan_root.path());
+    orphan_tool.key = "orphan".to_string();
+    let mut central_guard = tool(central_repo.path());
+    central_guard.key = "central-guard".to_string();
+    let tools = [assigned_tool, orphan_tool, central_guard];
+
+    apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft {
+            global_tools: vec!["assigned".to_string()],
+            projects: Vec::new(),
+        },
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("assign managed target");
+    let orphan = orphan_root.path().join(&skill.name);
+    symlink(&central, &orphan).unwrap();
+    let external_link = orphan_root.path().join("external");
+    symlink(external.path(), &external_link).unwrap();
+    let regular = orphan_root.path().join("regular");
+    write_skill(&regular, "regular");
+    let nested = orphan_root.path().join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let nested_link = nested.join(&skill.name);
+    symlink(&central, &nested_link).unwrap();
+    let broken = orphan_root.path().join("broken");
+    symlink(orphan_root.path().join("missing"), &broken).unwrap();
+    let central_alias = central_repo.path().join("review-alias");
+    symlink(&central, &central_alias).unwrap();
+
+    let removed = cleanup_orphaned_skill_symlinks(&store, &tools).expect("cleanup links");
+
+    assert_eq!(removed, 1);
+    assert!(std::fs::symlink_metadata(&orphan).is_err());
+    assert!(std::fs::symlink_metadata(assigned_root.path().join(&skill.name)).is_ok());
+    assert!(std::fs::symlink_metadata(&external_link).is_ok());
+    assert!(regular.is_dir());
+    assert!(std::fs::symlink_metadata(&nested_link).is_ok());
+    assert!(std::fs::symlink_metadata(&broken).is_ok());
+    assert!(std::fs::symlink_metadata(&central_alias).is_ok());
 }
 
 #[test]
@@ -750,6 +942,60 @@ fn keeping_a_conflicting_project_skill_cancels_the_hub_assignment() {
     assert_eq!(
         std::fs::read_to_string(project_skill.join("SKILL.md")).unwrap(),
         "project"
+    );
+}
+
+#[test]
+fn project_assignment_scan_includes_builtin_compatibility_directories() {
+    let (_db, store) = make_store();
+    let central = tempfile::tempdir().expect("central");
+    write_skill(central.path(), "library");
+    let skill = add_skill(&store, central.path());
+    let project_dir = tempfile::tempdir().expect("project");
+    write_skill(
+        &project_dir.path().join(".codex/skills/legacy-skill"),
+        "legacy skill",
+    );
+    let project = ProjectRecord {
+        id: "project-1".to_string(),
+        name: "Project".to_string(),
+        root_path: project_dir.path().to_string_lossy().to_string(),
+        enabled_tool_keys: vec!["codex".to_string()],
+        local_git_exclude_enabled: false,
+        created_at: 1,
+        updated_at: 1,
+        last_scanned_at: None,
+    };
+    store.insert_project(&project).expect("insert project");
+    let global = tempfile::tempdir().expect("global");
+    let tools = [tool(global.path())];
+
+    apply_skill_assignment(
+        &store,
+        &skill.id,
+        &AssignmentDraft {
+            global_tools: Vec::new(),
+            projects: vec![ProjectAssignmentDraft {
+                project_id: project.id.clone(),
+                tool_keys: vec!["codex".to_string()],
+            }],
+        },
+        &tools,
+        &HashSet::new(),
+        false,
+    )
+    .expect("apply project assignment");
+
+    let discovered = store
+        .list_project_discovered_skills(&project.id)
+        .expect("list discovered skills");
+    assert!(
+        discovered.iter().any(|item| {
+            item.name == "legacy-skill"
+                && item.relative_path == ".codex/skills/legacy-skill"
+                && item.tool_keys == vec!["codex"]
+        }),
+        "discovered: {discovered:#?}"
     );
 }
 

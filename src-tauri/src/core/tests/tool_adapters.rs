@@ -1,8 +1,8 @@
 use std::fs;
 
 use crate::core::tool_adapters::{
-    adapter_by_key, project_relative_skills_dir, resolve_project_path, scan_tool_dir,
-    supports_project_scope, ToolAdapter, ToolId,
+    adapter_by_key, project_discovery_skills_dirs, project_relative_skills_dir,
+    resolve_project_path, scan_tool_dir, supports_project_scope, ToolAdapter, ToolId,
 };
 
 #[test]
@@ -20,6 +20,7 @@ fn adapter_by_key_finds_new_tools() {
     assert!(adapter_by_key("qwen_code").is_some());
     assert!(adapter_by_key("hermes_agent").is_some());
     assert!(adapter_by_key("workbuddy").is_some());
+    assert!(adapter_by_key("ds_harness").is_some());
 }
 
 #[test]
@@ -83,6 +84,41 @@ fn project_relative_skills_dir_maps_supported_agents() {
     let workbuddy = adapter_by_key("workbuddy").unwrap();
     assert_eq!(project_relative_skills_dir(&workbuddy), ".workbuddy/skills");
     assert!(!supports_project_scope(&workbuddy));
+
+    let dsh = adapter_by_key("ds_harness").unwrap();
+    assert_eq!(project_relative_skills_dir(&dsh), ".dsh/skills");
+    assert!(supports_project_scope(&dsh));
+}
+
+#[test]
+fn ds_harness_adapter_uses_dsh_skill_roots() {
+    let dsh = adapter_by_key("ds_harness").unwrap();
+
+    assert_eq!(dsh.id, ToolId::DsHarness);
+    assert_eq!(dsh.relative_skills_dir, ".dsh/skills");
+    assert_eq!(dsh.relative_detect_dir, ".dsh");
+    assert_eq!(project_discovery_skills_dirs(&dsh), vec![".dsh/skills"]);
+}
+
+#[test]
+fn project_discovery_dirs_include_confirmed_compatibility_paths() {
+    let cursor = adapter_by_key("cursor").unwrap();
+    assert_eq!(
+        project_discovery_skills_dirs(&cursor),
+        vec![".agents/skills", ".cursor/skills"]
+    );
+
+    let codex = adapter_by_key("codex").unwrap();
+    assert_eq!(
+        project_discovery_skills_dirs(&codex),
+        vec![".agents/skills", ".codex/skills"]
+    );
+
+    let cline = adapter_by_key("cline").unwrap();
+    assert_eq!(
+        project_discovery_skills_dirs(&cline),
+        vec![".agents/skills"]
+    );
 }
 
 #[test]
@@ -111,7 +147,9 @@ fn scan_tool_dir_skips_codex_system_and_includes_symlink_dir() {
     let dir = tempfile::tempdir().unwrap();
 
     fs::create_dir_all(dir.path().join("a")).unwrap();
+    fs::write(dir.path().join("a/SKILL.md"), b"# A").unwrap();
     fs::create_dir_all(dir.path().join(".system")).unwrap();
+    fs::create_dir_all(dir.path().join("invalid")).unwrap();
     fs::write(dir.path().join("not-a-dir"), b"x").unwrap();
 
     #[cfg(unix)]
@@ -130,6 +168,7 @@ fn scan_tool_dir_skips_codex_system_and_includes_symlink_dir() {
     let names: Vec<String> = out.iter().map(|s| s.name.clone()).collect();
 
     assert!(names.contains(&"a".to_string()));
+    assert!(!names.contains(&"invalid".to_string()));
     assert!(!names.contains(&".system".to_string()));
 
     #[cfg(unix)]

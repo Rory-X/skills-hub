@@ -1637,6 +1637,42 @@ struct RepoCacheMeta {
 
 static GIT_CACHE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+fn git_cache_retry_could_help(err: &anyhow::Error) -> bool {
+    let text = format!("{:#}", err).to_lowercase();
+    !(text.contains("需要系统 git")
+        || text.contains("system git is required")
+        || text.contains("sparse checkout path is empty")
+        || text.contains("cancelled|")
+        || text.contains("操作已被用户取消"))
+}
+
+fn combine_clone_retry_error(first: anyhow::Error, retry: anyhow::Error) -> anyhow::Error {
+    let first_root = first.root_cause().to_string();
+    let retry_display = format!("{:#}", retry);
+    if retry_display.contains(&first_root) {
+        retry
+    } else {
+        retry.context(format!("首次拉取失败：{first_root}"))
+    }
+}
+
+fn retry_git_clone<T>(
+    repo_dir: &Path,
+    first_error: anyhow::Error,
+    retry: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if !git_cache_retry_could_help(&first_error) {
+        return Err(first_error);
+    }
+    if repo_dir.exists() {
+        let _ = std::fs::remove_dir_all(repo_dir);
+    }
+    match retry() {
+        Ok(value) => Ok(value),
+        Err(retry_error) => Err(combine_clone_retry_error(first_error, retry_error)),
+    }
+}
+
 fn clone_to_cache<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     store: &SkillStore,
@@ -1704,14 +1740,9 @@ fn clone_to_cache_with_refresh<R: tauri::Runtime>(
     let proxy_url = get_github_proxy_url(store)?;
     let rev = match clone_or_pull(clone_url, &repo_dir, branch, cancel, Some(&proxy_url)) {
         Ok(rev) => rev,
-        Err(err) => {
-            // If cache got corrupted, retry once from a clean state.
-            if repo_dir.exists() {
-                let _ = std::fs::remove_dir_all(&repo_dir);
-            }
+        Err(err) => retry_git_clone(&repo_dir, err, || {
             clone_or_pull(clone_url, &repo_dir, branch, cancel, Some(&proxy_url))
-                .with_context(|| format!("{:#}", err))?
-        }
+        })?,
     };
 
     let _ = std::fs::write(
@@ -1842,10 +1873,7 @@ fn clone_to_cache_subpath<R: tauri::Runtime>(
         Some(&proxy_url),
     ) {
         Ok(rev) => rev,
-        Err(err) => {
-            if repo_dir.exists() {
-                let _ = std::fs::remove_dir_all(&repo_dir);
-            }
+        Err(err) => retry_git_clone(&repo_dir, err, || {
             clone_or_pull_sparse(
                 clone_url,
                 &repo_dir,
@@ -1854,8 +1882,7 @@ fn clone_to_cache_subpath<R: tauri::Runtime>(
                 cancel,
                 Some(&proxy_url),
             )
-            .with_context(|| format!("{:#}", err))?
-        }
+        })?,
     };
 
     let _ = std::fs::write(

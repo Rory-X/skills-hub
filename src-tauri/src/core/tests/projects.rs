@@ -1,11 +1,12 @@
 use std::path::Path;
 
 use crate::core::projects::{
-    assign_project_skill_tools_and_scan, can_ignore_project_issue, collect_project_skill,
-    create_or_get_project, diagnose_project, inject_project_skill, project_issue_fingerprint,
-    project_issue_projections, rebuild_project_git_exclude, remove_project_skill,
-    repair_project_issue, repair_project_issue_and_scan, scan_project,
-    update_project_configuration, visible_project_issue_projections, ProjectIssue, ProjectToolSpec,
+    assign_project_skill_tools_and_scan, build_project_detail_data, can_ignore_project_issue,
+    collect_project_skill, create_or_get_project, diagnose_project, ignore_project_issue_and_scan,
+    inject_project_skill, project_issue_fingerprint, project_issue_projections,
+    rebuild_project_git_exclude, remove_project_skill, repair_project_issue,
+    repair_project_issue_and_scan, scan_project, update_project_configuration,
+    visible_project_issue_projections, ProjectIssue, ProjectToolSpec,
 };
 use crate::core::skill_store::{
     IgnoredIssueRecord, ProjectSkillLinkRecord, SkillAssignmentRecord, SkillRecord, SkillStore,
@@ -104,6 +105,140 @@ fn scan_deduplicates_shared_tool_directories_and_matches_library_content() {
     assert!(assignments
         .iter()
         .all(|assignment| assignment.ownership == "native"));
+}
+
+#[test]
+fn scan_discovers_compatibility_directories_for_the_same_tool() {
+    let (_db_dir, store) = make_store();
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    write_skill(
+        &project_dir.path().join(".agents/skills/shared"),
+        "shared skill",
+    );
+    write_skill(
+        &project_dir.path().join(".cursor/skills/cursor-only"),
+        "cursor-only skill",
+    );
+    let project = create_or_get_project(&store, project_dir.path(), &["cursor".to_string()])
+        .expect("create project");
+    let tools = [
+        ProjectToolSpec::new("cursor", ".agents/skills").with_discovery_dirs([".cursor/skills"])
+    ];
+
+    let scanned = scan_project(&store, &project, &tools).expect("scan project");
+
+    assert_eq!(
+        scanned
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cursor-only", "shared"]
+    );
+    let cursor_only = scanned
+        .iter()
+        .find(|skill| skill.name == "cursor-only")
+        .expect("cursor compatibility skill");
+    assert_eq!(cursor_only.relative_path, ".cursor/skills/cursor-only");
+    assert_eq!(cursor_only.tool_keys, vec!["cursor"]);
+}
+
+#[test]
+fn scan_discovers_nested_skills_without_marking_the_container_invalid() {
+    let (_db_dir, store) = make_store();
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    write_skill(
+        &project_dir
+            .path()
+            .join(".claude/skills/gitnexus/gitnexus-debugging"),
+        "debugging skill",
+    );
+    write_skill(
+        &project_dir
+            .path()
+            .join(".claude/skills/gitnexus/gitnexus-refactoring"),
+        "refactoring skill",
+    );
+    let project = create_or_get_project(&store, project_dir.path(), &["claude_code".to_string()])
+        .expect("create project");
+    let tools = [ProjectToolSpec::new("claude_code", ".claude/skills")];
+
+    let scanned = scan_project(&store, &project, &tools).expect("scan project");
+    let issues = diagnose_project(&store, &project, &tools).expect("diagnose project");
+
+    assert_eq!(
+        scanned
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["gitnexus-debugging", "gitnexus-refactoring"]
+    );
+    assert!(scanned
+        .iter()
+        .all(|skill| skill.status != "invalid_missing_skill_md"));
+    assert!(issues.iter().all(|issue| issue.kind != "invalid_skill"));
+}
+
+#[test]
+fn scan_stops_descending_after_finding_a_skill_directory() {
+    let (_db_dir, store) = make_store();
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let skill_path = project_dir.path().join(".agents/skills/review");
+    write_skill(&skill_path, "review skill");
+    write_skill(&skill_path.join("examples/nested"), "nested example");
+    let project = create_or_get_project(&store, project_dir.path(), &["codex".to_string()])
+        .expect("create project");
+    let tools = [ProjectToolSpec::new("codex", ".agents/skills")];
+
+    let scanned = scan_project(&store, &project, &tools).expect("scan project");
+
+    assert_eq!(scanned.len(), 1);
+    assert_eq!(scanned[0].name, "review");
+}
+
+#[test]
+fn scan_discovers_deeply_nested_skills_without_entering_generated_trees() {
+    let (_db_dir, store) = make_store();
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let container = project_dir.path().join(".agents/skills/bundle");
+    let mut nested = container.clone();
+    for depth in 0..12 {
+        nested = nested.join(format!("level-{depth}"));
+    }
+    write_skill(&nested.join("deep-skill"), "deep skill");
+    write_skill(
+        &container.join("node_modules/dependency-skill"),
+        "dependency skill",
+    );
+    write_skill(&container.join(".git/internal-skill"), "internal skill");
+    let project = create_or_get_project(&store, project_dir.path(), &["codex".to_string()])
+        .expect("create project");
+    let tools = [ProjectToolSpec::new("codex", ".agents/skills")];
+
+    let scanned = scan_project(&store, &project, &tools).expect("scan project");
+
+    assert_eq!(scanned.len(), 1);
+    assert_eq!(scanned[0].name, "deep-skill");
+}
+
+#[test]
+fn injection_uses_the_target_directory_instead_of_discovery_aliases() {
+    let (_db_dir, store) = make_store();
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let central_dir = tempfile::tempdir().expect("central tempdir");
+    write_skill(central_dir.path(), "library content");
+    let hash = crate::core::content_hash::hash_dir(central_dir.path()).expect("hash skill");
+    let skill = make_skill("library-review", "review", central_dir.path(), &hash);
+    store.upsert_skill(&skill).expect("insert skill");
+    let project = create_or_get_project(&store, project_dir.path(), &["cursor".to_string()])
+        .expect("create project");
+    let tools = [
+        ProjectToolSpec::new("cursor", ".agents/skills").with_discovery_dirs([".cursor/skills"])
+    ];
+
+    inject_project_skill(&store, &project, &skill, &tools).expect("inject skill");
+
+    assert!(project_dir.path().join(".agents/skills/review").exists());
+    assert!(!project_dir.path().join(".cursor/skills/review").exists());
 }
 
 #[test]
@@ -584,6 +719,85 @@ fn invalid_skill_issue_exposes_delete_action_and_removes_only_that_directory() {
 }
 
 #[test]
+fn invalid_skill_issue_can_be_ignored_without_changing_the_directory() {
+    let (_db_dir, store) = make_store();
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let invalid_path = project_dir.path().join(".agents/skills/not-a-skill");
+    std::fs::create_dir_all(&invalid_path).expect("create invalid skill");
+    let notes_path = invalid_path.join("notes.txt");
+    std::fs::write(&notes_path, "keep this directory").expect("write invalid skill");
+    let project = create_or_get_project(&store, project_dir.path(), &["codex".to_string()])
+        .expect("create project");
+    let tools = [ProjectToolSpec::new("codex", ".agents/skills")];
+    scan_project(&store, &project, &tools).expect("scan project");
+    let issue = diagnose_project(&store, &project, &tools)
+        .expect("diagnose project")
+        .into_iter()
+        .find(|issue| issue.kind == "invalid_skill")
+        .expect("invalid issue");
+    let projection = project_issue_projections(&store, &project, vec![issue.clone()])
+        .expect("project issue projection")
+        .remove(0);
+
+    assert!(projection.can_ignore);
+    let refreshed = ignore_project_issue_and_scan(
+        &store,
+        &project.id,
+        &issue.id,
+        &projection.fingerprint,
+        &tools,
+    )
+    .expect("ignore invalid skill");
+
+    assert!(invalid_path.is_dir());
+    assert_eq!(
+        std::fs::read_to_string(&notes_path).expect("read preserved file"),
+        "keep this directory"
+    );
+    assert!(visible_project_issue_projections(
+        &store,
+        &refreshed,
+        diagnose_project(&store, &refreshed, &tools).expect("diagnose ignored project"),
+    )
+    .expect("visible ignored issues")
+    .iter()
+    .all(|projection| projection.issue.kind != "invalid_skill"));
+    let ignored_detail =
+        build_project_detail_data(&store, &refreshed, &tools).expect("build ignored detail");
+    assert!(ignored_detail.issues.is_empty());
+    assert_eq!(
+        ignored_detail
+            .current_skills
+            .iter()
+            .find(|skill| skill.name == "not-a-skill")
+            .expect("ignored directory row")
+            .status,
+        "healthy"
+    );
+
+    std::fs::write(&notes_path, "directory content changed").expect("change invalid skill");
+    assert!(visible_project_issue_projections(
+        &store,
+        &refreshed,
+        diagnose_project(&store, &refreshed, &tools).expect("diagnose changed project"),
+    )
+    .expect("visible changed issues")
+    .iter()
+    .any(|projection| projection.issue.kind == "invalid_skill"));
+    let changed_detail =
+        build_project_detail_data(&store, &refreshed, &tools).expect("build changed detail");
+    assert_eq!(
+        changed_detail
+            .current_skills
+            .iter()
+            .find(|skill| skill.name == "not-a-skill")
+            .expect("changed directory row")
+            .status,
+        "needs_attention"
+    );
+}
+
+#[test]
 fn invalid_skill_delete_refuses_content_repaired_after_the_scan() {
     let (_db_dir, store) = make_store();
     let project_dir = tempfile::tempdir().expect("project tempdir");
@@ -612,6 +826,37 @@ fn invalid_skill_delete_refuses_content_repaired_after_the_scan() {
     .expect_err("stale delete action must be rejected");
 
     assert!(invalid_path.join("SKILL.md").is_file());
+}
+
+#[test]
+fn invalid_skill_delete_refuses_a_container_with_new_nested_skills() {
+    let (_db_dir, store) = make_store();
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let container_path = project_dir.path().join(".agents/skills/gitnexus");
+    std::fs::create_dir_all(&container_path).expect("create empty container");
+    let project = create_or_get_project(&store, project_dir.path(), &["codex".to_string()])
+        .expect("create project");
+    let tools = [ProjectToolSpec::new("codex", ".agents/skills")];
+    scan_project(&store, &project, &tools).expect("scan project");
+    let issue = diagnose_project(&store, &project, &tools)
+        .expect("diagnose project")
+        .into_iter()
+        .find(|issue| issue.kind == "invalid_skill")
+        .expect("invalid issue");
+    let nested_skill = container_path.join("gitnexus-debugging");
+    write_skill(&nested_skill, "nested skill");
+
+    repair_project_issue(
+        &store,
+        &project,
+        &tools,
+        &issue.id,
+        "delete_invalid_skill",
+        None,
+    )
+    .expect_err("container with nested skills must not be deleted");
+
+    assert!(nested_skill.join("SKILL.md").is_file());
 }
 
 #[test]
